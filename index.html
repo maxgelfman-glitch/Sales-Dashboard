@@ -754,7 +754,7 @@ function icsWrap(events){ return ['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Pow
 function segMatch(l){ return state.segment==='all'||l.type===state.segment; }
 function searchMatch(l){
   var q=state.search.trim().toLowerCase(); if(!q) return true;
-  var svc=(l.services||[]).map(function(id){return (SERVICE_MAP[id]||{}).name||'';}).join(' ');
+  var svc=(l.services||[]).map(function(id){return svcName(id);}).join(' ');
   return [l.name,l.contact,l.phone,l.email,l.address,l.source,l.notes,svc].join(' ').toLowerCase().indexOf(q)>=0;
 }
 function visibleLeads(){ return state.leads.filter(function(l){return segMatch(l)&&searchMatch(l);}); }
@@ -1493,6 +1493,31 @@ function saveLead(id){
   closeModal(); render(); renderOverlay();
 }
 function updateLead(id,data){ var l=state.leads.find(function(x){return x.id===id;}); if(!l) return; Object.assign(l,data); l.updated=Date.now(); save(); }
+function normalizeLead(l){
+  l=l||{};
+  return {
+    id: l.id||uid(),
+    type: (l.type==='commercial'?'commercial':'residential'),
+    name: (l.name!=null&&String(l.name).trim())?String(l.name):'Unnamed lead',
+    contact: l.contact!=null?String(l.contact):'',
+    phone: l.phone!=null?String(l.phone):'',
+    email: l.email!=null?String(l.email):'',
+    address: l.address!=null?String(l.address):'',
+    value: (l.value!=null?l.value:''),
+    source: l.source!=null&&String(l.source)?String(l.source):'Other',
+    stage: STAGE_MAP[l.stage]?l.stage:'new',
+    confidence: CONF_MAP[l.confidence]?l.confidence:'warm',
+    notes: l.notes!=null?String(l.notes):'',
+    services: Array.isArray(l.services)?l.services.filter(function(x){return typeof x==='string';}):[],
+    comms: Array.isArray(l.comms)?l.comms.map(function(c){ c=c||{}; return {id:c.id||cid(),method:METHOD_MAP[c.method]?c.method:'note',date:c.date||todayISO(),notes:c.notes!=null?String(c.notes):'',ts:c.ts||0}; }):[],
+    followUp: (l.followUp&&l.followUp.date)?{date:String(l.followUp.date),note:(l.followUp.note!=null?String(l.followUp.note):'')}:null,
+    reclean: Number(l.reclean)||0,
+    lostReason: l.lostReason!=null?String(l.lostReason):'',
+    sample: !!l.sample,
+    created: Number(l.created)||Date.now(),
+    updated: Number(l.updated)||Date.now()
+  };
+}
 
 function changeStage(id,newStage){
   var lead=state.leads.find(function(l){return l.id===id;}); if(!lead) return;
@@ -1611,7 +1636,7 @@ function chooseImport(){
 }
 function importJSON(text){
   try{ var data=JSON.parse(text); if(!data.leads||!Array.isArray(data.leads)) throw 0;
-    openModal(confirmModal('Import '+data.leads.length+' leads?','This replaces your current '+state.leads.length+' lead'+(state.leads.length===1?'':'s')+' with the '+data.leads.length+' from this backup file. Export first if unsure.','Replace & import',function(){ state.leads=data.leads.map(function(l){ l.reclean=l.reclean||0; l.services=l.services||[]; return l; }); save(); closeOverlay(); render(); toast('Imported '+data.leads.length+' leads'); },false));
+    openModal(confirmModal('Import '+data.leads.length+' leads?','This replaces your current '+state.leads.length+' lead'+(state.leads.length===1?'':'s')+' with the '+data.leads.length+' from this backup file. Export first if unsure.','Replace & import',function(){ state.leads=data.leads.map(normalizeLead); save(); closeOverlay(); render(); toast('Imported '+state.leads.length+' leads'); },false));
   }catch(e){ toast('Not a valid backup file',true); }
 }
 function parseCSV(text){
@@ -1717,8 +1742,8 @@ function boot(){
   try{ var th=localStorage.getItem(THEME_KEY); if(th) document.documentElement.setAttribute('data-theme',th); }catch(e){}
   var had=load();
   if(!had||state.leads.length===0){ seed(); }
-  // migrate older records
-  state.leads.forEach(function(l){ if(!l.confidence) l.confidence='warm'; if(!l.services) l.services=[]; if(l.reclean==null) l.reclean=0; });
+  // normalize / migrate every record so no malformed lead can break rendering
+  if(Array.isArray(state.leads)) state.leads=state.leads.map(normalizeLead); else state.leads=[];
   if(!settings.templates) settings.templates=[];
   if(!settings.customServices) settings.customServices=[];
   if(!settings.customSources) settings.customSources=[];
