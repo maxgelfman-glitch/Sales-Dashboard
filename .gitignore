@@ -1,0 +1,9 @@
+# Test-only tooling (the app itself has no dependencies)
+node_modules/
+package.json
+package-lock.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
