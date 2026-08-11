@@ -38,21 +38,37 @@ Everyone who needs a touch, grouped **Overdue / Due today / This week / Upcoming
 A sortable, searchable table of every lead, with a service-type filter.
 
 ### 📈 Insights
-Your numbers at a glance: **win rate**, **revenue won**, **average job value**, open pipeline, **which lead sources actually convert** (so you know where to spend), most-requested services, and a pipeline funnel.
+Your numbers at a glance: **win rate** (counted only on *closed* leads — won + lost — so unworked leads never skew it), **win rate broken down by lead quality** (see how well your Hot vs Cold leads actually close), **revenue won**, **average job value**, open pipeline, **which lead sources actually convert** (so you know where to spend), most-requested services, and a pipeline funnel.
 
 ### The lead record (click any lead)
 - **Contact info** — phone, email, address are tappable (call, email, open in Maps).
 - **Pipeline stage** — change it from a dropdown.
-- **Follow-up reminder** — set a "reach back out on ___" date with a note; quick buttons for *2 days / 1 week / 2 weeks / 1 month*.
+- **Lead quality** — mark each lead **Hot / Warm / Cold** (one tap). A colored dot shows it everywhere, and Insights breaks down your win rate by quality.
+- **Follow-up reminder** — set a "reach back out on ___" date with a note; quick buttons *or pick any date you want*.
+- **One-tap outreach** — hit **Text** or **Email** and your phone's Messages/email app opens **pre-filled** with a message; you just tap send. Optionally logs it for you.
 - **Communication log** — a timeline of every call, text, email, or on-site visit, with date and notes. Logging a contact **prompts you to set the next follow-up right then**.
-- **Service tags** — house wash, driveway/concrete, roof, deck/fence, gutters, fleet, storefront, and more.
-- **Repeat business** — mark a Won job to **re-clean in 6 or 12 months** and it auto-schedules the reminder. Power washing wears off; this books the next job before you forget.
-- **Message templates** — ready-to-go follow-up and win-back texts, personalized with the contact's name. Tap to copy.
+- **Service tags** — house wash, driveway/concrete, roof, deck/fence, gutters, fleet, storefront, and more — **plus any custom tags you add yourself**.
+- **Repeat business** — mark a Won job to re-clean in 6, 12, or **any custom number of months** and it auto-schedules the reminder. Power washing wears off; this books the next job before you forget.
 - **Notes** — gate codes, surfaces, pricing, anything.
+
+## Messages, tone & templates
+
+You set a **tone** (Friendly / Professional / Casual) and the built-in follow-up and win-back messages match it. You can also **write your own templates** in Settings using fill-in-the-blanks like `{first}` (first name), `{place}` (home/property), `{service}`, and `{value}` — they fill in automatically per lead. Everything is one-tap **Text** / **Email** / **Copy**.
+
+> This is *semi-automatic*: the message is written for you and your phone opens ready to go — you tap send (about 10 seconds). Truly automatic sending (on a schedule, no tapping) would need a small hosted backend + a texting/email service; that's an easy future add-on when you want it.
 
 ## Reminders
 
-Turn on **desktop reminders** in Settings and the app will send you a notification when follow-ups are due (with your permission). Even without that, the sidebar badge and the Dashboard list keep you on top of things.
+Three ways, use whichever fits:
+- **Desktop notifications** — turn on in Settings; a pop-up when follow-ups are due (with permission).
+- **Reminders on your phone** — click **Calendar** in Settings (or "Add to my calendar" on any lead) to download a calendar file. Open it once and your phone's calendar notifies you — and can email you too.
+- **In-app** — the red sidebar badge and the Dashboard "Needs attention" list are always there.
+
+## Make it yours
+- **Custom service tags** — tap "+ New" in the Services picker on any lead, or manage them in Settings.
+- **Custom lead sources** — add your own (e.g. Nextdoor) in Settings.
+- **Message templates & tone** — in Settings.
+- **Theme** — light or dark.
 
 ## Handy shortcuts
 - `N` — new lead

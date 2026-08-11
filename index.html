@@ -487,6 +487,51 @@ tbody tr:last-child td{border-bottom:none}
 .map-note{background:var(--accent-soft);color:var(--ink-2);border-radius:10px;padding:11px 13px;font-size:12.5px;margin-bottom:14px;display:flex;gap:9px;align-items:flex-start}
 .map-note svg{width:16px;height:16px;color:var(--accent);flex:0 0 auto;margin-top:1px}
 
+/* Lead quality */
+.conf-pick{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.conf-opt{border:1.5px solid var(--line-strong);border-radius:11px;padding:10px 4px;display:flex;align-items:center;justify-content:center;gap:7px;background:var(--surface-2);font-size:12.5px;font-weight:650;color:var(--ink-2);transition:.12s}
+.conf-opt .cdot{width:10px;height:10px;border-radius:50%}
+.conf-opt:hover{border-color:var(--faint)}
+.conf-opt.sel-hot{border-color:var(--bad);background:var(--bad-soft);color:var(--bad)}
+.conf-opt.sel-warm{border-color:var(--warn);background:var(--warn-soft);color:var(--warn)}
+.conf-opt.sel-cold{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.chip-hot{background:var(--bad-soft);color:var(--bad)}
+.chip-warm{background:var(--warn-soft);color:var(--warn)}
+.chip-cold{background:var(--accent-soft);color:var(--accent)}
+.qdot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto;vertical-align:middle}
+
+/* Compose / templates */
+.send-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.tpl-list{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.tpl-list .tpl{cursor:pointer;transition:.12s}
+.tpl-list .tpl:hover{border-color:var(--line-strong)}
+.tpl-list .tpl.sel{border-color:var(--accent);background:var(--accent-soft)}
+.var-hint{font-size:11.5px;color:var(--muted);margin-top:7px}
+.var-hint code{background:var(--surface-hover);padding:1px 5px;border-radius:5px;font-size:11px;color:var(--ink-2)}
+
+/* Inline new-tag + management */
+.new-tag{border-style:dashed!important;color:var(--muted)}
+.new-tag:hover{border-color:var(--accent)!important;color:var(--accent)}
+.mini-input{border:1.5px solid var(--accent);border-radius:20px;padding:6px 12px;font-size:12.5px;background:var(--surface);color:var(--ink);width:140px;outline:none}
+.chip-manage{display:flex;flex-wrap:wrap;gap:7px}
+.chip-manage .chip{padding:5px 10px}
+.chip-manage .chip button{background:none;border:none;color:currentColor;opacity:.55;cursor:pointer;padding:0 0 0 3px;display:inline-flex;align-items:center}
+.chip-manage .chip button:hover{opacity:1}
+.chip-manage .chip button svg{width:12px;height:12px}
+.tmpl-item{display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid var(--line)}
+.tmpl-item:first-child{border-top:none}
+.tmpl-item .ti-txt{flex:1;min-width:0}
+.tmpl-item .ti-txt .t{font-weight:600;font-size:13.5px}
+.tmpl-item .ti-txt .d{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}
+.tmpl-item .ti-act{display:flex;gap:6px;flex:0 0 auto}
+.tone-pick{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:6px}
+.tone-opt{border:1.5px solid var(--line-strong);border-radius:10px;padding:9px;text-align:center;background:var(--surface-2);font-size:13px;font-weight:600;color:var(--ink-2);transition:.12s}
+.tone-opt:hover{border-color:var(--faint)}
+.tone-opt.sel{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.settings-scroll{max-height:none}
+.set-section-title{font-size:11.5px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:20px 0 4px;padding-top:16px;border-top:1px solid var(--line)}
+.set-section-title:first-child{border-top:none;padding-top:0;margin-top:0}
+
 /* Toast */
 .toast-wrap{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;gap:8px;align-items:center}
 .toast{
@@ -557,6 +602,7 @@ var I = {
   building:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="1.5"/><path d="M9 22v-4h6v4M8 6h.01M12 6h.01M16 6h.01M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M16 14h.01"/></svg>',
   dollar:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>',
   clock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  calendar:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2.5"/><path d="M3 9h18M8 2v4M16 2v4"/></svg>',
   snooze:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6M5 5l2-2M19 5l-2-2"/></svg>',
   repeat:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>',
   check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
@@ -600,15 +646,35 @@ var SERVICES = [
 var SERVICE_MAP={}; SERVICES.forEach(function(s){SERVICE_MAP[s.id]=s;});
 var SOURCES = ['Workiz','Facebook Lead','Google','Referral','Website','Yard Sign','Repeat Customer','Other'];
 var LOST_REASONS = ['Price too high','Went with competitor','No response','Not ready yet','Out of service area','Job too small','Other'];
+var CONFIDENCE = [
+  {id:'hot', name:'Hot',  color:'var(--bad)',  chip:'chip-hot',  cls:'sel-hot',  desc:'Ready to buy'},
+  {id:'warm',name:'Warm', color:'var(--warn)', chip:'chip-warm', cls:'sel-warm', desc:'Interested'},
+  {id:'cold',name:'Cold', color:'var(--accent)',chip:'chip-cold', cls:'sel-cold', desc:'Long shot'}
+];
+var CONF_MAP={}; CONFIDENCE.forEach(function(c){CONF_MAP[c.id]=c;});
+var TONE_TEMPLATES = {
+  friendly:{
+    follow:"Hi {first}! Just following up on the power washing quote for your {place}. I'd love to get it looking great for you — want me to get you on the schedule?",
+    winback:"Hi {first}! It's been a while since we cleaned your {place}. Ready to bring back that fresh look? Happy to put together a quick quote whenever you are."
+  },
+  professional:{
+    follow:"Hello {first}, following up regarding the power washing estimate for your {place}. Please let me know if you have any questions or would like to schedule the service.",
+    winback:"Hello {first}, it's been some time since your last power washing service. We'd be glad to schedule a refresh — let me know a convenient time and I'll prepare a quote."
+  },
+  casual:{
+    follow:"Hey {first}, still thinking about getting that power washing done? Happy to get you booked whenever — just say the word.",
+    winback:"Hey {first}! Your {place} is probably due for another wash. Want me to swing by and get it looking new again?"
+  }
+};
 var STORE_KEY='pw_crm_v1', THEME_KEY='pw_crm_theme', SETTINGS_KEY='pw_crm_settings';
 
 /* ---------- State ---------- */
 var state = {
   leads:[], view:'dashboard', segment:'all', search:'', selectedId:null,
-  sort:{key:'updated',dir:'desc'}, sidebarOpen:false, serviceFilter:'all',
+  sort:{key:'updated',dir:'desc'}, sidebarOpen:false, serviceFilter:'all', confFilter:'all',
   _modal:null, _confirmFn:null, _pendingDelete:null, _lastFocus:null
 };
-var settings = {notify:false, lastBackup:0, sampleDismissed:false};
+var settings = {notify:false, lastBackup:0, sampleDismissed:false, tone:'friendly', templates:[], customServices:[], customSources:[]};
 
 /* ---------- Persistence ---------- */
 function load(){
@@ -650,6 +716,39 @@ function fuStatus(lead){
 }
 function digits(s){ return (s||'').replace(/\D/g,''); }
 function isActive(l){ return l.stage!=='won'&&l.stage!=='lost'; }
+function allServices(){ return SERVICES.concat(settings.customServices||[]); }
+function svcName(id){ if(SERVICE_MAP[id]) return SERVICE_MAP[id].name; var c=(settings.customServices||[]).filter(function(x){return x.id===id;})[0]; return c?c.name:id; }
+function allSources(){ return SOURCES.concat(settings.customSources||[]); }
+function confOf(l){ return CONF_MAP[l.confidence]||CONF_MAP.warm; }
+function resolveTemplate(lead,body){
+  var first=(lead.contact||lead.name||'there').split(' ')[0];
+  var place=lead.type==='commercial'?'property':'home';
+  var svc=(lead.services&&lead.services.length)?svcName(lead.services[0]):place;
+  return String(body)
+    .replace(/\{first\}/g,first).replace(/\{name\}/g,lead.name||'')
+    .replace(/\{business\}/g,lead.name||'').replace(/\{service\}/g,svc)
+    .replace(/\{place\}/g,place).replace(/\{value\}/g,lead.value?money(lead.value):'the estimate');
+}
+function builtinTemplates(){
+  var t=TONE_TEMPLATES[settings.tone]||TONE_TEMPLATES.friendly;
+  return [{id:'follow',name:'Follow-up',body:t.follow,builtin:true},{id:'winback',name:'Win-back / re-clean',body:t.winback,builtin:true}];
+}
+function allTemplates(){ return builtinTemplates().concat((settings.templates||[]).map(function(t){return {id:t.id,name:t.name,body:t.body,builtin:false};})); }
+function openLink(href){ var a=document.createElement('a'); a.href=href; a.target='_blank'; a.rel='noopener'; document.body.appendChild(a); a.click(); setTimeout(function(){a.remove();},50); }
+function downloadFile(name,text,mime){ var blob=new Blob([text],{type:mime||'text/plain'}); var url=URL.createObjectURL(blob),a=document.createElement('a'); a.href=url; a.download=name; a.click(); setTimeout(function(){URL.revokeObjectURL(url);},1000); }
+function icsStamp(){ var d=new Date(); function p(n){return n<10?'0'+n:''+n;} return d.getUTCFullYear()+p(d.getUTCMonth()+1)+p(d.getUTCDate())+'T'+p(d.getUTCHours())+p(d.getUTCMinutes())+p(d.getUTCSeconds())+'Z'; }
+function icsEscape(s){ return String(s||'').replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\n/g,'\\n'); }
+function icsEvent(lead){
+  var d=lead.followUp.date.replace(/-/g,''); // YYYYMMDD
+  var start=d+'T090000', end=d+'T093000';
+  var summary='Follow up: '+lead.name+(lead.phone?' ('+lead.phone+')':'');
+  var desc=(lead.followUp.note?lead.followUp.note+'. ':'')+'PowerWash CRM reminder.';
+  return ['BEGIN:VEVENT','UID:'+lead.id+'-'+d+'@powerwashcrm','DTSTAMP:'+icsStamp(),
+    'DTSTART:'+start,'DTEND:'+end,'SUMMARY:'+icsEscape(summary),'DESCRIPTION:'+icsEscape(desc),
+    'BEGIN:VALARM','ACTION:DISPLAY','DESCRIPTION:'+icsEscape('Follow up: '+lead.name),'TRIGGER:PT0S','END:VALARM',
+    'END:VEVENT'].join('\r\n');
+}
+function icsWrap(events){ return ['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//PowerWash CRM//EN','CALSCALE:GREGORIAN'].concat(events).concat(['END:VCALENDAR']).join('\r\n'); }
 
 /* ---------- Filtering ---------- */
 function segMatch(l){ return state.segment==='all'||l.type===state.segment; }
@@ -830,10 +929,12 @@ function kanbanCard(lead){
   else if(fu.level==='today')fuBadge='<span class="card-fu" style="color:var(--warn)">'+I.bell+'Today</span>';
   else if(fu.level==='soon')fuBadge='<span class="card-fu" style="color:var(--warn)">'+I.clock+fu.days+'d</span>';
   else if(fu.level==='later')fuBadge='<span class="card-fu" style="color:var(--muted)">'+I.clock+relDays(lead.followUp.date)+'</span>';
-  var tags=(lead.services||[]).slice(0,2).map(function(id){return '<span class="chip chip-svc">'+esc((SERVICE_MAP[id]||{}).name||id)+'</span>';}).join('');
+  var tags=(lead.services||[]).slice(0,2).map(function(id){return '<span class="chip chip-svc">'+esc(svcName(id))+'</span>';}).join('');
   var more=(lead.services||[]).length>2?'<span class="chip chip-svc">+'+((lead.services.length)-2)+'</span>':'';
+  var c=confOf(lead);
+  var qdot='<span class="qdot" style="background:'+c.color+'" title="'+c.name+' lead"></span>';
   return '<div class="card" draggable="true" data-card="'+lead.id+'" data-open="'+lead.id+'">'+
-    '<div class="card-top"><div><div class="card-name">'+esc(lead.name)+'</div>'+(lead.contact?'<div class="card-sub">'+esc(lead.contact)+'</div>':'')+'</div>'+typeChip+'</div>'+
+    '<div class="card-top"><div><div class="card-name">'+qdot+' '+esc(lead.name)+'</div>'+(lead.contact?'<div class="card-sub">'+esc(lead.contact)+'</div>':'')+'</div>'+typeChip+'</div>'+
     (tags?'<div class="card-tags">'+tags+more+'</div>':'')+
     '<div class="card-foot">'+(lead.value?'<span class="card-val tnum">'+money(lead.value)+'</span>':'<span class="card-sub">No value</span>')+fuBadge+'</div></div>';
 }
@@ -857,6 +958,7 @@ function followupsView(){
 function contactsView(){
   var v=visibleLeads().slice();
   if(state.serviceFilter!=='all') v=v.filter(function(l){return (l.services||[]).indexOf(state.serviceFilter)>=0;});
+  if(state.confFilter&&state.confFilter!=='all') v=v.filter(function(l){return (l.confidence||'warm')===state.confFilter;});
   var sk=state.sort.key,dir=state.sort.dir==='asc'?1:-1;
   v.sort(function(a,b){
     var x,y;
@@ -876,14 +978,16 @@ function contactsView(){
     else if(fu.level==='soon')fuChip='<span class="chip chip-warn">'+fmtDate(l.followUp.date)+'</span>';
     else if(fu.level==='later')fuChip='<span class="chip chip-neutral">'+fmtDate(l.followUp.date)+'</span>';
     else fuChip='<span class="dim" style="font-size:12.5px">—</span>';
-    return '<tr data-open="'+l.id+'"><td><div class="td-name">'+esc(l.name)+(l.reclean?' <span class="chip chip-repeat" style="vertical-align:middle">Repeat</span>':'')+'</div>'+(l.contact?'<div class="td-sub">'+esc(l.contact)+'</div>':'')+'</td>'+
+    var c=confOf(l);
+    return '<tr data-open="'+l.id+'"><td><div class="td-name"><span class="qdot" style="background:'+c.color+'" title="'+c.name+' lead"></span> '+esc(l.name)+(l.reclean?' <span class="chip chip-repeat" style="vertical-align:middle">Repeat</span>':'')+'</div>'+(l.contact?'<div class="td-sub">'+esc(l.contact)+'</div>':'')+'</td>'+
       '<td><span class="chip '+(l.type==='residential'?'chip-res':'chip-com')+'">'+(l.type==='residential'?'Residential':'Commercial')+'</span></td>'+
       '<td><span class="chip chip-neutral">'+STAGE_MAP[l.stage].name+'</span></td>'+
       '<td class="tnum">'+(l.value?money(l.value):'<span class="dim">—</span>')+'</td>'+
       '<td class="dim tnum" style="font-size:13px">'+(lc?fmtDate(lc.date):'Never')+'</td><td>'+fuChip+'</td></tr>';
   }).join('');
-  var svcOpts='<option value="all">All services</option>'+SERVICES.map(function(s){return '<option value="'+s.id+'"'+(state.serviceFilter===s.id?' selected':'')+'>'+s.name+'</option>';}).join('');
-  var toolbar='<div class="toolbar"><span class="t-lbl">Filter:</span><select class="mini-sel" id="svcFilter">'+svcOpts+'</select><span class="count-txt">'+v.length+' lead'+(v.length===1?'':'s')+'</span></div>';
+  var svcOpts='<option value="all">All services</option>'+allServices().map(function(s){return '<option value="'+s.id+'"'+(state.serviceFilter===s.id?' selected':'')+'>'+esc(s.name)+'</option>';}).join('');
+  var confOpts='<option value="all">All quality</option>'+CONFIDENCE.map(function(c){return '<option value="'+c.id+'"'+(state.confFilter===c.id?' selected':'')+'>'+c.name+'</option>';}).join('');
+  var toolbar='<div class="toolbar"><span class="t-lbl">Filter:</span><select class="mini-sel" id="confFilter">'+confOpts+'</select><select class="mini-sel" id="svcFilter">'+svcOpts+'</select><span class="count-txt">'+v.length+' lead'+(v.length===1?'':'s')+'</span></div>';
   return banners()+toolbar+'<div class="table-wrap"><table><thead><tr>'+th('name','Lead')+th('type','Type')+th('stage','Stage')+th('value','Value')+th('lastcontact','Last contact')+th('followup','Next follow-up')+'</tr></thead><tbody>'+(rows||'<tr><td colspan="6" class="empty" style="padding:40px">No matching leads</td></tr>')+'</tbody></table></div>';
 }
 
@@ -900,11 +1004,23 @@ function insightsView(){
   var pipeVal=active.reduce(function(s,l){return s+(Number(l.value)||0);},0);
 
   var ins='<div class="ins-grid">'+
-    stat(I.spark,'Win rate',convRate+'%',won.length+' won · '+lost.length+' lost')+
+    stat(I.spark,'Win rate',convRate+'%',closed?('of '+closed+' closed ('+won.length+' won · '+lost.length+' lost)'):'no closed leads yet')+
     stat(I.dollar,'Revenue won',money(wonRev),segLabel())+
     stat(I.check,'Avg job value',money(avgJob),won.length+' completed job'+(won.length===1?'':'s'))+
     stat(I.board,'Open pipeline',money(pipeVal),active.length+' active lead'+(active.length===1?'':'s'))+
   '</div>';
+
+  // by lead quality (answers "do cold leads skew win rate?")
+  var qBars=CONFIDENCE.map(function(c){
+    var inTier=v.filter(function(l){return (l.confidence||'warm')===c.id;});
+    var w=inTier.filter(function(l){return l.stage==='won';}).length;
+    var ls=inTier.filter(function(l){return l.stage==='lost';}).length;
+    var cl=w+ls, rate=cl?Math.round(w/cl*100):0;
+    return {name:c.name,color:c.color,total:inTier.length,rate:rate,closed:cl};
+  });
+  var maxQ=Math.max.apply(null,qBars.map(function(q){return q.total;}).concat([1]));
+  var qHtml=qBars.map(function(q){var w=Math.round(q.total/maxQ*100);return '<div class="bar-row"><div class="bar-label"><span class="sw" style="background:'+q.color+'"></span>'+q.name+'</div><div class="bar-track"><div class="bar-fill" style="width:'+w+'%;background:'+q.color+'"></div></div><div class="bar-val tnum">'+q.total+' lead'+(q.total===1?'':'s')+' <small>· '+(q.closed?q.rate+'% won':'none closed')+'</small></div></div>';}).join('');
+  var qPanel='<div class="panel"><div class="panel-head"><h2>Win rate by lead quality</h2><span class="hint">Only closed leads (won + lost) count toward a rate</span></div><div class="bars">'+qHtml+'</div></div>';
 
   // by source
   var bySource={};
@@ -927,7 +1043,7 @@ function insightsView(){
   var svcPanel='';
   if(svcArr.length){
     var maxSvc=Math.max.apply(null,svcArr.map(function(s){return s.n;}).concat([1]));
-    var svcBars=svcArr.map(function(s){var w=Math.round(s.n/maxSvc*100);return '<div class="bar-row"><div class="bar-label">'+esc((SERVICE_MAP[s.id]||{}).name||s.id)+'</div><div class="bar-track"><div class="bar-fill" style="width:'+w+'%;background:var(--res)"></div></div><div class="bar-val tnum">'+s.n+'</div></div>';}).join('');
+    var svcBars=svcArr.map(function(s){var w=Math.round(s.n/maxSvc*100);return '<div class="bar-row"><div class="bar-label">'+esc(svcName(s.id))+'</div><div class="bar-track"><div class="bar-fill" style="width:'+w+'%;background:var(--res)"></div></div><div class="bar-val tnum">'+s.n+'</div></div>';}).join('');
     svcPanel='<div class="panel"><div class="panel-head"><h2>Most requested services</h2></div><div class="bars">'+svcBars+'</div></div>';
   }
 
@@ -935,7 +1051,7 @@ function insightsView(){
   var funnel='<div class="panel"><div class="panel-head"><h2>Pipeline funnel</h2></div><div class="funnel">'+
     STAGES.map(function(s){var n=v.filter(function(l){return l.stage===s.id;}).length;return '<div class="fn-step"><div class="fn-n tnum">'+n+'</div><div class="fn-l"><span class="cdot" style="background:'+s.color+'"></span>'+s.name+'</div></div>';}).join('')+'</div></div>';
 
-  return ins+srcPanel+svcPanel+funnel;
+  return ins+qPanel+srcPanel+svcPanel+funnel;
 }
 
 /* ============================================================================ SLIDE-OVER */
@@ -956,6 +1072,9 @@ function renderOverlay(){
 function slideover(lead){
   var fu=fuStatus(lead);
   var typeChip='<span class="chip '+(lead.type==='residential'?'chip-res':'chip-com')+'"><span class="dot" style="background:currentColor"></span>'+(lead.type==='residential'?'Residential':'Commercial')+'</span>';
+  var c=confOf(lead);
+  var confChip='<span class="chip '+c.chip+'"><span class="dot" style="background:currentColor"></span>'+c.name+'</span>';
+  var confPick='<div class="conf-pick" style="margin-top:2px">'+CONFIDENCE.map(function(cc){return '<button type="button" class="conf-opt'+(lead.confidence===cc.id?' '+cc.cls:'')+'" data-setconf="'+cc.id+'"><span class="cdot" style="background:'+cc.color+'"></span>'+cc.name+'</button>';}).join('')+'</div>';
   var stageOpts=STAGES.map(function(s){return '<option value="'+s.id+'"'+(s.id===lead.stage?' selected':'')+'>'+s.name+'</option>';}).join('');
 
   var info='<div class="info-grid">';
@@ -970,7 +1089,7 @@ function slideover(lead){
   // services
   var svcSection='';
   if((lead.services||[]).length){
-    svcSection='<div class="section"><div class="section-label">Services</div><div class="tag-pick">'+lead.services.map(function(id){return '<span class="chip chip-svc" style="padding:5px 11px;font-size:12px">'+esc((SERVICE_MAP[id]||{}).name||id)+'</span>';}).join('')+'</div></div>';
+    svcSection='<div class="section"><div class="section-label">Services</div><div class="tag-pick">'+lead.services.map(function(id){return '<span class="chip chip-svc" style="padding:5px 11px;font-size:12px">'+esc(svcName(id))+'</span>';}).join('')+'</div></div>';
   }
 
   // follow-up
@@ -990,7 +1109,7 @@ function slideover(lead){
       recleanBlock='<div class="section"><div class="fu-set good"><div class="fs-ic">'+I.repeat+'</div><div class="fs-txt"><div class="t">Repeat customer — re-clean every '+lead.reclean+' months</div><div class="d">Next reminder set for '+esc(fmtDate((lead.followUp&&lead.followUp.date)||addMonthsISO(lead.reclean)))+'</div></div><button class="btn btn-ghost btn-sm" data-reclean="0">Stop</button></div></div>';
     } else {
       recleanBlock='<div class="section"><div class="section-label">Repeat business</div><div class="fu-set none"><div class="fs-ic">'+I.repeat+'</div><div class="fs-txt"><div class="t">Schedule the next re-clean</div><div class="d">Power washing wears off — line up the next job now.</div></div></div>'+
-        '<div class="reclean-btns"><button class="btn btn-soft btn-sm" data-reclean="6">In 6 months</button><button class="btn btn-soft btn-sm" data-reclean="12">In 12 months</button></div></div>';
+        '<div class="reclean-btns"><button class="btn btn-soft btn-sm" data-reclean="6">In 6 months</button><button class="btn btn-soft btn-sm" data-reclean="12">In 12 months</button><button class="btn btn-ghost btn-sm" data-reclean="custom">Custom…</button></div></div>';
     }
   }
 
@@ -998,44 +1117,45 @@ function slideover(lead){
   var comms=(lead.comms||[]).slice().sort(function(a,b){return a.date<b.date?1:(a.date>b.date?-1:(b.ts||0)-(a.ts||0));});
   var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
 
-  // templates
-  var first=(lead.contact||lead.name||'there').split(' ')[0];
-  var svc=lead.type==='commercial'?'property':'home';
-  var tplFollow='Hi '+first+', following up on the power washing quote for your '+svc+'. Happy to answer any questions or get you on the schedule — when works best for you?';
-  var tplCheck='Hi '+first+', it\'s been a while since we cleaned your '+svc+'. Ready to get it looking fresh again? I can put together a quick quote.';
-
   var lostBlock=lead.stage==='lost'&&lead.lostReason?'<div class="section"><div class="fu-set bad"><div class="fs-ic">'+I.info+'</div><div class="fs-txt"><div class="t">Marked lost</div><div class="d">Reason: '+esc(lead.lostReason)+'</div></div></div></div>':'';
 
   return '<aside class="slideover" role="dialog" aria-modal="true" aria-label="Lead details">'+
     '<div class="so-head"><div class="so-top"><div style="flex:1;min-width:0"><h2 class="so-title">'+esc(lead.name)+'</h2>'+
-      '<div class="so-sub">'+typeChip+(lead.reclean?' <span class="chip chip-repeat">'+I.repeat+'Repeat</span>':'')+'<span>Added '+fmtDate(isoFromTs(lead.created))+'</span></div></div>'+
+      '<div class="so-sub">'+typeChip+confChip+(lead.reclean?' <span class="chip chip-repeat">'+I.repeat+'Repeat</span>':'')+'<span>Added '+fmtDate(isoFromTs(lead.created))+'</span></div></div>'+
       '<button class="icon-btn" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
       '<div style="margin-top:14px"><label class="field-lbl" for="stageSel" style="margin-bottom:6px">Pipeline stage</label>'+
       '<select id="stageSel" style="width:100%;border:1px solid var(--line-strong);border-radius:10px;padding:9px 11px;background:var(--surface-2);color:var(--ink);font-weight:600">'+stageOpts+'</select></div></div>'+
     '<div class="so-body">'+
-      '<div class="section">'+fuBlock+'</div>'+recleanBlock+lostBlock+
+      '<div class="section">'+fuBlock+(fu.level!=='none'?'<div style="text-align:right;margin-top:8px"><button class="btn btn-ghost btn-sm" data-addcal="'+lead.id+'">'+I.calendar+'Add to my calendar</button></div>':'')+'</div>'+recleanBlock+lostBlock+
+      '<div class="section"><div class="section-label">Reach out</div>'+
+        '<div class="send-row" style="margin-top:0">'+
+          (lead.phone?'<button class="btn btn-soft btn-sm" data-compose="'+lead.id+'|text">'+I.chat+'Text</button>':'')+
+          (lead.email?'<button class="btn btn-soft btn-sm" data-compose="'+lead.id+'|email">'+I.mail+'Email</button>':'')+
+          '<button class="btn btn-ghost btn-sm" data-compose="'+lead.id+'|copy">'+I.copy+'Compose message</button>'+
+        '</div>'+((!lead.phone&&!lead.email)?'<div class="var-hint" style="margin-top:8px">Add a phone or email to send with one tap.</div>':'')+'</div>'+
+      '<div class="section"><div class="section-label">Lead quality</div>'+confPick+'</div>'+
       '<div class="section"><div class="section-label">Contact info</div>'+info+'</div>'+svcSection+
       '<div class="section"><div class="section-label">Communication log<button class="add" data-log="'+lead.id+'">'+I.plus+'Log contact</button></div><div class="timeline">'+tl+'</div></div>'+
-      '<div class="section"><div class="section-label">Message templates <span style="font-weight:500;text-transform:none;letter-spacing:0;color:var(--faint)">— tap to copy</span></div>'+tplCard('Follow-up',tplFollow)+tplCard('Win-back / re-clean',tplCheck)+'</div>'+
       '<div class="section"><div class="section-label">Notes<button class="add" data-editnote="'+lead.id+'">'+I.edit+'Edit</button></div><div class="notes-box'+(lead.notes?'':' empty-note')+'">'+(lead.notes?esc(lead.notes):'No notes yet')+'</div></div>'+
     '</div>'+
     '<div class="so-foot"><button class="btn btn-ghost btn-sm" data-edit="'+lead.id+'">'+I.edit+'Edit details</button><div style="flex:1"></div><button class="btn btn-danger btn-sm" data-del="'+lead.id+'">'+I.trash+'Delete</button></div>'+
   '</aside>';
 }
 function infoItem(icon,lbl,val,full){ return '<div class="info-item'+(full?' full':'')+'">'+icon+'<div class="it-txt"><div class="it-lbl">'+lbl+'</div><div class="it-val">'+val+'</div></div></div>'; }
-function tplCard(title,txt){ return '<div class="tpl"><div class="tpl-top"><span class="t">'+esc(title)+'</span><button class="copy" data-copy="'+attr(txt)+'">'+I.copy+'Copy</button></div><div class="tpl-txt">'+esc(txt)+'</div></div>'; }
 
 /* ============================================================================ MODALS */
 function openModal(fn){ if(!state._modal&&!state.selectedId) saveFocus(); state._modal=fn; renderOverlay(); }
 function closeModal(){ state._modal=null; state._confirmFn=null; if(state.selectedId) renderOverlay(); else { document.getElementById('overlay').innerHTML=''; restoreFocus(); } }
 
 function leadModal(existing,presetStage){
-  var l=existing||{type:'residential',stage:presetStage||'new',source:'Facebook Lead',services:[]};
+  var l=existing||{type:'residential',stage:presetStage||'new',source:'Facebook Lead',services:[],confidence:'warm'};
   return function(){
     var isEdit=!!existing;
-    var srcOpts=SOURCES.map(function(s){return '<option'+(l.source===s?' selected':'')+'>'+s+'</option>';}).join('');
+    var srcOpts=allSources().map(function(s){return '<option'+(l.source===s?' selected':'')+'>'+esc(s)+'</option>';}).join('');
     var stageOpts=STAGES.map(function(s){return '<option value="'+s.id+'"'+(l.stage===s.id?' selected':'')+'>'+s.name+'</option>';}).join('');
-    var tags=SERVICES.map(function(s){return '<button type="button" class="tag-opt'+((l.services||[]).indexOf(s.id)>=0?' sel':'')+'" data-tag="'+s.id+'">'+s.name+'</button>';}).join('');
+    var curConf=l.confidence||'warm';
+    var confBtns=CONFIDENCE.map(function(c){return '<button type="button" class="conf-opt'+(curConf===c.id?' '+c.cls:'')+'" data-conf="'+c.id+'"><span class="cdot" style="background:'+c.color+'"></span>'+c.name+'</button>';}).join('');
+    var tags=allServices().map(function(s){return '<button type="button" class="tag-opt'+((l.services||[]).indexOf(s.id)>=0?' sel':'')+'" data-tag="'+s.id+'">'+esc(s.name)+'</button>';}).join('')+'<button type="button" class="tag-opt new-tag" data-newtag="1">'+I.plus+'New</button>';
     return '<div class="modal" role="dialog" aria-modal="true" aria-label="'+(isEdit?'Edit lead':'New lead')+'">'+
       '<div class="modal-head"><h2>'+(isEdit?'Edit lead':'New lead')+'</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
       '<div class="modal-body">'+
@@ -1044,6 +1164,7 @@ function leadModal(existing,presetStage){
           '<button type="button" class="type-opt'+(l.type==='commercial'?' sel-com':'')+'" data-type="commercial">'+I.building+'Commercial</button>'+
         '</div><input type="hidden" id="f-type" value="'+attr(l.type)+'"/></div>'+
         '<div class="field"><label id="nameLbl">'+(l.type==='commercial'?'Business name':'Name')+' <span class="req">*</span></label><input id="f-name" value="'+attr(l.name||'')+'" placeholder="'+(l.type==='commercial'?'e.g. Riverside Plaza':'e.g. John Smith')+'"/></div>'+
+        '<div class="field"><label>Lead quality <span style="font-weight:500;color:var(--muted)">— how likely to close?</span></label><div class="conf-pick" id="confPick">'+confBtns+'</div><input type="hidden" id="f-conf" value="'+attr(curConf)+'"/></div>'+
         '<div class="field row2"><div><label>Point of contact</label><input id="f-contact" value="'+attr(l.contact||'')+'" placeholder="Contact person"/></div><div><label>Phone</label><input id="f-phone" value="'+attr(l.phone||'')+'" placeholder="(555) 123-4567"/></div></div>'+
         '<div class="field row2"><div><label>Email</label><input id="f-email" value="'+attr(l.email||'')+'" placeholder="name@email.com"/></div><div><label>Est. job value</label><input id="f-value" type="number" min="0" value="'+attr(l.value||'')+'" placeholder="1500"/></div></div>'+
         '<div class="field"><label>Address</label><input id="f-address" value="'+attr(l.address||'')+'" placeholder="Service address"/></div>'+
@@ -1091,6 +1212,37 @@ function noteModal(leadId){
     return '<div class="modal" role="dialog" aria-modal="true" aria-label="Edit notes"><div class="modal-head"><h2>Edit notes</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div><div class="modal-body"><div class="field" style="margin:0"><textarea id="n-notes" style="min-height:160px" placeholder="Notes about this lead…">'+esc(lead.notes||'')+'</textarea></div></div><div class="modal-foot"><div class="spacer"></div><button class="btn btn-ghost" data-close="1">Cancel</button><button class="btn btn-primary" data-savenote="'+leadId+'">'+I.check+'Save</button></div></div>';
   };
 }
+function recleanModal(leadId){
+  return function(){
+    var lead=state.leads.find(function(l){return l.id===leadId;}); var cur=lead.reclean||6;
+    return '<div class="modal" role="dialog" aria-modal="true" aria-label="Re-clean reminder" style="width:min(440px,calc(100vw - 32px))"><div class="modal-head"><h2>Re-clean reminder</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
+      '<div class="modal-body"><div class="field"><label>Remind me to reach out again in…</label>'+
+      '<div style="display:flex;align-items:center;gap:10px"><input type="number" id="rc-months" min="1" max="60" value="'+cur+'" style="width:100px"/><span style="font-weight:600;color:var(--ink-2)">months</span></div>'+
+      '<div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap"><button type="button" class="btn btn-ghost btn-sm" data-rcq="3">3 mo</button><button type="button" class="btn btn-ghost btn-sm" data-rcq="6">6 mo</button><button type="button" class="btn btn-ghost btn-sm" data-rcq="12">12 mo</button><button type="button" class="btn btn-ghost btn-sm" data-rcq="18">18 mo</button><button type="button" class="btn btn-ghost btn-sm" data-rcq="24">24 mo</button></div></div></div>'+
+      '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savereclean="'+leadId+'">'+I.check+'Set reminder</button></div></div>';
+  };
+}
+function composeModal(leadId,mode){
+  return function(){
+    var lead=state.leads.find(function(l){return l.id===leadId;});
+    var tpls=allTemplates();
+    var first=tpls[0];
+    var chips=tpls.map(function(t,i){return '<div class="tpl'+(i===0?' sel':'')+'" data-tpl="'+attr(t.body)+'" data-tplname="'+attr(t.name)+'"><div class="tpl-top"><span class="t">'+esc(t.name)+'</span></div><div class="tpl-txt">'+esc(resolveTemplate(lead,t.body))+'</div></div>';}).join('');
+    var canText=!!lead.phone, canEmail=!!lead.email;
+    var focusText=mode==='text'&&canText, focusEmail=mode==='email'&&canEmail;
+    return '<div class="modal" role="dialog" aria-modal="true" aria-label="Compose message"><div class="modal-head"><h2>Message '+esc((lead.contact||lead.name||'').split(" ")[0]||lead.name)+'</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
+      '<div class="modal-body">'+
+        '<div class="field"><label>Pick a template <span style="font-weight:500;color:var(--muted)">(tone: '+esc(settings.tone)+' — change in Settings)</span></label><div class="tpl-list">'+chips+'</div></div>'+
+        '<div class="field"><label>Message <span style="font-weight:500;color:var(--muted)">— edit freely before sending</span></label><textarea id="cm-body" style="min-height:120px">'+esc(resolveTemplate(lead,first.body))+'</textarea></div>'+
+        '<div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-weight:600"><input type="checkbox" id="cm-log" checked style="width:auto"/> Log this as a contact when I send</label></div>'+
+      '</div>'+
+      '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div>'+
+        '<button class="btn btn-ghost btn-sm" data-cm-copy="'+leadId+'">'+I.copy+'Copy</button>'+
+        (canEmail?'<button class="btn '+(focusEmail?'btn-primary':'btn-soft')+' btn-sm" data-cm-email="'+leadId+'">'+I.mail+'Email</button>':'')+
+        (canText?'<button class="btn '+(focusText||!canEmail?'btn-primary':'btn-soft')+' btn-sm" data-cm-text="'+leadId+'">'+I.chat+'Text</button>':'')+
+      '</div></div>';
+  };
+}
 function lostModal(leadId){
   return function(){
     var opts=LOST_REASONS.map(function(r){return '<option>'+r+'</option>';}).join('');
@@ -1108,15 +1260,47 @@ function confirmModal(title,msg,confirmLabel,onConfirm,danger){
 function settingsModal(){
   return function(){
     var notifySupported=('Notification' in window);
+    var toneBtns=['friendly','professional','casual'].map(function(t){return '<button type="button" class="tone-opt'+(settings.tone===t?' sel':'')+'" data-tone="'+t+'">'+t.charAt(0).toUpperCase()+t.slice(1)+'</button>';}).join('');
+    var customTpls=(settings.templates||[]);
+    var tplList=customTpls.length?customTpls.map(function(t){return '<div class="tmpl-item"><div class="ti-txt"><div class="t">'+esc(t.name)+'</div><div class="d">'+esc(t.body)+'</div></div><div class="ti-act"><button class="icon-btn" data-tpledit="'+t.id+'" title="Edit">'+I.edit+'</button><button class="icon-btn" data-tpldel="'+t.id+'" title="Delete">'+I.trash+'</button></div></div>';}).join(''):'<div class="var-hint" style="margin:4px 0 8px">No custom templates yet. The built-in follow-up and win-back messages always adapt to your tone above.</div>';
+    var customSvc=(settings.customServices||[]);
+    var svcManage=customSvc.length?('<div class="chip-manage" style="margin-top:8px">'+customSvc.map(function(s){return '<span class="chip chip-svc">'+esc(s.name)+'<button data-svcdel="'+s.id+'" title="Remove">'+I.x+'</button></span>';}).join('')+'</div>'):'<div class="var-hint" style="margin-top:6px">Add your own service tags right from any lead — tap “+ New” in the Services picker.</div>';
+    var customSrc=(settings.customSources||[]);
+    var srcManage=customSrc.length?('<div class="chip-manage" style="margin-top:8px">'+customSrc.map(function(s){return '<span class="chip chip-neutral">'+esc(s)+'<button data-srcdel="'+esc(s)+'" title="Remove">'+I.x+'</button></span>';}).join('')+'</div>'):'';
     return '<div class="modal" role="dialog" aria-modal="true" aria-label="Settings"><div class="modal-head"><h2>Settings</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
       '<div class="modal-body">'+
-        '<div class="set-row"><div class="sr-txt"><div class="t">Appearance</div><div class="d">Switch between light and dark.</div></div><button class="btn btn-ghost btn-sm" data-act="theme">'+I.sun+'Toggle theme</button></div>'+
-        '<div class="set-row"><div class="sr-txt"><div class="t">Desktop reminders</div><div class="d">'+(notifySupported?'Get a notification when follow-ups are due. You\'ll be asked for permission.':'Not supported in this browser — the in-app list still works.')+'</div></div><label class="switch"><input type="checkbox" id="set-notify"'+(settings.notify?' checked':'')+(notifySupported?'':' disabled')+'/><span class="track"></span></label></div>'+
-        '<div class="set-row"><div class="sr-txt"><div class="t">Import leads</div><div class="d">From a CSV (Workiz, Go High Level, Facebook) or a JSON backup.</div></div><button class="btn btn-ghost btn-sm" data-act="add-import">'+I.upload+'Import</button></div>'+
+        '<div class="set-section-title">Appearance</div>'+
+        '<div class="set-row"><div class="sr-txt"><div class="t">Theme</div><div class="d">Switch between light and dark.</div></div><button class="btn btn-ghost btn-sm" data-act="theme">'+I.sun+'Toggle</button></div>'+
+
+        '<div class="set-section-title">Reminders</div>'+
+        '<div class="set-row"><div class="sr-txt"><div class="t">Desktop notifications</div><div class="d">'+(notifySupported?'A pop-up when follow-ups are due (asks permission).':'Not supported in this browser — the in-app list still works.')+'</div></div><label class="switch"><input type="checkbox" id="set-notify"'+(settings.notify?' checked':'')+(notifySupported?'':' disabled')+'/><span class="track"></span></label></div>'+
+        '<div class="set-row"><div class="sr-txt"><div class="t">Send reminders to my phone</div><div class="d">Download your upcoming follow-ups as a calendar file — open it once and your calendar app notifies you (and can email you).</div></div><button class="btn btn-ghost btn-sm" data-act="export-cal">'+I.calendar+'Calendar</button></div>'+
+
+        '<div class="set-section-title">Message tone &amp; templates</div>'+
+        '<div class="set-row" style="border:none;padding-bottom:4px"><div class="sr-txt" style="flex:none;width:100%"><div class="t" style="margin-bottom:8px">Tone of your messages</div><div class="tone-pick">'+toneBtns+'</div><div class="var-hint">This shapes the built-in follow-up &amp; win-back wording.</div></div></div>'+
+        '<div class="set-row" style="align-items:flex-start"><div class="sr-txt" style="flex:none;width:100%"><div style="display:flex;align-items:center"><div class="t" style="flex:1">Your custom templates</div><button class="btn btn-soft btn-sm" data-tplnew="1">'+I.plus+'New template</button></div>'+tplList+'</div></div>'+
+
+        '<div class="set-section-title">Custom tags &amp; sources</div>'+
+        '<div class="set-row" style="align-items:flex-start;border-bottom:none"><div class="sr-txt" style="flex:none;width:100%"><div class="t">Custom service tags</div>'+svcManage+'</div></div>'+
+        '<div class="set-row" style="align-items:flex-start"><div class="sr-txt" style="flex:none;width:100%"><div style="display:flex;align-items:center;gap:8px"><div class="t" style="flex:1">Custom lead sources</div><input id="new-src" class="mini-sel" placeholder="e.g. Nextdoor" style="width:150px"/><button class="btn btn-soft btn-sm" data-srcadd="1">Add</button></div>'+srcManage+'</div></div>'+
+
+        '<div class="set-section-title">Your data</div>'+
+        '<div class="set-row"><div class="sr-txt"><div class="t">Import leads</div><div class="d">From a CSV (Workiz / GHL / Facebook) or a JSON backup.</div></div><button class="btn btn-ghost btn-sm" data-act="add-import">'+I.upload+'Import</button></div>'+
         '<div class="set-row"><div class="sr-txt"><div class="t">Export / back up</div><div class="d">'+(settings.lastBackup?'Last backup '+Math.floor((Date.now()-settings.lastBackup)/86400000)+' days ago.':'Download all your data as a file.')+'</div></div><button class="btn btn-ghost btn-sm" data-act="export">'+I.download+'Export</button></div>'+
         '<div class="set-row"><div class="sr-txt"><div class="t" style="color:var(--bad)">Erase everything</div><div class="d">Delete all leads from this browser. Export first!</div></div><button class="btn btn-danger btn-sm" data-act="erase">Erase all</button></div>'+
       '</div>'+
       '<div class="modal-foot"><div class="spacer"></div><button class="btn btn-primary" data-close="1">Done</button></div></div>';
+  };
+}
+function templateEditModal(existingId){
+  return function(){
+    var t=existingId?(settings.templates||[]).filter(function(x){return x.id===existingId;})[0]:{name:'',body:''};
+    if(!t) t={name:'',body:''};
+    return '<div class="modal" role="dialog" aria-modal="true" aria-label="Template"><div class="modal-head"><h2>'+(existingId?'Edit template':'New template')+'</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
+      '<div class="modal-body"><div class="field"><label>Template name</label><input id="te-name" value="'+attr(t.name)+'" placeholder="e.g. Seasonal special"/></div>'+
+      '<div class="field" style="margin-bottom:6px"><label>Message</label><textarea id="te-body" style="min-height:120px" placeholder="Hi {first}, ...">'+esc(t.body)+'</textarea></div>'+
+      '<div class="var-hint">Use <code>{first}</code> first name · <code>{name}</code> full name · <code>{place}</code> home/property · <code>{service}</code> first service · <code>{value}</code> quote amount. They fill in automatically per lead.</div></div>'+
+      '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savetpl="'+(existingId||'')+'">'+I.check+'Save</button></div></div>';
   };
 }
 
@@ -1187,6 +1371,7 @@ function wire(){
   };
   var s=document.getElementById('search'); if(s) s.oninput=function(){ state.search=this.value; refreshContent(); };
   var sf=document.getElementById('svcFilter'); if(sf) sf.onchange=function(){ state.serviceFilter=this.value; refreshContent(); };
+  var cf=document.getElementById('confFilter'); if(cf) cf.onchange=function(){ state.confFilter=this.value; refreshContent(); };
   if(state.view==='pipeline') setupDnD();
 }
 function doAction(act){
@@ -1196,11 +1381,12 @@ function doAction(act){
   else if(act==='export') exportData();
   else if(act==='add-import') chooseImport();
   else if(act==='settings') openModal(settingsModal());
+  else if(act==='export-cal') exportCalendar();
   else if(act==='clear-sample') clearSamples();
   else if(act==='dismiss-sample'){ settings.sampleDismissed=true; saveSettings(); render(); }
   else if(act==='erase') eraseAll();
 }
-function refreshContent(){ var c=document.getElementById('content'); if(c){ c.innerHTML=viewContent(); if(state.view==='pipeline') setupDnD(); var sf=document.getElementById('svcFilter'); if(sf) sf.onchange=function(){ state.serviceFilter=this.value; refreshContent(); }; } }
+function refreshContent(){ var c=document.getElementById('content'); if(c){ c.innerHTML=viewContent(); if(state.view==='pipeline') setupDnD(); var sf=document.getElementById('svcFilter'); if(sf) sf.onchange=function(){ state.serviceFilter=this.value; refreshContent(); }; var cf=document.getElementById('confFilter'); if(cf) cf.onchange=function(){ state.confFilter=this.value; refreshContent(); }; } }
 function toggleSort(key){ if(state.sort.key===key){ state.sort.dir=state.sort.dir==='asc'?'desc':'asc'; } else { state.sort.key=key; state.sort.dir=key==='name'?'asc':'desc'; } refreshContent(); }
 
 function wireSlideover(){
@@ -1210,10 +1396,14 @@ function wireSlideover(){
   var stageSel=document.getElementById('stageSel');
   if(stageSel) stageSel.onchange=function(){ changeStage(state.selectedId,this.value); };
   ov.onclick=function(e){
-    var t=e.target.closest('[data-log],[data-setfu],[data-edit],[data-del],[data-editnote],[data-copy],[data-delcomm],[data-reclean]');
+    var t=e.target.closest('[data-log],[data-setfu],[data-edit],[data-del],[data-editnote],[data-copy],[data-delcomm],[data-reclean],[data-setconf],[data-addcal],[data-compose]');
     if(!t) return;
     if(t.dataset.log){ openModal(commModal(t.dataset.log)); }
     else if(t.dataset.setfu){ openModal(fuModal(state.selectedId)); }
+    else if(t.dataset.setconf){ setConfidence(state.selectedId,t.dataset.setconf); }
+    else if(t.dataset.addcal){ addToCalendar(t.dataset.addcal); }
+    else if(t.dataset.compose){ var parts=t.dataset.compose.split('|'); openModal(composeModal(parts[0],parts[1])); }
+    else if(t.dataset.reclean==='custom'){ openModal(recleanModal(state.selectedId)); }
     else if(t.dataset.reclean!=null){ setReclean(state.selectedId,+t.dataset.reclean); }
     else if(t.dataset.edit){ openModal(leadModal(state.leads.find(function(l){return l.id===t.dataset.edit;}))); }
     else if(t.dataset.editnote){ openModal(noteModal(t.dataset.editnote)); }
@@ -1232,10 +1422,30 @@ function wireModal(){
   ov.querySelectorAll('[data-type]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-type]').forEach(function(x){x.className='type-opt';}); this.className='type-opt '+(this.dataset.type==='residential'?'sel-res':'sel-com'); document.getElementById('f-type').value=this.dataset.type; var nl=document.getElementById('nameLbl'); if(nl) nl.innerHTML=(this.dataset.type==='commercial'?'Business name':'Name')+' <span class="req">*</span>'; }; });
   ov.querySelectorAll('[data-itype]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-itype]').forEach(function(x){x.className='type-opt';}); this.className='type-opt '+(this.dataset.itype==='residential'?'sel-res':'sel-com'); document.getElementById('imp-type').value=this.dataset.itype; }; });
   ov.querySelectorAll('[data-method]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-method]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); document.getElementById('c-method').value=this.dataset.method; }; });
+  ov.querySelectorAll('[data-conf]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-conf]').forEach(function(x){x.className='conf-opt';}); var c=CONF_MAP[this.dataset.conf]; this.className='conf-opt '+c.cls; document.getElementById('f-conf').value=this.dataset.conf; }; });
   ov.querySelectorAll('[data-tag]').forEach(function(b){ b.onclick=function(){ this.classList.toggle('sel'); }; });
+  ov.querySelectorAll('[data-newtag]').forEach(function(b){ b.onclick=function(){ startNewTag(this); }; });
   ov.querySelectorAll('[data-quickfu]').forEach(function(b){ b.onclick=function(){ var d=addDaysISO(+this.dataset.quickfu),el=document.getElementById('c-fudate')||document.getElementById('fu-date'); if(el) el.value=d; }; });
   var fuChk=document.getElementById('c-setfu'); if(fuChk) fuChk.onchange=function(){ document.getElementById('c-fu-wrap').style.display=this.checked?'block':'none'; };
   var notify=document.getElementById('set-notify'); if(notify) notify.onchange=function(){ toggleNotify(this); };
+  ov.querySelectorAll('[data-rcq]').forEach(function(b){ b.onclick=function(){ var el=document.getElementById('rc-months'); if(el) el.value=this.dataset.rcq; }; });
+  // compose template selection
+  ov.querySelectorAll('[data-tpl]').forEach(function(el){ el.onclick=function(){ ov.querySelectorAll('[data-tpl]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); var lead=state.leads.find(function(l){return l.id===state.selectedId;}); var ta=document.getElementById('cm-body'); if(ta&&lead) ta.value=resolveTemplate(lead,this.dataset.tpl); }; });
+  var el2;
+  if((el2=ov.querySelector('[data-savereclean]'))) el2.onclick=function(){ var m=parseInt(document.getElementById('rc-months').value,10); if(!m||m<1){ toast('Enter a number of months',true); return; } setReclean(this.dataset.savereclean,m); closeModal(); };
+  if((el2=ov.querySelector('[data-cm-text]'))) el2.onclick=function(){ sendMessage(this.dataset.cmText,'text'); };
+  if((el2=ov.querySelector('[data-cm-email]'))) el2.onclick=function(){ sendMessage(this.dataset.cmEmail,'email'); };
+  if((el2=ov.querySelector('[data-cm-copy]'))) el2.onclick=function(){ copyText(document.getElementById('cm-body').value); };
+  // settings actions (inside modal)
+  ov.querySelectorAll('[data-act]').forEach(function(b){ b.onclick=function(){ doAction(this.dataset.act); }; });
+  ov.querySelectorAll('[data-tone]').forEach(function(b){ b.onclick=function(){ settings.tone=this.dataset.tone; saveSettings(); ov.querySelectorAll('[data-tone]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); toast(this.dataset.tone.charAt(0).toUpperCase()+this.dataset.tone.slice(1)+' tone'); }; });
+  ov.querySelectorAll('[data-tpledit]').forEach(function(b){ b.onclick=function(){ openModal(templateEditModal(this.dataset.tpledit)); }; });
+  ov.querySelectorAll('[data-tpldel]').forEach(function(b){ b.onclick=function(){ var id=this.dataset.tpldel; settings.templates=(settings.templates||[]).filter(function(t){return t.id!==id;}); saveSettings(); openModal(settingsModal()); toast('Template deleted'); }; });
+  var tn=ov.querySelector('[data-tplnew]'); if(tn) tn.onclick=function(){ openModal(templateEditModal(null)); };
+  if((el2=ov.querySelector('[data-savetpl]'))) el2.onclick=function(){ saveTemplate(this.dataset.savetpl); };
+  ov.querySelectorAll('[data-svcdel]').forEach(function(b){ b.onclick=function(){ deleteCustomService(this.dataset.svcdel); }; });
+  ov.querySelectorAll('[data-srcdel]').forEach(function(b){ b.onclick=function(){ var s=this.dataset.srcdel; settings.customSources=(settings.customSources||[]).filter(function(x){return x!==s;}); saveSettings(); openModal(settingsModal()); }; });
+  var sa=ov.querySelector('[data-srcadd]'); if(sa) sa.onclick=function(){ var inp=document.getElementById('new-src'),name=inp.value.trim(); if(!name) return; settings.customSources=settings.customSources||[]; if(settings.customSources.indexOf(name)<0&&SOURCES.indexOf(name)<0) settings.customSources.push(name); saveSettings(); openModal(settingsModal()); toast('Source added'); };
 
   var el;
   if((el=ov.querySelector('[data-savelead]'))) el.onclick=function(){ saveLead(this.dataset.savelead); };
@@ -1248,7 +1458,7 @@ function wireModal(){
   if((el=ov.querySelector('#imp-run'))) el.onclick=runImport;
 
   var m=ov.querySelector('.modal'); trapFocus(m);
-  var focusEl=ov.querySelector('#f-name,#c-notes,#fu-date,#n-notes,#lost-reason'); if(focusEl) focusEl.focus();
+  var focusEl=ov.querySelector('#f-name,#c-notes,#fu-date,#n-notes,#lost-reason,#te-name,#rc-months'); if(focusEl) focusEl.focus();
 }
 
 function trapFocus(container){
@@ -1265,10 +1475,19 @@ function trapFocus(container){
 
 /* ---------- CRUD ---------- */
 function getSelectedTags(){ var out=[]; document.querySelectorAll('#tagPick [data-tag].sel').forEach(function(b){ out.push(b.dataset.tag); }); return out; }
+function startNewTag(btn){
+  var pick=btn.parentNode;
+  if(pick.querySelector('.mini-input')){ pick.querySelector('.mini-input').focus(); return; }
+  var inp=document.createElement('input'); inp.className='mini-input'; inp.placeholder='New service…'; inp.maxLength=28;
+  pick.insertBefore(inp,btn); inp.focus();
+  function addChip(){ var name=inp.value.trim(); if(!name) return; var id='cs'+Date.now().toString(36)+Math.random().toString(36).slice(2,5); settings.customServices=settings.customServices||[]; settings.customServices.push({id:id,name:name}); saveSettings(); var chip=document.createElement('button'); chip.type='button'; chip.className='tag-opt sel'; chip.dataset.tag=id; chip.textContent=name; chip.onclick=function(){ this.classList.toggle('sel'); }; pick.insertBefore(chip,inp); inp.value=''; inp.focus(); toast('Added "'+name+'"'); }
+  inp.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); addChip(); } else if(e.key==='Escape'){ inp.remove(); } });
+  inp.addEventListener('blur',function(){ if(inp.value.trim()) addChip(); setTimeout(function(){ if(inp.parentNode) inp.remove(); },150); });
+}
 function saveLead(id){
   var nameEl=document.getElementById('f-name'),name=nameEl.value.trim();
   if(!name){ nameEl.focus(); nameEl.style.borderColor='var(--bad)'; toast('Please enter a name',true); return; }
-  var data={type:document.getElementById('f-type').value,name:name,contact:document.getElementById('f-contact').value.trim(),phone:document.getElementById('f-phone').value.trim(),email:document.getElementById('f-email').value.trim(),value:document.getElementById('f-value').value,address:document.getElementById('f-address').value.trim(),source:document.getElementById('f-source').value,stage:document.getElementById('f-stage').value,notes:document.getElementById('f-notes').value.trim(),services:getSelectedTags()};
+  var data={type:document.getElementById('f-type').value,name:name,contact:document.getElementById('f-contact').value.trim(),phone:document.getElementById('f-phone').value.trim(),email:document.getElementById('f-email').value.trim(),value:document.getElementById('f-value').value,address:document.getElementById('f-address').value.trim(),source:document.getElementById('f-source').value,stage:document.getElementById('f-stage').value,notes:document.getElementById('f-notes').value.trim(),services:getSelectedTags(),confidence:document.getElementById('f-conf').value};
   if(id){ updateLead(id,data); toast('Lead updated'); }
   else { var lead=Object.assign({id:uid(),created:Date.now(),comms:[],followUp:null,reclean:0},data); lead.updated=Date.now(); state.leads.push(lead); save(); state.selectedId=lead.id; toast('Lead added'); }
   closeModal(); render(); renderOverlay();
@@ -1288,6 +1507,19 @@ function setReclean(id,months){
   else { lead.reclean=0; toast('Re-clean reminder removed'); }
   lead.updated=Date.now(); save(); render(); renderOverlay();
 }
+function setConfidence(id,conf){ var lead=state.leads.find(function(l){return l.id===id;}); if(!lead) return; lead.confidence=conf; lead.updated=Date.now(); save(); render(); renderOverlay(); toast((CONF_MAP[conf]||{}).name+' lead'); }
+function addToCalendar(id){
+  var lead=state.leads.find(function(l){return l.id===id;}); if(!lead||!lead.followUp||!lead.followUp.date){ toast('No follow-up date set',true); return; }
+  downloadFile('followup-'+(lead.name||'lead').replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'.ics', icsWrap([icsEvent(lead)]), 'text/calendar');
+  toast('Calendar file downloaded — open it to add the reminder');
+}
+function exportCalendar(){
+  var list=state.leads.filter(function(l){ return isActive(l)&&l.followUp&&l.followUp.date; });
+  if(!list.length){ toast('No upcoming follow-ups to export',true); return; }
+  downloadFile('powerwash-followups.ics', icsWrap(list.map(icsEvent)), 'text/calendar');
+  if(state._modal) closeModal();
+  toast('Exported '+list.length+' follow-up'+(list.length===1?'':'s')+' to calendar');
+}
 function saveComm(leadId){
   var lead=state.leads.find(function(l){return l.id===leadId;});
   var method=document.getElementById('c-method').value,date=document.getElementById('c-date').value||todayISO();
@@ -1303,6 +1535,16 @@ function saveFu(leadId){
   updateLead(leadId,{followUp:{date:date,note:note}}); closeModal(); render(); renderOverlay(); toast('Follow-up scheduled');
 }
 function snooze(id){ var lead=state.leads.find(function(l){return l.id===id;}); if(!lead||!lead.followUp) return; lead.followUp.date=addDaysISO(3); lead.updated=Date.now(); save(); render(); if(state.selectedId) renderOverlay(); toast('Snoozed 3 days'); }
+function sendMessage(leadId,via){
+  var lead=state.leads.find(function(l){return l.id===leadId;}); if(!lead) return;
+  var body=document.getElementById('cm-body').value;
+  var doLog=document.getElementById('cm-log').checked;
+  if(via==='text'){ if(!lead.phone){ toast('No phone number',true); return; } openLink('sms:'+lead.phone.replace(/[^0-9+]/g,'')+'?&body='+encodeURIComponent(body)); }
+  else { if(!lead.email){ toast('No email',true); return; } openLink('mailto:'+encodeURIComponent(lead.email)+'?subject='+encodeURIComponent('Your power washing quote')+'&body='+encodeURIComponent(body)); }
+  if(doLog){ lead.comms=lead.comms||[]; lead.comms.push({id:cid(),method:via,date:todayISO(),notes:'Sent: '+body.slice(0,120)+(body.length>120?'…':''),ts:Date.now()}); lead.updated=Date.now(); save(); }
+  closeModal(); render(); renderOverlay();
+  toast(via==='text'?'Opening Messages…':'Opening email…');
+}
 function deleteLead(id){
   var idx=state.leads.findIndex(function(l){return l.id===id;}); if(idx<0) return;
   var removed=state.leads[idx];
@@ -1415,7 +1657,7 @@ function runImport(){
     if(dedupe){ if((pk&&(existingKeys[pk]||seen[pk]))||(ek&&(existingKeys[ek]||seen[ek]))){ skipped++; return; } }
     if(pk) seen[pk]=1; if(ek) seen[ek]=1;
     var valNum=val(r,'value').replace(/[^0-9.]/g,'');
-    var lead={id:uid(),type:type,name:name,contact:val(r,'contact'),phone:phone,email:email,address:val(r,'address'),value:valNum,source:val(r,'source')||'Other',stage:'new',notes:val(r,'notes'),services:[],comms:[],followUp:null,reclean:0,created:Date.now(),updated:Date.now()};
+    var lead={id:uid(),type:type,name:name,contact:val(r,'contact'),phone:phone,email:email,address:val(r,'address'),value:valNum,source:val(r,'source')||'Other',stage:'new',confidence:'warm',notes:val(r,'notes'),services:[],comms:[],followUp:null,reclean:0,created:Date.now(),updated:Date.now()};
     state.leads.push(lead); added++;
   });
   save(); state._importRows=null; state._importHeaders=null; closeModal(); render();
@@ -1425,6 +1667,20 @@ function runImport(){
 /* ---------- Sample & erase ---------- */
 function clearSamples(){
   openModal(confirmModal('Clear sample leads?','This removes the '+state.leads.filter(function(l){return l.sample;}).length+' example leads so you can start with your own. Your own leads (if any) stay.','Clear samples',function(){ state.leads=state.leads.filter(function(l){return !l.sample;}); save(); closeOverlay(); render(); toast('Samples cleared'); },false));
+}
+function saveTemplate(id){
+  var name=document.getElementById('te-name').value.trim(), body=document.getElementById('te-body').value.trim();
+  if(!name){ toast('Give it a name',true); return; }
+  if(!body){ toast('Write a message',true); return; }
+  settings.templates=settings.templates||[];
+  if(id){ var t=settings.templates.filter(function(x){return x.id===id;})[0]; if(t){ t.name=name; t.body=body; } }
+  else { settings.templates.push({id:'tp'+Date.now().toString(36)+Math.random().toString(36).slice(2,5),name:name,body:body}); }
+  saveSettings(); openModal(settingsModal()); toast('Template saved');
+}
+function deleteCustomService(id){
+  settings.customServices=(settings.customServices||[]).filter(function(s){return s.id!==id;});
+  state.leads.forEach(function(l){ if(l.services) l.services=l.services.filter(function(s){return s!==id;}); });
+  save(); saveSettings(); openModal(settingsModal()); toast('Tag removed');
 }
 function eraseAll(){
   openModal(confirmModal('Erase everything?','This permanently deletes ALL '+state.leads.length+' leads from this browser. Make sure you exported a backup first — this cannot be undone.','Erase all',function(){ state.leads=[]; save(); closeOverlay(); render(); toast('All data erased'); }));
@@ -1450,6 +1706,8 @@ function seed(){
     {id:uid(),sample:true,type:'residential',name:'The Fletchers',contact:'Sam Fletcher',phone:'(555) 442-1187',email:'',address:'55 Oakwood Ave',source:'Yard Sign',value:900,stage:'won',services:['house','concrete','deck'],reclean:12,created:now-20*D,updated:now-14*D,notes:'Full house + driveway + fence. Very happy — asked about annual plan.',comms:[{id:cid(),method:'call',date:iso(-20),notes:'Quote given.',ts:now-20*D},{id:cid(),method:'visit',date:iso(-14),notes:'Job completed. Paid cash. Loved it.',ts:now-14*D}],followUp:{date:iso(351),note:'Re-clean due — reach out to re-book'}},
     {id:uid(),sample:true,type:'residential',name:'Greg Holland',contact:'Greg Holland',phone:'(555) 220-9963',email:'gholland@email.com',address:'8 Pinecrest Rd',source:'Facebook Lead',value:350,stage:'contacted',services:['concrete'],reclean:0,created:now-15*D,updated:now-10*D,notes:'Wanted driveway done. Went quiet after first quote.',comms:[{id:cid(),method:'text',date:iso(-15),notes:'Sent quote, no reply.',ts:now-15*D},{id:cid(),method:'text',date:iso(-10),notes:'Followed up, still no reply.',ts:now-10*D}],followUp:{date:iso(-4),note:'Last attempt — then mark lost'}}
   ];
+  var cf=['warm','hot','hot','warm','warm','cold'];
+  state.leads.forEach(function(l,i){ l.confidence=cf[i]||'warm'; });
   save();
 }
 
@@ -1459,6 +1717,12 @@ function boot(){
   try{ var th=localStorage.getItem(THEME_KEY); if(th) document.documentElement.setAttribute('data-theme',th); }catch(e){}
   var had=load();
   if(!had||state.leads.length===0){ seed(); }
+  // migrate older records
+  state.leads.forEach(function(l){ if(!l.confidence) l.confidence='warm'; if(!l.services) l.services=[]; if(l.reclean==null) l.reclean=0; });
+  if(!settings.templates) settings.templates=[];
+  if(!settings.customServices) settings.customServices=[];
+  if(!settings.customSources) settings.customSources=[];
+  if(!settings.tone) settings.tone='friendly';
   render();
   checkReminders(false);
   setInterval(function(){ checkReminders(false); }, 60*60*1000);
