@@ -119,7 +119,10 @@ Now it opens full‑screen like a normal app and works offline.
   Supabase → Authentication → Email settings (optional).
 - **Two people editing the same lead at once.** Whoever saves last wins for that
   field — the app never loses or corrupts the record. In normal owner + VA use
-  this effectively never comes up.
+  this effectively never comes up. One deliberate edge: if someone edits a lead
+  offline while it gets deleted on another device, reconnecting brings the lead
+  back with that edit (an edit is treated as newer intent — better to keep an
+  extra row than silently lose someone's work).
 - **Per‑device preferences.** Your custom message templates, custom lead sources
   and property types currently live per‑device (they don't sync yet). Your
   leads, contacts, stages, follow‑ups and team **do** sync. Syncing preferences

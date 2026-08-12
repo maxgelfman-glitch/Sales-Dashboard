@@ -35,6 +35,7 @@ echo; echo "== app E2E (auth, sync, roles, tenant isolation, offline, invite) ==
 echo; echo "== PWA offline-shell + migration import =="; reseed; node test/e2e_pwa.js || rc=1
 echo; echo "== multi-device (propagation, LWW, delete, account switch) =="; reseed; node test/e2e_multi.js || rc=1
 echo; echo "== stress (bulk sync, rapid edits, free-app smoke) =="; reseed; node test/e2e_stress.js || rc=1
+echo; echo "== conflict (offline edit vs remote delete) =="; reseed; node test/e2e_conflict.js || rc=1
 echo
 [ "$rc" = 0 ] && echo "ALL HOSTED TESTS PASSED" || echo "SOME HOSTED TESTS FAILED"
 exit $rc

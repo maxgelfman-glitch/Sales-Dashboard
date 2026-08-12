@@ -86,6 +86,8 @@ bash test/run_all.sh
 | `e2e.js` (18) | auth, org bootstrap, create→sync, persist across reload, org sharing, role‑gated delete, tenant isolation, offline write→sync, invite flow |
 | `e2e_pwa.js` (8) | service worker caches the shell; app boots with **no network**; migration import from the free app's JSON (UUID re‑issue + attribution) |
 | `e2e_multi.js` (6) | two devices: create/edit(LWW)/comm/delete propagation; account‑switch leaks nothing across orgs |
+| `e2e_stress.js` (6) | bulk 60‑lead sync + comms with no corruption; rapid edits under the debounce coalesce to the final value; free app still loads and stays localStorage‑only |
+| `e2e_conflict.js` (6) | offline edit vs. remote delete resolves safely — edit preserved (lead resurrected), exactly one row, both devices converge |
 
 **Production uses real Supabase** — the gateway and `local_bootstrap.sql` are
 test‑only and are never deployed. The migrations in `supabase/migrations/` run
