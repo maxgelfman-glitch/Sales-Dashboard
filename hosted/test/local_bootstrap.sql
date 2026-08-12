@@ -11,14 +11,31 @@ create table if not exists auth.users (
 );
 
 -- Supabase-style: the current user id comes from the request JWT's `sub` claim.
+-- Robust to both the per-claim GUC (direct psql tests) and the JSON `claims`
+-- GUC that PostgREST v12 / modern Supabase set.
 create or replace function auth.uid() returns uuid
   language sql stable as $$
-  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
+  select coalesce(
+    nullif(current_setting('request.jwt.claim.sub', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+  )::uuid
 $$;
 create or replace function auth.role() returns text
   language sql stable as $$
-  select coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon')
+  select coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'),
+    'anon'
+  )
 $$;
+
+-- PostgREST connects as this role and SET ROLEs to anon/authenticated per request.
+do $$ begin
+  if not exists (select from pg_roles where rolname = 'authenticator') then
+    create role authenticator noinherit login password 'authpass';
+  end if;
+end $$;
+grant anon, authenticated to authenticator;
 
 do $$ begin
   if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin; end if;
