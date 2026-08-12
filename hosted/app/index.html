@@ -1987,6 +1987,7 @@ var HB = {
       l.updatedBy = HB.uid;
       (l.comms || []).forEach(function (c) { if (!c.createdBy) c.createdBy = HB.uid; });
     });
+    HB._dirty = true;
     DB.saveLocal(state.leads);
     if (HB._t) clearTimeout(HB._t);
     HB._t = setTimeout(HB.flushNow, 300);
@@ -1996,11 +1997,14 @@ var HB = {
     HB.syncing = true; HB.paintStatus();
     DB.flush(state.leads).then(function (r) {
       HB.syncing = false;
-      HB.lastErr = (r && r.ok) ? null : ((r && r.reason) || null);
+      if (r && r.ok) { HB._dirty = false; HB.lastErr = null; }   // pushed or nothing to push
+      else HB.lastErr = (r && r.reason) || null;                  // offline/error → stays dirty
       HB.online = DB.isOnline();
       HB.paintStatus();
     });
   },
+  // Push pending writes; a no-op unless something is actually dirty + online.
+  heartbeat: function () { if (HB.ready && HB.online && HB._dirty && !HB.syncing) HB.flushNow(); },
 
   paintStatus: function () {
     var pill = document.getElementById('hb-sync');
@@ -2080,8 +2084,20 @@ function hbRenderGate(msg) {
 }
 
 /* ---------- Identity + entering the app ---------- */
+function hbIdentityKey() { return 'pwcrm-identity:' + HB.uid; }
+function hbReadIdentity() {
+  try { return JSON.parse(localStorage.getItem(hbIdentityKey()) || 'null'); } catch (e) { return null; }
+}
+function hbApplyIdentity(id) {
+  HB.orgId = id.orgId; HB.role = id.role || 'owner';
+  HB.members = id.members || {}; HB.orgName = id.orgName || 'My Business';
+}
+// Resolve org/role/teammates. Online: via RPC (creates org / accepts invite),
+// then cache it. Offline or transient failure: fall back to the cached identity
+// so the app still boots and works from the local mirror.
 function hbResolveIdentity() {
-  // create org (or accept invite) then read our profile + org + teammates
+  var cached = hbReadIdentity();
+  if (!HB.online && cached && cached.uid === HB.uid) { hbApplyIdentity(cached); return Promise.resolve(); }
   return HB.client.rpc('accept_invite_or_bootstrap', { p_name: 'My Business' }).then(function (r) {
     if (r.error) throw r.error;
     HB.orgId = r.data;
@@ -2096,12 +2112,21 @@ function hbResolveIdentity() {
     var me = profs.filter(function (p) { return p.id === HB.uid; })[0];
     HB.role = (me && me.role) || 'owner';
     if (rr[1].data && rr[1].data.name) HB.orgName = rr[1].data.name;
+    try {
+      localStorage.setItem(hbIdentityKey(), JSON.stringify({
+        uid: HB.uid, orgId: HB.orgId, role: HB.role, members: HB.members, orgName: HB.orgName
+      }));
+    } catch (e) {}
+  }).catch(function (e) {
+    if (cached && cached.uid === HB.uid) { hbApplyIdentity(cached); return; } // degraded → use cache
+    throw e;
   });
 }
 
 function hbEnterApp(session) {
   if (HB.entered) return;
   HB.entered = true;
+  HB.online = (typeof navigator !== 'undefined') ? navigator.onLine : true;
   HB.uid = session.user.id;
   HB.email = session.user.email || '';
   loadSettings();
@@ -2120,6 +2145,7 @@ function hbEnterApp(session) {
     if (!HB._pollTimer) {
       setInterval(function () { checkReminders(false); }, 60 * 60 * 1000);
       HB._pollTimer = setInterval(hbPull, 30000);
+      setInterval(HB.heartbeat, 4000); // guarantees pending writes converge after reconnect
     }
     hbBindSync();
     return hbPull(); // reconcile with server

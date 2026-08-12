@@ -47,8 +47,20 @@ self.addEventListener('fetch', function (e) {
   // (the Supabase API) goes straight to the network.
   if (url.origin !== self.location.origin) return;
 
+  // Navigations (index.html, possibly with a ?supabase_url=… query): serve the
+  // cached shell first so the app opens instantly and works fully offline.
+  // ignoreSearch so the query string never causes a cache miss.
+  if (req.mode === 'navigate') {
+    e.respondWith(
+      caches.match('./index.html', { ignoreSearch: true }).then(function (hit) {
+        return hit || fetch(req).catch(function () { return caches.match('./index.html', { ignoreSearch: true }); });
+      })
+    );
+    return;
+  }
+
   e.respondWith(
-    caches.match(req).then(function (hit) {
+    caches.match(req, { ignoreSearch: true }).then(function (hit) {
       if (hit) {
         // refresh in the background (stale-while-revalidate for the shell)
         fetch(req).then(function (res) {
@@ -64,8 +76,7 @@ self.addEventListener('fetch', function (e) {
         }
         return res;
       }).catch(function () {
-        // offline and not cached: fall back to the app shell for navigations
-        if (req.mode === 'navigate') return caches.match('./index.html');
+        if (req.mode === 'navigate') return caches.match('./index.html', { ignoreSearch: true });
         throw new Error('offline');
       });
     })

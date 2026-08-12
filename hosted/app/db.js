@@ -92,6 +92,18 @@
   }
   function thrle(r) { if (r && r.error) throw r.error; return r; }
 
+  // ---- operation lock --------------------------------------------------
+  // push (flush) and pull (pullMerge) BOTH read+advance `snapshot` and rewrite
+  // the mirror, so they must never interleave. A pull that fetched a stale
+  // server view while a push was mid-flight would wrongly treat a just-pushed
+  // lead as "deleted remotely". Serialize every push/pull through one chain.
+  var opChain = Promise.resolve();
+  function serialize(fn) {
+    var run = opChain.then(fn, fn);
+    opChain = run.then(function () {}, function () {});
+    return run;
+  }
+
   // ---- public API ------------------------------------------------------
   var API = {
     // called after auth resolves; sets identity + loads the local mirror
@@ -126,24 +138,22 @@
     // only on full success, so failures self-heal on the next call.
     flush: function (leads) {
       if (!client) return Promise.resolve({ ok: false, reason: 'no-client' });
-      var run = leads ? Promise.resolve(leads) : API.loadLocal();
-      return run.then(function (cur) {
-        cur = cur || [];
-        if (pushing) { pendingPush = true; return { ok: false, reason: 'busy' }; }
-        var ops = Sync.diff(cur, snapshot, ctx);
-        if (ops.empty) return { ok: true, empty: true };
-        if (!online) return { ok: false, reason: 'offline' };
-        pushing = true;
-        return applyDiff(ops).then(function () {
-          snapshot = JSON.parse(JSON.stringify(cur));
-          pushing = false;
-          return idbSet(keyFor('snapshot'), snapshot).then(function () {
-            if (pendingPush) { pendingPush = false; return API.flush(); }
-            return { ok: true, pushed: ops };
+      return serialize(function () {
+        var run = leads ? Promise.resolve(leads) : API.loadLocal();
+        return run.then(function (cur) {
+          cur = cur || [];
+          var ops = Sync.diff(cur, snapshot, ctx);
+          if (ops.empty) return { ok: true, empty: true };
+          if (!online) return { ok: false, reason: 'offline' };
+          return applyDiff(ops).then(function () {
+            snapshot = JSON.parse(JSON.stringify(cur));
+            return idbSet(keyFor('snapshot'), snapshot).then(function () {
+              return { ok: true, pushed: ops };
+            });
+          }).catch(function (e) {
+            online = (typeof navigator === 'undefined') ? true : navigator.onLine;
+            return { ok: false, reason: 'error', error: (e && e.message) || String(e) };
           });
-        }).catch(function (e) {
-          pushing = false; online = (typeof navigator === 'undefined') ? true : navigator.onLine;
-          return { ok: false, reason: 'error', error: (e && e.message) || String(e) };
         });
       });
     },
@@ -151,14 +161,24 @@
     // Pull server state and merge into `local` (LWW). Also drops leads that
     // the server no longer has AND that aren't waiting to be pushed (i.e.
     // they were deleted on another device), so deletes propagate.
-    pullMerge: function (local) {
-      return pull().then(function (server) {
-        var merged = Sync.mergeByUpdated(local || [], server);
-        var serverIds = {}; server.forEach(function (s) { serverIds[s.id] = true; });
-        var snapIds = {}; snapshot.forEach(function (s) { snapIds[s.id] = true; });
-        // keep a lead if: server has it, OR it's brand-new locally (never synced)
-        merged = merged.filter(function (l) { return serverIds[l.id] || !snapIds[l.id]; });
-        return merged;
+    pullMerge: function (localHint) {
+      return serialize(function () {
+        // read the freshest mirror INSIDE the lock (not the caller's snapshot),
+        // so a lead added between call and execution is never dropped.
+        return API.loadLocal().then(function (local) {
+          if (!local) local = localHint || [];
+          return pull().then(function (server) {
+          var merged = Sync.mergeByUpdated(local || [], server);
+          var serverIds = {}; server.forEach(function (s) { serverIds[s.id] = true; });
+          var snapIds = {}; snapshot.forEach(function (s) { snapIds[s.id] = true; });
+          // keep a lead if: server has it, OR it's brand-new locally (never
+          // synced). Because this runs serialized after any in-flight push,
+          // `snapshot` and `server` are consistent — a lead in snapshot but not
+          // on the server was genuinely deleted on another device.
+          merged = merged.filter(function (l) { return serverIds[l.id] || !snapIds[l.id]; });
+          return merged;
+          });
+        });
       });
     },
 
