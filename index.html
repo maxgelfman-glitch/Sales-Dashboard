@@ -635,16 +635,20 @@ var STAGE_MAP={}; STAGES.forEach(function(s){STAGE_MAP[s.id]=s;});
 function migrateStage(s){ if(STAGE_MAP[s]) return s; if(s==='scheduled') return 'job'; return 'new'; }
 // Structured contact outcomes — drive the follow-up engine and stage progression
 var OUTCOMES = [
-  {id:'noanswer',  name:'No answer / no reply', advance:true},
-  {id:'voicemail', name:'Left a voicemail',     advance:true},
-  {id:'interested',name:'Spoke — interested',   reset:true},
-  {id:'estimate',  name:'Booked the estimate',  reset:true, stage:'estimate'},
-  {id:'quote',     name:'Sent the quote',       reset:true, stage:'quoted'},
-  {id:'notnow',    name:'Spoke — not now',      reset:true, nurture:true},
-  {id:'job',       name:'Booked the job',       reset:true, stage:'job'},
-  {id:'no',        name:'Not interested',       lost:true}
+  {id:'noanswer',  base:'No answer / no reply', labels:{call:'No answer',visit:'No one available',text:'No reply',email:'No reply'}, methods:['call','text','email','visit'], advance:true},
+  {id:'voicemail', base:'Left a voicemail',     labels:{},                                                                        methods:['call'],                    advance:true},
+  {id:'interested',base:'Spoke — interested',   labels:{text:'Replied — interested',email:'Replied — interested'},                methods:['call','text','email','visit'], reset:true},
+  {id:'estimate',  base:'Booked the estimate',  labels:{},                                                                        methods:['call','text','email','visit'], reset:true, stage:'estimate'},
+  {id:'quote',     base:'Sent the quote',       labels:{call:'Gave the quote',visit:'Gave the quote'},                            methods:['call','text','email','visit'], reset:true, stage:'quoted'},
+  {id:'notnow',    base:'Spoke — not now',      labels:{text:'Replied — not now',email:'Replied — not now'},                      methods:['call','text','email','visit'], reset:true, nurture:true},
+  {id:'job',       base:'Booked the job',       labels:{},                                                                        methods:['call','text','email','visit'], reset:true, stage:'job'},
+  {id:'no',        base:'Not interested',       labels:{},                                                                        methods:['call','text','email','visit'], lost:true}
 ];
+OUTCOMES.forEach(function(o){ o.name=o.base; });
 var OUTCOME_MAP={}; OUTCOMES.forEach(function(o){OUTCOME_MAP[o.id]=o;});
+function outcomeLabel(id,method){ var o=OUTCOME_MAP[id]; if(!o) return ''; return (o.labels&&o.labels[method])||o.base; }
+function outcomesFor(method){ if(method==='note') return []; return OUTCOMES.filter(function(o){return o.methods.indexOf(method)>=0;}).map(function(o){return {id:o.id,name:(o.labels&&o.labels[method])||o.base};}); }
+function defaultOutcome(method){ var l=outcomesFor(method); if(!l.length) return ''; var na=l.filter(function(x){return x.id==='noanswer';})[0]; return na?na.id:l[0].id; }
 var METHODS = [
   {id:'call', name:'Call',    icon:I.phone, cls:'tl-call'},
   {id:'text', name:'Text',    icon:I.chat,  cls:'tl-text'},
@@ -766,7 +770,13 @@ function channelNote(channel, stage, o){
   return ch+' — '+ang;
 }
 function suggestNextStep(lead, outcomeId, curMethod){
-  var o=OUTCOME_MAP[outcomeId]||OUTCOME_MAP.noanswer;
+  var o=OUTCOME_MAP[outcomeId];
+  if(!o){ // note / unspecified — gentle default, no attempt escalation
+    var t0=lead.type==='commercial'?'commercial':'residential';
+    var s0=(CADENCE[t0]||CADENCE.residential)[lead.stage]||CADENCE[t0].contacted;
+    var ch0=suggestChannel(lead,null,curMethod);
+    return {date:addDaysISO(s0[0]!=null?s0[0]:7), note:channelNote(ch0,lead.stage,null), why:'Follow up', channel:ch0, nurture:false};
+  }
   if(o.lost) return null;                                   // going to Lost → no follow-up
   var type=lead.type==='commercial'?'commercial':'residential';
   var stage=o.stage||lead.stage;
@@ -1189,7 +1199,7 @@ function slideover(lead){
 
   // timeline
   var comms=(lead.comms||[]).slice().sort(function(a,b){return a.date<b.date?1:(a.date>b.date?-1:(b.ts||0)-(a.ts||0));});
-  var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+(c.outcome&&OUTCOME_MAP[c.outcome]?' <span style="font-weight:500;color:var(--muted)">· '+esc(OUTCOME_MAP[c.outcome].name)+'</span>':'')+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<div class="tl-actions"><button class="tl-del" data-editcomm="'+c.id+'">Edit</button><button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
+  var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+(c.outcome&&OUTCOME_MAP[c.outcome]?' <span style="font-weight:500;color:var(--muted)">· '+esc(outcomeLabel(c.outcome,c.method))+'</span>':'')+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<div class="tl-actions"><button class="tl-del" data-editcomm="'+c.id+'">Edit</button><button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
 
   var lostBlock=lead.stage==='lost'&&lead.lostReason?'<div class="section"><div class="fu-set bad"><div class="fs-ic">'+I.info+'</div><div class="fs-txt"><div class="t">Marked lost</div><div class="d">Reason: '+esc(lead.lostReason)+'</div></div></div></div>':'';
 
@@ -1257,9 +1267,9 @@ function commModal(leadId, commId){
     var lead=state.leads.find(function(l){return l.id===leadId;});
     var editing=commId?(lead.comms||[]).filter(function(c){return c.id===commId;})[0]:null;
     var curMethod=editing?editing.method:'call';
-    var curOutcome=editing?(editing.outcome||'noanswer'):'noanswer';
+    var curOutcome=editing?(editing.outcome||defaultOutcome(curMethod)):defaultOutcome(curMethod);
     var methodBtns=METHODS.map(function(m){return '<button type="button" class="method-opt'+(m.id===curMethod?' sel':'')+'" data-method="'+m.id+'">'+m.icon+m.name+'</button>';}).join('');
-    var outOpts=OUTCOMES.map(function(o){return '<option value="'+o.id+'"'+(curOutcome===o.id?' selected':'')+'>'+o.name+'</option>';}).join('');
+    var outOpts=outcomesFor(curMethod).map(function(o){return '<option value="'+o.id+'"'+(curOutcome===o.id?' selected':'')+'>'+esc(o.name)+'</option>';}).join('');
     var sug=(!editing&&settings.autoCadence!==false)?suggestNextStep(lead,curOutcome,curMethod):null;
     var fuDate=sug?sug.date:addDaysISO(3), fuNote=sug?sug.note:'', fuWhy=sug?sug.why:'';
     return '<div class="modal" role="dialog" aria-modal="true" aria-label="'+(editing?'Edit contact':'Log contact')+'">'+
@@ -1268,7 +1278,7 @@ function commModal(leadId, commId){
       '<div class="modal-body" style="padding-top:14px">'+
         '<input type="hidden" id="c-editid" value="'+(commId||'')+'"/><input type="hidden" id="c-leadid" value="'+leadId+'"/>'+
         '<div class="field"><label>How did you reach out?</label><div class="method-pick">'+methodBtns+'</div><input type="hidden" id="c-method" value="'+curMethod+'"/></div>'+
-        '<div class="field row2"><div><label>What happened?</label><select id="c-outcome">'+outOpts+'</select></div><div><label>Date</label><input type="date" id="c-date" value="'+(editing?editing.date:todayISO())+'"/></div></div>'+
+        '<div class="field row2"><div id="c-outcome-col"'+(curMethod==='note'?' style="display:none"':'')+'><label>What happened?</label><select id="c-outcome">'+outOpts+'</select></div><div><label>Date</label><input type="date" id="c-date" value="'+(editing?editing.date:todayISO())+'"/></div></div>'+
         '<div class="field"'+(editing?' style="margin-bottom:0"':'')+'><label>Notes</label><textarea id="c-notes" placeholder="What was discussed?">'+(editing?esc(editing.notes||''):'')+'</textarea></div>'+
         (editing?'':('<div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-weight:600"><input type="checkbox" id="c-setfu" checked style="width:auto"/> Schedule next follow-up</label>'+
           '<div id="c-fu-why" class="var-hint" style="margin:7px 0 0;display:flex;align-items:center;gap:6px">'+I.spark+'<span>'+esc(fuWhy)+'</span></div>'+
@@ -1277,6 +1287,16 @@ function commModal(leadId, commId){
       '</div>'+
       '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savecomm="'+leadId+'">'+I.check+(editing?'Save changes':'Save')+'</button></div></div>';
   };
+}
+function rebuildOutcomeOptions(){
+  var sel=document.getElementById('c-outcome'); if(!sel) return;
+  var method=document.getElementById('c-method').value, col=document.getElementById('c-outcome-col');
+  var opts=outcomesFor(method);
+  if(!opts.length){ if(col) col.style.display='none'; sel.value=''; recomputeFollowup(); return; }
+  if(col) col.style.display='';
+  var cur=sel.value, keep=opts.filter(function(o){return o.id===cur;}).length?cur:defaultOutcome(method);
+  sel.innerHTML=opts.map(function(o){return '<option value="'+o.id+'"'+(o.id===keep?' selected':'')+'>'+esc(o.name)+'</option>';}).join('');
+  recomputeFollowup();
 }
 function recomputeFollowup(){
   var lid=document.getElementById('c-leadid'); if(!lid) return;
@@ -1528,7 +1548,7 @@ function wireModal(){
 
   ov.querySelectorAll('[data-type]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-type]').forEach(function(x){x.className='type-opt';}); this.className='type-opt '+(this.dataset.type==='residential'?'sel-res':'sel-com'); document.getElementById('f-type').value=this.dataset.type; var nl=document.getElementById('nameLbl'); if(nl) nl.innerHTML=(this.dataset.type==='commercial'?'Business name':'Name')+' <span class="req">*</span>'; }; });
   ov.querySelectorAll('[data-itype]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-itype]').forEach(function(x){x.className='type-opt';}); this.className='type-opt '+(this.dataset.itype==='residential'?'sel-res':'sel-com'); document.getElementById('imp-type').value=this.dataset.itype; }; });
-  ov.querySelectorAll('[data-method]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-method]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); document.getElementById('c-method').value=this.dataset.method; recomputeFollowup(); }; });
+  ov.querySelectorAll('[data-method]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-method]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); document.getElementById('c-method').value=this.dataset.method; rebuildOutcomeOptions(); }; });
   var outSel=document.getElementById('c-outcome'); if(outSel) outSel.onchange=recomputeFollowup;
   ov.querySelectorAll('[data-conf]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-conf]').forEach(function(x){x.className='conf-opt';}); var c=CONF_MAP[this.dataset.conf]; this.className='conf-opt '+c.cls; document.getElementById('f-conf').value=this.dataset.conf; }; });
   ov.querySelectorAll('[data-tag]').forEach(function(b){ b.onclick=function(){ this.classList.toggle('sel'); }; });
