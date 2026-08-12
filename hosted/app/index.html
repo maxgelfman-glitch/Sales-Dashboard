@@ -2275,17 +2275,41 @@ function hbImportFree() {
   inp.click();
 }
 
+/* ---------- First-run connect screen (no file editing needed) ---------- */
+// Shown once per device when the app isn't connected yet. Max pastes his
+// Project URL + anon key here; we save them in this browser and reload.
+function hbConfigScreen() {
+  var app = document.getElementById('app');
+  app.innerHTML =
+    '<div class="hb-auth"><div class="hb-card"><div class="hb-logo">' + I.drop + '</div>' +
+    '<h1>Connect your app</h1>' +
+    '<p class="hb-sub">One-time setup on this device. Paste the two values from your ' +
+    'Supabase project (Settings → API). Follow <code>DEPLOY.md</code> if you need help finding them.</p>' +
+    '<form id="hb-cfg">' +
+      '<label class="hb-l">Project URL</label>' +
+      '<input id="hb-cfg-url" type="url" inputmode="url" placeholder="https://xxxxxxxx.supabase.co" />' +
+      '<label class="hb-l">anon public key</label>' +
+      '<input id="hb-cfg-key" type="text" placeholder="paste the long anon key here" />' +
+      '<button type="submit" class="hb-btn" id="hb-cfg-go">Connect</button>' +
+    '</form>' +
+    '<div class="hb-foot">This is safe to paste here. Your data is protected by the ' +
+    'security rules you set up in Supabase, not by hiding this key.</div>' +
+  '</div></div>';
+  document.getElementById('hb-cfg').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var url = (document.getElementById('hb-cfg-url').value || '').trim().replace(/\/+$/, '');
+    var key = (document.getElementById('hb-cfg-key').value || '').trim();
+    if (!/^https:\/\/.+\.supabase\.co$/i.test(url) && url.indexOf('http') !== 0) { toast('Paste the Project URL (starts with https://)', true); return; }
+    if (key.length < 20) { toast('Paste the anon key (it\'s a long string)', true); return; }
+    try { localStorage.setItem('pwcrm-config', JSON.stringify({ url: url, anonKey: key })); } catch (e2) {}
+    location.reload();
+  });
+}
+
 /* ---------- Hosted boot ---------- */
 function boot() {
   try { var th = localStorage.getItem(THEME_KEY); if (th) document.documentElement.setAttribute('data-theme', th); } catch (e) {}
-  if (!window.CONFIG || !CONFIG.configured()) {
-    document.getElementById('app').innerHTML =
-      '<div class="hb-auth"><div class="hb-card"><div class="hb-logo">' + I.drop + '</div>' +
-      '<h1>Almost there</h1><p class="hb-sub">This app needs to be connected to your Supabase project. ' +
-      'Open <code>config.js</code> and paste in your Project URL and anon key, then reload. ' +
-      'Step-by-step instructions are in <code>DEPLOY.md</code>.</p></div></div>';
-    return;
-  }
+  if (!window.CONFIG || !CONFIG.configured()) { hbConfigScreen(); return; }
   HB.client = supabase.createClient(CONFIG.url, CONFIG.anonKey, {
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: 'pwcrm-auth' }
   });
