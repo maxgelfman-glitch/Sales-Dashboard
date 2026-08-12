@@ -425,9 +425,11 @@ tbody tr:last-child td{border-bottom:none}
 .tl-method{font-weight:650;font-size:13.5px;text-transform:capitalize}
 .tl-date{font-size:12px;color:var(--faint);margin-left:auto;white-space:nowrap}
 .tl-notes{font-size:13.5px;color:var(--ink-2);margin-top:3px;white-space:pre-wrap;word-break:break-word}
-.tl-del{opacity:0;color:var(--faint);background:none;border:none;font-size:11px;margin-top:4px;transition:.12s;padding:0}
+.tl-del{opacity:0;color:var(--faint);background:none;border:none;font-size:11px;transition:.12s;padding:0}
+.tl-actions{display:flex;gap:14px;margin-top:5px}
 .tl-item:hover .tl-del{opacity:1}
-.tl-del:hover{color:var(--bad)}
+.tl-del:hover{color:var(--accent)}
+.tl-actions button[data-delcomm]:hover{color:var(--bad)}
 
 .tpl{background:var(--surface-2);border:1px solid var(--line);border-radius:11px;padding:11px 13px;margin-bottom:9px}
 .tpl-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
@@ -646,6 +648,7 @@ var SERVICES = [
 var SERVICE_MAP={}; SERVICES.forEach(function(s){SERVICE_MAP[s.id]=s;});
 var SOURCES = ['Workiz','Facebook Lead','Google','Referral','Website','Yard Sign','Repeat Customer','Other'];
 var LOST_REASONS = ['Price too high','Went with competitor','No response','Not ready yet','Out of service area','Job too small','Other'];
+var PROPERTY_TYPES = ['Residential home','HOA / Condo association','Apartment building','Hotel / Motel','Hospital / Medical','Office building','Shopping center / Retail','Restaurant','Place of worship','Public school','Private school','University / College','Warehouse / Industrial','Senior living','Municipal / Government','Property management co.','Other'];
 var CONFIDENCE = [
   {id:'hot', name:'Hot',  color:'var(--bad)',  chip:'chip-hot',  cls:'sel-hot',  desc:'Ready to buy'},
   {id:'warm',name:'Warm', color:'var(--warn)', chip:'chip-warm', cls:'sel-warm', desc:'Interested'},
@@ -671,10 +674,10 @@ var STORE_KEY='pw_crm_v1', THEME_KEY='pw_crm_theme', SETTINGS_KEY='pw_crm_settin
 /* ---------- State ---------- */
 var state = {
   leads:[], view:'dashboard', segment:'all', search:'', selectedId:null,
-  sort:{key:'updated',dir:'desc'}, sidebarOpen:false, serviceFilter:'all', confFilter:'all',
+  sort:{key:'updated',dir:'desc'}, sidebarOpen:false, serviceFilter:'all', confFilter:'all', sourceFilter:'all', stageFilter:'all', ptypeFilter:'all',
   _modal:null, _confirmFn:null, _pendingDelete:null, _lastFocus:null
 };
-var settings = {notify:false, lastBackup:0, sampleDismissed:false, tone:'friendly', templates:[], customServices:[], customSources:[]};
+var settings = {notify:false, lastBackup:0, sampleDismissed:false, tone:'friendly', templates:[], customServices:[], customSources:[], customPropertyTypes:[]};
 
 /* ---------- Persistence ---------- */
 function load(){
@@ -719,6 +722,7 @@ function isActive(l){ return l.stage!=='won'&&l.stage!=='lost'; }
 function allServices(){ return SERVICES.concat(settings.customServices||[]); }
 function svcName(id){ if(SERVICE_MAP[id]) return SERVICE_MAP[id].name; var c=(settings.customServices||[]).filter(function(x){return x.id===id;})[0]; return c?c.name:id; }
 function allSources(){ return SOURCES.concat(settings.customSources||[]); }
+function allPropertyTypes(){ return PROPERTY_TYPES.concat(settings.customPropertyTypes||[]); }
 function confOf(l){ return CONF_MAP[l.confidence]||CONF_MAP.warm; }
 function resolveTemplate(lead,body){
   var first=(lead.contact||lead.name||'there').split(' ')[0];
@@ -959,6 +963,9 @@ function contactsView(){
   var v=visibleLeads().slice();
   if(state.serviceFilter!=='all') v=v.filter(function(l){return (l.services||[]).indexOf(state.serviceFilter)>=0;});
   if(state.confFilter&&state.confFilter!=='all') v=v.filter(function(l){return (l.confidence||'warm')===state.confFilter;});
+  if(state.sourceFilter&&state.sourceFilter!=='all') v=v.filter(function(l){return (l.source||'Other')===state.sourceFilter;});
+  if(state.stageFilter&&state.stageFilter!=='all') v=v.filter(function(l){return l.stage===state.stageFilter;});
+  if(state.ptypeFilter&&state.ptypeFilter!=='all') v=v.filter(function(l){return (l.propertyType||'')===state.ptypeFilter;});
   var sk=state.sort.key,dir=state.sort.dir==='asc'?1:-1;
   v.sort(function(a,b){
     var x,y;
@@ -987,7 +994,13 @@ function contactsView(){
   }).join('');
   var svcOpts='<option value="all">All services</option>'+allServices().map(function(s){return '<option value="'+s.id+'"'+(state.serviceFilter===s.id?' selected':'')+'>'+esc(s.name)+'</option>';}).join('');
   var confOpts='<option value="all">All quality</option>'+CONFIDENCE.map(function(c){return '<option value="'+c.id+'"'+(state.confFilter===c.id?' selected':'')+'>'+c.name+'</option>';}).join('');
-  var toolbar='<div class="toolbar"><span class="t-lbl">Filter:</span><select class="mini-sel" id="confFilter">'+confOpts+'</select><select class="mini-sel" id="svcFilter">'+svcOpts+'</select><span class="count-txt">'+v.length+' lead'+(v.length===1?'':'s')+'</span></div>';
+  var stageFOpts='<option value="all">All stages</option>'+STAGES.map(function(s){return '<option value="'+s.id+'"'+(state.stageFilter===s.id?' selected':'')+'>'+s.name+'</option>';}).join('');
+  var srcSet={}; allSources().forEach(function(s){srcSet[s]=1;}); state.leads.forEach(function(l){ if(l.source) srcSet[l.source]=1; });
+  var srcFOpts='<option value="all">All sources</option>'+Object.keys(srcSet).map(function(s){return '<option'+(state.sourceFilter===s?' selected':'')+'>'+esc(s)+'</option>';}).join('');
+  var ptSet={}; allPropertyTypes().forEach(function(s){ptSet[s]=1;}); state.leads.forEach(function(l){ if(l.propertyType) ptSet[l.propertyType]=1; });
+  var ptFOpts='<option value="all">All property types</option>'+Object.keys(ptSet).map(function(s){return '<option'+(state.ptypeFilter===s?' selected':'')+'>'+esc(s)+'</option>';}).join('');
+  var reset=(state.confFilter!=='all'||state.serviceFilter!=='all'||state.sourceFilter!=='all'||state.stageFilter!=='all'||state.ptypeFilter!=='all')?'<button class="btn btn-ghost btn-sm" id="clrFilters">Clear filters</button>':'';
+  var toolbar='<div class="toolbar"><span class="t-lbl">Filter:</span><select class="mini-sel" id="stageFilter">'+stageFOpts+'</select><select class="mini-sel" id="ptypeFilter">'+ptFOpts+'</select><select class="mini-sel" id="sourceFilter">'+srcFOpts+'</select><select class="mini-sel" id="confFilter">'+confOpts+'</select><select class="mini-sel" id="svcFilter">'+svcOpts+'</select>'+reset+'<span class="count-txt">'+v.length+' lead'+(v.length===1?'':'s')+'</span></div>';
   return banners()+toolbar+'<div class="table-wrap"><table><thead><tr>'+th('name','Lead')+th('type','Type')+th('stage','Stage')+th('value','Value')+th('lastcontact','Last contact')+th('followup','Next follow-up')+'</tr></thead><tbody>'+(rows||'<tr><td colspan="6" class="empty" style="padding:40px">No matching leads</td></tr>')+'</tbody></table></div>';
 }
 
@@ -1084,6 +1097,7 @@ function slideover(lead){
   if(lead.address)info+=infoItem(I.pin,'Address','<a class="it-val" href="https://maps.google.com/?q='+encodeURIComponent(lead.address)+'" target="_blank" rel="noopener">'+esc(lead.address)+'</a>',true);
   info+=infoItem(I.dollar,'Est. value',lead.value?money(lead.value):'—');
   info+=infoItem(I.board,'Source',esc(lead.source||'—'));
+  if(lead.propertyType) info+=infoItem(I.building,'Property type',esc(lead.propertyType));
   info+='</div>';
 
   // services
@@ -1115,7 +1129,7 @@ function slideover(lead){
 
   // timeline
   var comms=(lead.comms||[]).slice().sort(function(a,b){return a.date<b.date?1:(a.date>b.date?-1:(b.ts||0)-(a.ts||0));});
-  var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
+  var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<div class="tl-actions"><button class="tl-del" data-editcomm="'+c.id+'">Edit</button><button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
 
   var lostBlock=lead.stage==='lost'&&lead.lostReason?'<div class="section"><div class="fu-set bad"><div class="fs-ic">'+I.info+'</div><div class="fs-txt"><div class="t">Marked lost</div><div class="d">Reason: '+esc(lead.lostReason)+'</div></div></div></div>':'';
 
@@ -1152,6 +1166,7 @@ function leadModal(existing,presetStage){
   return function(){
     var isEdit=!!existing;
     var srcOpts=allSources().map(function(s){return '<option'+(l.source===s?' selected':'')+'>'+esc(s)+'</option>';}).join('');
+    var ptypeOpts=allPropertyTypes().map(function(pt){return '<option'+(l.propertyType===pt?' selected':'')+'>'+esc(pt)+'</option>';}).join('');
     var stageOpts=STAGES.map(function(s){return '<option value="'+s.id+'"'+(l.stage===s.id?' selected':'')+'>'+s.name+'</option>';}).join('');
     var curConf=l.confidence||'warm';
     var confBtns=CONFIDENCE.map(function(c){return '<button type="button" class="conf-opt'+(curConf===c.id?' '+c.cls:'')+'" data-conf="'+c.id+'"><span class="cdot" style="background:'+c.color+'"></span>'+c.name+'</button>';}).join('');
@@ -1169,29 +1184,33 @@ function leadModal(existing,presetStage){
         '<div class="field row2"><div><label>Email</label><input id="f-email" value="'+attr(l.email||'')+'" placeholder="name@email.com"/></div><div><label>Est. job value</label><input id="f-value" type="number" min="0" value="'+attr(l.value||'')+'" placeholder="1500"/></div></div>'+
         '<div class="field"><label>Address</label><input id="f-address" value="'+attr(l.address||'')+'" placeholder="Service address"/></div>'+
         '<div class="field"><label>Services needed</label><div class="tag-pick" id="tagPick">'+tags+'</div></div>'+
-        '<div class="field row2"><div><label>Source</label><select id="f-source">'+srcOpts+'</select></div><div><label>Stage</label><select id="f-stage">'+stageOpts+'</select></div></div>'+
+        '<div class="field"><label>Property type <span style="font-weight:500;color:var(--muted)">— HOA, hotel, office, school…</span></label><div style="display:flex;gap:6px;align-items:center"><select id="f-ptype" style="flex:1;min-width:0"><option value="">— none —</option>'+ptypeOpts+'</select><button type="button" class="btn btn-ghost btn-sm" data-newptype="1" title="Add a new property type" style="flex:0 0 auto">'+I.plus+'New</button></div></div>'+
+        '<div class="field row2"><div><label>Source</label><div style="display:flex;gap:6px;align-items:center"><select id="f-source" style="flex:1;min-width:0">'+srcOpts+'</select><button type="button" class="btn btn-ghost btn-sm" data-newsource="1" title="Add a new source" style="flex:0 0 auto">'+I.plus+'New</button></div></div><div><label>Stage</label><select id="f-stage">'+stageOpts+'</select></div></div>'+
         '<div class="field"><label>Notes</label><textarea id="f-notes" placeholder="Access notes, surfaces to clean, gate codes, pricing…">'+esc(l.notes||'')+'</textarea></div>'+
       '</div>'+
       '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savelead="'+(isEdit?l.id:'')+'">'+I.check+(isEdit?'Save changes':'Add lead')+'</button></div></div>';
   };
 }
 
-function commModal(leadId){
+function commModal(leadId, commId){
   return function(){
     var lead=state.leads.find(function(l){return l.id===leadId;});
-    var methodBtns=METHODS.map(function(m){return '<button type="button" class="method-opt'+(m.id==='call'?' sel':'')+'" data-method="'+m.id+'">'+m.icon+m.name+'</button>';}).join('');
-    return '<div class="modal" role="dialog" aria-modal="true" aria-label="Log contact">'+
-      '<div class="modal-head"><h2>Log contact</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
+    var editing=commId?(lead.comms||[]).filter(function(c){return c.id===commId;})[0]:null;
+    var curMethod=editing?editing.method:'call';
+    var methodBtns=METHODS.map(function(m){return '<button type="button" class="method-opt'+(m.id===curMethod?' sel':'')+'" data-method="'+m.id+'">'+m.icon+m.name+'</button>';}).join('');
+    return '<div class="modal" role="dialog" aria-modal="true" aria-label="'+(editing?'Edit contact':'Log contact')+'">'+
+      '<div class="modal-head"><h2>'+(editing?'Edit contact':'Log contact')+'</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
       '<div class="modal-sub">with <b style="color:var(--ink)">'+esc(lead.name)+'</b></div>'+
       '<div class="modal-body" style="padding-top:14px">'+
-        '<div class="field"><label>How did you reach out?</label><div class="method-pick">'+methodBtns+'</div><input type="hidden" id="c-method" value="call"/></div>'+
-        '<div class="field row2"><div><label>Date</label><input type="date" id="c-date" value="'+todayISO()+'"/></div><div><label>Outcome</label><select id="c-outcome"><option value="">— optional —</option><option>Left voicemail</option><option>Spoke — interested</option><option>Spoke — not now</option><option>Sent quote</option><option>Scheduled job</option><option>No answer</option></select></div></div>'+
-        '<div class="field"><label>Notes</label><textarea id="c-notes" placeholder="What was discussed?"></textarea></div>'+
-        '<div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-weight:600"><input type="checkbox" id="c-setfu" checked style="width:auto"/> Schedule next follow-up</label>'+
+        '<input type="hidden" id="c-editid" value="'+(commId||'')+'"/>'+
+        '<div class="field"><label>How did you reach out?</label><div class="method-pick">'+methodBtns+'</div><input type="hidden" id="c-method" value="'+curMethod+'"/></div>'+
+        '<div class="field row2"><div><label>Date</label><input type="date" id="c-date" value="'+(editing?editing.date:todayISO())+'"/></div><div><label>Outcome</label><select id="c-outcome"><option value="">— optional —</option><option>Left voicemail</option><option>Spoke — interested</option><option>Spoke — not now</option><option>Sent quote</option><option>Scheduled job</option><option>No answer</option></select></div></div>'+
+        '<div class="field"'+(editing?' style="margin-bottom:0"':'')+'><label>Notes</label><textarea id="c-notes" placeholder="What was discussed?">'+(editing?esc(editing.notes||''):'')+'</textarea></div>'+
+        (editing?'':('<div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-weight:600"><input type="checkbox" id="c-setfu" checked style="width:auto"/> Schedule next follow-up</label>'+
           '<div id="c-fu-wrap" style="margin-top:10px"><div class="field row2" style="margin:0"><div><input type="date" id="c-fudate" value="'+addDaysISO(3)+'"/></div><div><input id="c-funote" placeholder="Reminder note (e.g. call about quote)"/></div></div>'+
-          '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">'+quickChip(2,'in 2 days')+quickChip(7,'1 week')+quickChip(14,'2 weeks')+quickChip(30,'1 month')+'</div></div></div>'+
+          '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">'+quickChip(2,'in 2 days')+quickChip(7,'1 week')+quickChip(14,'2 weeks')+quickChip(30,'1 month')+'</div></div></div>'))+
       '</div>'+
-      '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savecomm="'+leadId+'">'+I.check+'Save</button></div></div>';
+      '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savecomm="'+leadId+'">'+I.check+(editing?'Save changes':'Save')+'</button></div></div>';
   };
 }
 function quickChip(days,label){ return '<button type="button" class="btn btn-ghost btn-sm" data-quickfu="'+days+'">'+label+'</button>'; }
@@ -1370,9 +1389,16 @@ function wire(){
     doAction(t.dataset.act);
   };
   var s=document.getElementById('search'); if(s) s.oninput=function(){ state.search=this.value; refreshContent(); };
+  bindFilters();
+  if(state.view==='pipeline') setupDnD();
+}
+function bindFilters(){
   var sf=document.getElementById('svcFilter'); if(sf) sf.onchange=function(){ state.serviceFilter=this.value; refreshContent(); };
   var cf=document.getElementById('confFilter'); if(cf) cf.onchange=function(){ state.confFilter=this.value; refreshContent(); };
-  if(state.view==='pipeline') setupDnD();
+  var srf=document.getElementById('sourceFilter'); if(srf) srf.onchange=function(){ state.sourceFilter=this.value; refreshContent(); };
+  var stf=document.getElementById('stageFilter'); if(stf) stf.onchange=function(){ state.stageFilter=this.value; refreshContent(); };
+  var ptf=document.getElementById('ptypeFilter'); if(ptf) ptf.onchange=function(){ state.ptypeFilter=this.value; refreshContent(); };
+  var clr=document.getElementById('clrFilters'); if(clr) clr.onclick=function(){ state.serviceFilter='all'; state.confFilter='all'; state.sourceFilter='all'; state.stageFilter='all'; state.ptypeFilter='all'; refreshContent(); };
 }
 function doAction(act){
   if(act==='add') openModal(leadModal(null));
@@ -1386,7 +1412,7 @@ function doAction(act){
   else if(act==='dismiss-sample'){ settings.sampleDismissed=true; saveSettings(); render(); }
   else if(act==='erase') eraseAll();
 }
-function refreshContent(){ var c=document.getElementById('content'); if(c){ c.innerHTML=viewContent(); if(state.view==='pipeline') setupDnD(); var sf=document.getElementById('svcFilter'); if(sf) sf.onchange=function(){ state.serviceFilter=this.value; refreshContent(); }; var cf=document.getElementById('confFilter'); if(cf) cf.onchange=function(){ state.confFilter=this.value; refreshContent(); }; } }
+function refreshContent(){ var c=document.getElementById('content'); if(c){ c.innerHTML=viewContent(); if(state.view==='pipeline') setupDnD(); bindFilters(); } }
 function toggleSort(key){ if(state.sort.key===key){ state.sort.dir=state.sort.dir==='asc'?'desc':'asc'; } else { state.sort.key=key; state.sort.dir=key==='name'?'asc':'desc'; } refreshContent(); }
 
 function wireSlideover(){
@@ -1396,7 +1422,7 @@ function wireSlideover(){
   var stageSel=document.getElementById('stageSel');
   if(stageSel) stageSel.onchange=function(){ changeStage(state.selectedId,this.value); };
   ov.onclick=function(e){
-    var t=e.target.closest('[data-log],[data-setfu],[data-edit],[data-del],[data-editnote],[data-copy],[data-delcomm],[data-reclean],[data-setconf],[data-addcal],[data-compose]');
+    var t=e.target.closest('[data-log],[data-setfu],[data-edit],[data-del],[data-editnote],[data-copy],[data-delcomm],[data-editcomm],[data-reclean],[data-setconf],[data-addcal],[data-compose]');
     if(!t) return;
     if(t.dataset.log){ openModal(commModal(t.dataset.log)); }
     else if(t.dataset.setfu){ openModal(fuModal(state.selectedId)); }
@@ -1408,6 +1434,7 @@ function wireSlideover(){
     else if(t.dataset.edit){ openModal(leadModal(state.leads.find(function(l){return l.id===t.dataset.edit;}))); }
     else if(t.dataset.editnote){ openModal(noteModal(t.dataset.editnote)); }
     else if(t.dataset.del){ deleteLead(t.dataset.del); }
+    else if(t.dataset.editcomm){ openModal(commModal(state.selectedId,t.dataset.editcomm)); }
     else if(t.dataset.delcomm){ var cidv=t.dataset.delcomm,lead=state.leads.find(function(l){return l.id===state.selectedId;}); lead.comms=lead.comms.filter(function(c){return c.id!==cidv;}); lead.updated=Date.now(); save(); renderOverlay(); render(); }
     else if(t.dataset.copy){ copyText(t.dataset.copy); }
   };
@@ -1425,6 +1452,8 @@ function wireModal(){
   ov.querySelectorAll('[data-conf]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-conf]').forEach(function(x){x.className='conf-opt';}); var c=CONF_MAP[this.dataset.conf]; this.className='conf-opt '+c.cls; document.getElementById('f-conf').value=this.dataset.conf; }; });
   ov.querySelectorAll('[data-tag]').forEach(function(b){ b.onclick=function(){ this.classList.toggle('sel'); }; });
   ov.querySelectorAll('[data-newtag]').forEach(function(b){ b.onclick=function(){ startNewTag(this); }; });
+  ov.querySelectorAll('[data-newsource]').forEach(function(b){ b.onclick=function(){ inlineNewOption(this,'f-source','customSources',SOURCES); }; });
+  ov.querySelectorAll('[data-newptype]').forEach(function(b){ b.onclick=function(){ inlineNewOption(this,'f-ptype','customPropertyTypes',PROPERTY_TYPES); }; });
   ov.querySelectorAll('[data-quickfu]').forEach(function(b){ b.onclick=function(){ var d=addDaysISO(+this.dataset.quickfu),el=document.getElementById('c-fudate')||document.getElementById('fu-date'); if(el) el.value=d; }; });
   var fuChk=document.getElementById('c-setfu'); if(fuChk) fuChk.onchange=function(){ document.getElementById('c-fu-wrap').style.display=this.checked?'block':'none'; };
   var notify=document.getElementById('set-notify'); if(notify) notify.onchange=function(){ toggleNotify(this); };
@@ -1484,10 +1513,31 @@ function startNewTag(btn){
   inp.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); addChip(); } else if(e.key==='Escape'){ inp.remove(); } });
   inp.addEventListener('blur',function(){ if(inp.value.trim()) addChip(); setTimeout(function(){ if(inp.parentNode) inp.remove(); },150); });
 }
+function inlineNewOption(btn, selectId, storeKey, baseArr){
+  var wrap=btn.parentNode;
+  if(wrap.querySelector('.mini-input')){ wrap.querySelector('.mini-input').focus(); return; }
+  var inp=document.createElement('input'); inp.className='mini-input'; inp.placeholder='New…'; inp.maxLength=40; inp.style.width='150px';
+  wrap.appendChild(inp); inp.focus();
+  var done=false;
+  function add(){
+    if(done||!inp.parentNode) return;         // one-shot: blur can re-fire after Enter
+    done=true;
+    var name=inp.value.trim(); if(!name){ inp.remove(); return; }
+    settings[storeKey]=settings[storeKey]||[];
+    if(settings[storeKey].indexOf(name)<0 && baseArr.indexOf(name)<0) settings[storeKey].push(name);
+    saveSettings();
+    var sel=document.getElementById(selectId), exists=false, i;
+    for(i=0;i<sel.options.length;i++){ if(sel.options[i].value===name||sel.options[i].text===name) exists=true; }
+    if(!exists){ var o=document.createElement('option'); o.text=name; o.value=name; sel.add(o); }
+    sel.value=name; inp.remove(); toast('Added "'+name+'"');
+  }
+  inp.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); add(); } else if(e.key==='Escape'){ inp.remove(); } });
+  inp.addEventListener('blur',function(){ if(inp.value.trim()) add(); else setTimeout(function(){ if(inp.parentNode) inp.remove(); },150); });
+}
 function saveLead(id){
   var nameEl=document.getElementById('f-name'),name=nameEl.value.trim();
   if(!name){ nameEl.focus(); nameEl.style.borderColor='var(--bad)'; toast('Please enter a name',true); return; }
-  var data={type:document.getElementById('f-type').value,name:name,contact:document.getElementById('f-contact').value.trim(),phone:document.getElementById('f-phone').value.trim(),email:document.getElementById('f-email').value.trim(),value:document.getElementById('f-value').value,address:document.getElementById('f-address').value.trim(),source:document.getElementById('f-source').value,stage:document.getElementById('f-stage').value,notes:document.getElementById('f-notes').value.trim(),services:getSelectedTags(),confidence:document.getElementById('f-conf').value};
+  var data={type:document.getElementById('f-type').value,name:name,contact:document.getElementById('f-contact').value.trim(),phone:document.getElementById('f-phone').value.trim(),email:document.getElementById('f-email').value.trim(),value:document.getElementById('f-value').value,address:document.getElementById('f-address').value.trim(),source:document.getElementById('f-source').value,propertyType:(document.getElementById('f-ptype')?document.getElementById('f-ptype').value:''),stage:document.getElementById('f-stage').value,notes:document.getElementById('f-notes').value.trim(),services:getSelectedTags(),confidence:document.getElementById('f-conf').value};
   if(id){ updateLead(id,data); toast('Lead updated'); }
   else { var lead=Object.assign({id:uid(),created:Date.now(),comms:[],followUp:null,reclean:0},data); lead.updated=Date.now(); state.leads.push(lead); save(); state.selectedId=lead.id; toast('Lead added'); }
   closeModal(); render(); renderOverlay();
@@ -1505,6 +1555,7 @@ function normalizeLead(l){
     address: l.address!=null?String(l.address):'',
     value: (l.value!=null?l.value:''),
     source: l.source!=null&&String(l.source)?String(l.source):'Other',
+    propertyType: l.propertyType!=null?String(l.propertyType):'',
     stage: STAGE_MAP[l.stage]?l.stage:'new',
     confidence: CONF_MAP[l.confidence]?l.confidence:'warm',
     notes: l.notes!=null?String(l.notes):'',
@@ -1550,8 +1601,15 @@ function saveComm(leadId){
   var method=document.getElementById('c-method').value,date=document.getElementById('c-date').value||todayISO();
   var outcome=document.getElementById('c-outcome').value,notes=document.getElementById('c-notes').value.trim();
   if(outcome) notes=notes?(outcome+' — '+notes):outcome;
+  var editEl=document.getElementById('c-editid'), editId=editEl?editEl.value:'';
+  if(editId){
+    var c=(lead.comms||[]).filter(function(x){return x.id===editId;})[0];
+    if(c){ c.method=method; c.date=date; c.notes=notes; }
+    lead.updated=Date.now(); save(); closeModal(); render(); renderOverlay(); toast('Contact updated'); return;
+  }
   lead.comms=lead.comms||[]; lead.comms.push({id:cid(),method:method,date:date,notes:notes,ts:Date.now()});
-  if(document.getElementById('c-setfu').checked){ var fdate=document.getElementById('c-fudate').value,fnote=document.getElementById('c-funote').value.trim(); if(fdate) lead.followUp={date:fdate,note:fnote}; }
+  var setfu=document.getElementById('c-setfu');
+  if(setfu&&setfu.checked){ var fdate=document.getElementById('c-fudate').value,fnote=document.getElementById('c-funote').value.trim(); if(fdate) lead.followUp={date:fdate,note:fnote}; }
   lead.updated=Date.now(); save(); closeModal(); render(); renderOverlay(); toast('Contact logged');
 }
 function saveFu(leadId){
@@ -1732,7 +1790,8 @@ function seed(){
     {id:uid(),sample:true,type:'residential',name:'Greg Holland',contact:'Greg Holland',phone:'(555) 220-9963',email:'gholland@email.com',address:'8 Pinecrest Rd',source:'Facebook Lead',value:350,stage:'contacted',services:['concrete'],reclean:0,created:now-15*D,updated:now-10*D,notes:'Wanted driveway done. Went quiet after first quote.',comms:[{id:cid(),method:'text',date:iso(-15),notes:'Sent quote, no reply.',ts:now-15*D},{id:cid(),method:'text',date:iso(-10),notes:'Followed up, still no reply.',ts:now-10*D}],followUp:{date:iso(-4),note:'Last attempt — then mark lost'}}
   ];
   var cf=['warm','hot','hot','warm','warm','cold'];
-  state.leads.forEach(function(l,i){ l.confidence=cf[i]||'warm'; });
+  var pt=['HOA / Condo association','Residential home','Residential home','Office building','Residential home','Residential home'];
+  state.leads.forEach(function(l,i){ l.confidence=cf[i]||'warm'; l.propertyType=pt[i]||''; });
   save();
 }
 
@@ -1747,6 +1806,7 @@ function boot(){
   if(!settings.templates) settings.templates=[];
   if(!settings.customServices) settings.customServices=[];
   if(!settings.customSources) settings.customSources=[];
+  if(!settings.customPropertyTypes) settings.customPropertyTypes=[];
   if(!settings.tone) settings.tone='friendly';
   render();
   checkReminders(false);
