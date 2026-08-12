@@ -256,6 +256,9 @@ input,select,textarea{font-family:inherit;font-size:15px}
 .fu-name{font-weight:600;font-size:14.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .fu-meta{font-size:12.5px;color:var(--muted);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
 .fu-meta b{color:var(--ink-2);font-weight:600}
+.fu-sug{font-size:12px;color:var(--ink-2);margin-top:6px;display:flex;align-items:center;gap:6px}
+.fu-sug svg{width:13px;height:13px;color:var(--accent);flex:0 0 auto}
+.fu-sug b{color:var(--accent);font-weight:650}
 .fu-when{flex:0 0 auto;text-align:right;font-size:12.5px;font-weight:650;min-width:88px}
 .fu-when small{display:block;font-weight:500;color:var(--faint);font-size:11px}
 .fu-actions{display:flex;gap:7px;flex:0 0 auto}
@@ -766,7 +769,7 @@ function suggestChannel(lead, o, curMethod){
 }
 function channelNote(channel, stage, o){
   var ch={call:'Call',text:'Text',email:'Email'}[channel]||'Reach out';
-  var ang = o&&o.nurture?'seasonal check-in':(stage==='quoted'?'follow up on the quote':stage==='estimate'?'confirm the estimate appointment':stage==='job'?'confirm the job':stage==='contacted'?'follow up to book the estimate':'follow up');
+  var ang = o&&o.nurture?'seasonal check-in':(stage==='quoted'?'follow up on the quote':stage==='estimate'?'confirm the estimate appointment':stage==='job'?'confirm the job':stage==='contacted'?'follow up to book the estimate':stage==='new'?'reach out and introduce':'follow up');
   return ch+' — '+ang;
 }
 function suggestNextStep(lead, outcomeId, curMethod){
@@ -969,18 +972,37 @@ function fuRow(lead){
   var lcTxt=lc?('Last: <b>'+METHOD_MAP[lc.method].name+'</b> · '+fmtDate(lc.date)):'Never contacted';
   var note=lead.followUp&&lead.followUp.note?' · '+esc(lead.followUp.note):'';
   var canSnooze=fu.level==='overdue'||fu.level==='today'||fu.level==='soon';
+  var rec=recommendNext(lead);
+  var recActionable=(rec.channel==='email'&&lead.email)||((rec.channel==='call'||rec.channel==='text')&&lead.phone);
+  var recIcon={call:I.phone,text:I.chat,email:I.mail}[rec.channel]||I.chat;
+  var sugLine=settings.autoCadence!==false?'<div class="fu-sug">'+I.spark+'<span><b>Do next:</b> '+esc(rec.label)+'</span></div>':'';
   return '<div class="fu-row">'+
     '<div class="fu-accent" style="background:'+accent+'"></div>'+
     '<div class="fu-main" data-open="'+lead.id+'">'+
       '<div class="fu-name">'+esc(lead.name)+' '+typeChip+' '+stageChip+(lead.reclean?' <span class="chip chip-repeat">'+I.repeat+'Repeat</span>':'')+'</div>'+
       '<div class="fu-meta"><span>'+lcTxt+'</span>'+(fu.level!=='none'?'<span>Follow up '+esc(fmtDate(lead.followUp.date))+note+'</span>':'')+'</div>'+
+      sugLine+
     '</div>'+
     '<div class="fu-when" style="color:'+whenColor+'">'+whenTxt+(fu.level!=='none'?'<small>'+esc(fmtDate(lead.followUp.date))+'</small>':'')+'</div>'+
     '<div class="fu-actions">'+
       (canSnooze?'<button class="icon-btn snooze" data-snooze="'+lead.id+'" title="Snooze 3 days">'+I.snooze+'</button>':'')+
-      (lead.phone?'<a class="icon-btn" href="tel:'+attr(lead.phone)+'" title="Call">'+I.phone+'</a>':'')+
-      '<button class="icon-btn accent" data-log="'+lead.id+'" title="Log contact">'+I.plus+'</button>'+
+      (recActionable?'<button class="icon-btn accent" data-doit="'+lead.id+'|'+rec.channel+'" title="Do it: '+attr(rec.label)+'">'+recIcon+'</button>':(lead.phone?'<a class="icon-btn" href="tel:'+attr(lead.phone)+'" title="Call">'+I.phone+'</a>':''))+
+      '<button class="icon-btn" data-log="'+lead.id+'" title="Log contact">'+I.plus+'</button>'+
     '</div></div>';
+}
+function recommendNext(lead){
+  var comms=commsByRecency(lead);
+  var lastMethod=comms.length?comms[0].method:null;
+  var lastO=comms.length?OUTCOME_MAP[comms[0].outcome]:null;
+  var channel=suggestChannel(lead,lastO,lastMethod);
+  return {channel:channel, label:channelNote(channel,lead.stage,null)};
+}
+function doNext(leadId, channel){
+  var lead=state.leads.find(function(l){return l.id===leadId;}); if(!lead) return;
+  if(channel==='email'&&lead.email) openModal(composeModal(leadId,'email'));
+  else if(channel==='text'&&lead.phone) openModal(composeModal(leadId,'text'));
+  else if(channel==='call'&&lead.phone) openLink('tel:'+lead.phone.replace(/[^0-9+]/g,''));
+  else openModal(commModal(leadId));
 }
 
 /* ---------- Pipeline ---------- */
@@ -1477,13 +1499,14 @@ function autoMap(headers){
 function wire(){
   var app=document.getElementById('app');
   app.onclick=function(e){
-    var t=e.target.closest('[data-nav],[data-seg],[data-act],[data-open],[data-log],[data-snooze],[data-sort],[data-add-stage]');
+    var t=e.target.closest('[data-nav],[data-seg],[data-act],[data-open],[data-log],[data-snooze],[data-doit],[data-sort],[data-add-stage]');
     if(!t) return;
     if(t.dataset.nav){ state.view=t.dataset.nav; state.sidebarOpen=false; render(); return; }
     if(t.dataset.seg){ state.segment=t.dataset.seg; render(); return; }
     if(t.dataset.sort){ toggleSort(t.dataset.sort); return; }
     if(t.dataset.addStage){ openModal(leadModal(null,t.dataset.addStage)); return; }
     if(t.dataset.snooze){ e.stopPropagation(); snooze(t.dataset.snooze); return; }
+    if(t.dataset.doit){ e.stopPropagation(); var dp=t.dataset.doit.split('|'); doNext(dp[0],dp[1]); return; }
     if(t.dataset.log){ e.stopPropagation(); openModal(commModal(t.dataset.log)); return; }
     if(t.dataset.open){ openLead(t.dataset.open); return; }
     doAction(t.dataset.act);
