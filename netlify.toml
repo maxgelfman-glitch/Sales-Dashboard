@@ -1,0 +1,32 @@
+# Netlify configuration for the hosted PowerWash CRM.
+# The app is a static site (no build step) living in hosted/app/.
+# With this file, linking the GitHub repo to a Netlify site auto-detects the
+# right folder to publish — no manual build settings to fill in.
+
+[build]
+  publish = "hosted/app"
+  # no build command — the app is plain HTML/JS served as-is
+  command = ""
+
+# Long-cache the vendored library and icons (they rarely change); the service
+# worker + short-cache HTML handle picking up new app versions on refresh.
+[[headers]]
+  for = "/vendor/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/icons/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+# Never cache the service worker or the page shell, so updates land promptly.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
