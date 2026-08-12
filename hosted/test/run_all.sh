@@ -34,6 +34,7 @@ echo; echo "== RLS security tests =="; bash test/run_rls_tests.sh || rc=1
 echo; echo "== app E2E (auth, sync, roles, tenant isolation, offline, invite) =="; reseed; node test/e2e.js || rc=1
 echo; echo "== PWA offline-shell + migration import =="; reseed; node test/e2e_pwa.js || rc=1
 echo; echo "== multi-device (propagation, LWW, delete, account switch) =="; reseed; node test/e2e_multi.js || rc=1
+echo; echo "== stress (bulk sync, rapid edits, free-app smoke) =="; reseed; node test/e2e_stress.js || rc=1
 echo
 [ "$rc" = 0 ] && echo "ALL HOSTED TESTS PASSED" || echo "SOME HOSTED TESTS FAILED"
 exit $rc
