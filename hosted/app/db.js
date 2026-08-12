@@ -53,7 +53,7 @@
   var client = null;           // supabase client
   var ctx = { orgId: null, uid: null, role: 'owner' };
   var snapshot = [];           // last state confirmed on server (nested[])
-  var pushing = false, pendingPush = false, online = true;
+  var online = true;   // push/pull mutual exclusion is handled by serialize()
 
   function keyFor(suffix) { return (ctx.orgId || 'anon') + ':' + suffix; }
 
