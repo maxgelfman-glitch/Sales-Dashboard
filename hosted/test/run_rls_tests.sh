@@ -69,6 +69,17 @@ ck "Owner B CANNOT update Org A lead"         "$(as_user $OWNB "with u as (updat
 INS_ERR="$(as_user $AGTA "insert into public.leads(org_id,name) values ('$ORGB','cross') returning 'ok';" 2>&1 | grep -c 'row-level security')"
 ck "Agent A CANNOT insert into another org"   "$INS_ERR" "1"
 
+echo "== Privilege escalation blocked =="
+# Agent must NOT be able to promote themselves to owner (role/org locked by trigger).
+esc="$(as_user $AGTA "update public.profiles set role='owner' where id='$AGTA' returning 'ok';" 2>&1 | grep -c 'only an owner can change a role')"
+ck "Agent CANNOT self-promote to owner"       "$esc" "1"
+ck "Agent role unchanged after attempt"       "$(as_user $OWNA "select role from public.profiles where id='$AGTA';"|tail -1)" "agent"
+# Owner CAN change a teammate's role (legitimate path still works).
+ck "Owner CAN change a teammate role"          "$(as_user $OWNA "update public.profiles set role='owner' where id='$AGTA' returning 'ok';"|tail -1)" "ok"
+# Nobody can move a profile to another org.
+orgmove="$(as_user $OWNA "update public.profiles set org_id='$ORGB' where id='$OWNA' returning 'ok';" 2>&1 | grep -c 'cannot change org_id')"
+ck "Cannot move a profile to another org"      "$orgmove" "1"
+
 echo ""
 echo "RLS RESULT: $pass passed, $fail failed"
 [ "$fail" = "0" ] && echo "ALL RLS TESTS PASS" || echo "RLS FAILURES PRESENT"

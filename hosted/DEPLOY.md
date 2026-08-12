@@ -31,11 +31,13 @@ web page lives — Netlify or Vercel, both free). No coding.
 
 1. In your Supabase project, click **SQL Editor** in the left sidebar → **New
    query**.
-2. Open the file **`supabase/migrations/0001_init.sql`** from this project, copy
-   everything, paste it into the editor, and click **Run**. You should see
-   "Success".
-3. Do the same with **`supabase/migrations/0002_rpc_invites.sql`** (new query,
-   paste, Run).
+2. Open each file in **`supabase/migrations/`** in order and run each one (New
+   query → paste → **Run** → "Success"):
+   - `0001_init.sql` — tables + security rules
+   - `0002_rpc_invites.sql` — account setup + teammate invites
+   - `0003_lock_role.sql` — locks roles so only you (owner) can change them
+
+   (If more `00NN_*.sql` files are ever added, run them in number order too.)
 
 That's your whole database — tables for leads, contacts, your team, plus the
 security rules that keep each business's data private and enforce the
