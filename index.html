@@ -623,14 +623,28 @@ var I = {
 
 /* ---------- Config ---------- */
 var STAGES = [
-  {id:'new',      name:'New Lead',  color:'#8e8e93'},
-  {id:'contacted',name:'Contacted', color:'#0071e3'},
-  {id:'quoted',   name:'Quoted',    color:'#5648c8'},
-  {id:'scheduled',name:'Scheduled', color:'#c97a00'},
-  {id:'won',      name:'Won',       color:'#1a9e4b'},
-  {id:'lost',     name:'Lost',      color:'#d70015'}
+  {id:'new',      name:'New Lead',       color:'#8e8e93'},
+  {id:'contacted',name:'Contacted',      color:'#0071e3'},
+  {id:'estimate', name:'Estimate Set',   color:'#00a2bd'},
+  {id:'quoted',   name:'Quoted',         color:'#5648c8'},
+  {id:'job',      name:'Job Scheduled',  color:'#c97a00'},
+  {id:'won',      name:'Won',            color:'#1a9e4b'},
+  {id:'lost',     name:'Lost',           color:'#d70015'}
 ];
 var STAGE_MAP={}; STAGES.forEach(function(s){STAGE_MAP[s.id]=s;});
+function migrateStage(s){ if(STAGE_MAP[s]) return s; if(s==='scheduled') return 'job'; return 'new'; }
+// Structured contact outcomes — drive the follow-up engine and stage progression
+var OUTCOMES = [
+  {id:'noanswer',  name:'No answer / no reply', advance:true},
+  {id:'voicemail', name:'Left a voicemail',     advance:true},
+  {id:'interested',name:'Spoke — interested',   reset:true},
+  {id:'estimate',  name:'Booked the estimate',  reset:true, stage:'estimate'},
+  {id:'quote',     name:'Sent the quote',       reset:true, stage:'quoted'},
+  {id:'notnow',    name:'Spoke — not now',      reset:true, nurture:true},
+  {id:'job',       name:'Booked the job',       reset:true, stage:'job'},
+  {id:'no',        name:'Not interested',       lost:true}
+];
+var OUTCOME_MAP={}; OUTCOMES.forEach(function(o){OUTCOME_MAP[o.id]=o;});
 var METHODS = [
   {id:'call', name:'Call',    icon:I.phone, cls:'tl-call'},
   {id:'text', name:'Text',    icon:I.chat,  cls:'tl-text'},
@@ -677,7 +691,7 @@ var state = {
   sort:{key:'updated',dir:'desc'}, sidebarOpen:false, serviceFilter:'all', confFilter:'all', sourceFilter:'all', stageFilter:'all', ptypeFilter:'all',
   _modal:null, _confirmFn:null, _pendingDelete:null, _lastFocus:null
 };
-var settings = {notify:false, lastBackup:0, sampleDismissed:false, tone:'friendly', templates:[], customServices:[], customSources:[], customPropertyTypes:[]};
+var settings = {notify:false, lastBackup:0, sampleDismissed:false, tone:'friendly', templates:[], customServices:[], customSources:[], customPropertyTypes:[], autoCadence:true};
 
 /* ---------- Persistence ---------- */
 function load(){
@@ -723,6 +737,52 @@ function allServices(){ return SERVICES.concat(settings.customServices||[]); }
 function svcName(id){ if(SERVICE_MAP[id]) return SERVICE_MAP[id].name; var c=(settings.customServices||[]).filter(function(x){return x.id===id;})[0]; return c?c.name:id; }
 function allSources(){ return SOURCES.concat(settings.customSources||[]); }
 function allPropertyTypes(){ return PROPERTY_TYPES.concat(settings.customPropertyTypes||[]); }
+
+/* ============================================================================
+   SMART FOLLOW-UP CADENCE ENGINE
+   Suggests the next follow-up (date + channel + why) from:
+   situation(stage) × last outcome × attempt# × type(res/com) × channel history.
+   All intelligence lives here; the UI just shows one editable suggestion.
+   ============================================================================ */
+var CADENCE = {
+  residential: { new:[0], contacted:[1,2,4,7,14], estimate:[1], quoted:[2,5,10], job:[1] },
+  commercial:  { new:[0], contacted:[3,7,14,30,60], estimate:[2], quoted:[3,7,21,42,30], job:[2] }
+};
+function commsByRecency(lead){ return (lead.comms||[]).slice().sort(function(a,b){ return a.date<b.date?1:(a.date>b.date?-1:((b.ts||0)-(a.ts||0))); }); }
+function snapToSpring(iso){ var d=parseDate(iso); if(!d||isNaN(d)) return iso; var m=d.getMonth(),y=d.getFullYear(); if(m>=10) y+=1; if(m>=10||m<=1) return y+'-03-15'; return iso; }
+function suggestChannel(lead, o, curMethod){
+  var avail=[]; if(lead.phone){avail.push('call');avail.push('text');} if(lead.email) avail.push('email');
+  if(!avail.length) return curMethod||'call';
+  if(o && o.reset && avail.indexOf(curMethod)>=0) return curMethod;       // continue a live thread
+  var comms=commsByRecency(lead), i;
+  for(i=0;i<comms.length;i++){ var c=comms[i]; if(c.outcome && OUTCOME_MAP[c.outcome] && OUTCOME_MAP[c.outcome].reset && avail.indexOf(c.method)>=0 && c.method!==curMethod) return c.method; } // learned preference
+  var order=(lead.type==='commercial'?['email','call','text']:['text','call','email']).filter(function(m){return avail.indexOf(m)>=0;});
+  for(i=0;i<order.length;i++){ if(order[i]!==curMethod) return order[i]; }   // rotate off the channel just used
+  return order[0]||avail[0];
+}
+function channelNote(channel, stage, o){
+  var ch={call:'Call',text:'Text',email:'Email'}[channel]||'Reach out';
+  var ang = o&&o.nurture?'seasonal check-in':(stage==='quoted'?'follow up on the quote':stage==='estimate'?'confirm the estimate appointment':stage==='job'?'confirm the job':stage==='contacted'?'follow up to book the estimate':'follow up');
+  return ch+' — '+ang;
+}
+function suggestNextStep(lead, outcomeId, curMethod){
+  var o=OUTCOME_MAP[outcomeId]||OUTCOME_MAP.noanswer;
+  if(o.lost) return null;                                   // going to Lost → no follow-up
+  var type=lead.type==='commercial'?'commercial':'residential';
+  var stage=o.stage||lead.stage;
+  var seq=(CADENCE[type]||CADENCE.residential)[stage]||CADENCE[type].contacted;
+  var days, why, nurture=false;
+  if(o.nurture){ days=type==='commercial'?90:120; nurture=true; why='Not ready — nurturing for the season'; }
+  else if(o.advance){
+    var trailing=0, comms=commsByRecency(lead);
+    for(var i=0;i<comms.length;i++){ if(comms[i].outcome==='noanswer'||comms[i].outcome==='voicemail') trailing++; else break; }
+    if(trailing>=seq.length){ days=type==='commercial'?90:120; nurture=true; why=type==='commercial'?'Several attempts — long-term nurture':'No response after several tries — nurture or mark lost'; }
+    else { days=seq[trailing]; var base=stage==='quoted'?'Quote is out':(stage==='contacted'?'Chasing the estimate':'Following up'); why=base+' · attempt '+(trailing+1)+' of '+seq.length; }
+  } else { days=(seq[0]!=null?seq[0]:2); why=stage==='quoted'?'Quote sent — check in':stage==='estimate'?'Estimate booked — confirm':stage==='job'?'Job booked — confirm':'Keep the momentum'; }
+  var date=addDaysISO(days); if(nurture||days>=75) date=snapToSpring(date);
+  var channel=suggestChannel(lead,o,curMethod);
+  return {date:date, note:channelNote(channel,stage,o), why:why, channel:channel, nurture:nurture};
+}
 function confOf(l){ return CONF_MAP[l.confidence]||CONF_MAP.warm; }
 function resolveTemplate(lead,body){
   var first=(lead.contact||lead.name||'there').split(' ')[0];
@@ -1129,7 +1189,7 @@ function slideover(lead){
 
   // timeline
   var comms=(lead.comms||[]).slice().sort(function(a,b){return a.date<b.date?1:(a.date>b.date?-1:(b.ts||0)-(a.ts||0));});
-  var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<div class="tl-actions"><button class="tl-del" data-editcomm="'+c.id+'">Edit</button><button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
+  var tl=comms.length?comms.map(function(c){var m=METHOD_MAP[c.method]||METHOD_MAP.note;return '<div class="tl-item"><div class="tl-ic '+m.cls+'">'+m.icon+'</div><div class="tl-body"><div class="tl-top"><span class="tl-method">'+m.name+(c.outcome&&OUTCOME_MAP[c.outcome]?' <span style="font-weight:500;color:var(--muted)">· '+esc(OUTCOME_MAP[c.outcome].name)+'</span>':'')+'</span><span class="tl-date tnum">'+fmtDate(c.date)+'</span></div>'+(c.notes?'<div class="tl-notes">'+esc(c.notes)+'</div>':'<div class="tl-notes" style="color:var(--faint)">No notes</div>')+'<div class="tl-actions"><button class="tl-del" data-editcomm="'+c.id+'">Edit</button><button class="tl-del" data-delcomm="'+c.id+'">Delete</button></div></div></div>';}).join(''):'<div style="color:var(--faint);font-size:13.5px;padding:4px 0 10px">No communication logged yet. Every call, text, or email you log here builds this lead\'s history.</div>';
 
   var lostBlock=lead.stage==='lost'&&lead.lostReason?'<div class="section"><div class="fu-set bad"><div class="fs-ic">'+I.info+'</div><div class="fs-txt"><div class="t">Marked lost</div><div class="d">Reason: '+esc(lead.lostReason)+'</div></div></div></div>':'';
 
@@ -1197,21 +1257,40 @@ function commModal(leadId, commId){
     var lead=state.leads.find(function(l){return l.id===leadId;});
     var editing=commId?(lead.comms||[]).filter(function(c){return c.id===commId;})[0]:null;
     var curMethod=editing?editing.method:'call';
+    var curOutcome=editing?(editing.outcome||'noanswer'):'noanswer';
     var methodBtns=METHODS.map(function(m){return '<button type="button" class="method-opt'+(m.id===curMethod?' sel':'')+'" data-method="'+m.id+'">'+m.icon+m.name+'</button>';}).join('');
+    var outOpts=OUTCOMES.map(function(o){return '<option value="'+o.id+'"'+(curOutcome===o.id?' selected':'')+'>'+o.name+'</option>';}).join('');
+    var sug=(!editing&&settings.autoCadence!==false)?suggestNextStep(lead,curOutcome,curMethod):null;
+    var fuDate=sug?sug.date:addDaysISO(3), fuNote=sug?sug.note:'', fuWhy=sug?sug.why:'';
     return '<div class="modal" role="dialog" aria-modal="true" aria-label="'+(editing?'Edit contact':'Log contact')+'">'+
       '<div class="modal-head"><h2>'+(editing?'Edit contact':'Log contact')+'</h2><button class="icon-btn x" data-close="1" aria-label="Close">'+I.x+'</button></div>'+
       '<div class="modal-sub">with <b style="color:var(--ink)">'+esc(lead.name)+'</b></div>'+
       '<div class="modal-body" style="padding-top:14px">'+
-        '<input type="hidden" id="c-editid" value="'+(commId||'')+'"/>'+
+        '<input type="hidden" id="c-editid" value="'+(commId||'')+'"/><input type="hidden" id="c-leadid" value="'+leadId+'"/>'+
         '<div class="field"><label>How did you reach out?</label><div class="method-pick">'+methodBtns+'</div><input type="hidden" id="c-method" value="'+curMethod+'"/></div>'+
-        '<div class="field row2"><div><label>Date</label><input type="date" id="c-date" value="'+(editing?editing.date:todayISO())+'"/></div><div><label>Outcome</label><select id="c-outcome"><option value="">— optional —</option><option>Left voicemail</option><option>Spoke — interested</option><option>Spoke — not now</option><option>Sent quote</option><option>Scheduled job</option><option>No answer</option></select></div></div>'+
+        '<div class="field row2"><div><label>What happened?</label><select id="c-outcome">'+outOpts+'</select></div><div><label>Date</label><input type="date" id="c-date" value="'+(editing?editing.date:todayISO())+'"/></div></div>'+
         '<div class="field"'+(editing?' style="margin-bottom:0"':'')+'><label>Notes</label><textarea id="c-notes" placeholder="What was discussed?">'+(editing?esc(editing.notes||''):'')+'</textarea></div>'+
         (editing?'':('<div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-weight:600"><input type="checkbox" id="c-setfu" checked style="width:auto"/> Schedule next follow-up</label>'+
-          '<div id="c-fu-wrap" style="margin-top:10px"><div class="field row2" style="margin:0"><div><input type="date" id="c-fudate" value="'+addDaysISO(3)+'"/></div><div><input id="c-funote" placeholder="Reminder note (e.g. call about quote)"/></div></div>'+
+          '<div id="c-fu-why" class="var-hint" style="margin:7px 0 0;display:flex;align-items:center;gap:6px">'+I.spark+'<span>'+esc(fuWhy)+'</span></div>'+
+          '<div id="c-fu-wrap" style="margin-top:8px"><div class="field row2" style="margin:0"><div><input type="date" id="c-fudate" value="'+fuDate+'"/></div><div><input id="c-funote" value="'+attr(fuNote)+'" placeholder="Reminder note"/></div></div>'+
           '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">'+quickChip(2,'in 2 days')+quickChip(7,'1 week')+quickChip(14,'2 weeks')+quickChip(30,'1 month')+'</div></div></div>'))+
       '</div>'+
       '<div class="modal-foot"><button class="btn btn-ghost" data-close="1">Cancel</button><div class="spacer"></div><button class="btn btn-primary" data-savecomm="'+leadId+'">'+I.check+(editing?'Save changes':'Save')+'</button></div></div>';
   };
+}
+function recomputeFollowup(){
+  var lid=document.getElementById('c-leadid'); if(!lid) return;
+  if(document.getElementById('c-editid')&&document.getElementById('c-editid').value) return; // edit mode: no suggestion
+  if(settings.autoCadence===false) return;
+  var lead=state.leads.find(function(l){return l.id===lid.value;}); if(!lead) return;
+  var outcome=document.getElementById('c-outcome').value, method=document.getElementById('c-method').value;
+  var setfu=document.getElementById('c-setfu'), wrap=document.getElementById('c-fu-wrap'), why=document.getElementById('c-fu-why');
+  var o=OUTCOME_MAP[outcome];
+  if(o&&o.lost){ if(setfu) setfu.checked=false; if(wrap) wrap.style.display='none'; if(why) why.innerHTML=I.info+'<span>This lead will be marked Lost — no follow-up needed.</span>'; return; }
+  var sug=suggestNextStep(lead,outcome,method); if(!sug) return;
+  if(setfu) setfu.checked=true; if(wrap) wrap.style.display='block';
+  var d=document.getElementById('c-fudate'), n=document.getElementById('c-funote');
+  if(d) d.value=sug.date; if(n) n.value=sug.note; if(why) why.innerHTML=I.spark+'<span>'+esc(sug.why)+'</span>';
 }
 function quickChip(days,label){ return '<button type="button" class="btn btn-ghost btn-sm" data-quickfu="'+days+'">'+label+'</button>'; }
 
@@ -1292,6 +1371,7 @@ function settingsModal(){
         '<div class="set-row"><div class="sr-txt"><div class="t">Theme</div><div class="d">Switch between light and dark.</div></div><button class="btn btn-ghost btn-sm" data-act="theme">'+I.sun+'Toggle</button></div>'+
 
         '<div class="set-section-title">Reminders</div>'+
+        '<div class="set-row"><div class="sr-txt"><div class="t">Smart follow-up suggestions</div><div class="d">When you log a contact, auto-suggest the next follow-up date &amp; channel based on the situation (stage, outcome, attempts, residential vs commercial). Always editable.</div></div><label class="switch"><input type="checkbox" id="set-cadence"'+(settings.autoCadence!==false?' checked':'')+'/><span class="track"></span></label></div>'+
         '<div class="set-row"><div class="sr-txt"><div class="t">Desktop notifications</div><div class="d">'+(notifySupported?'A pop-up when follow-ups are due (asks permission).':'Not supported in this browser — the in-app list still works.')+'</div></div><label class="switch"><input type="checkbox" id="set-notify"'+(settings.notify?' checked':'')+(notifySupported?'':' disabled')+'/><span class="track"></span></label></div>'+
         '<div class="set-row"><div class="sr-txt"><div class="t">Send reminders to my phone</div><div class="d">Download your upcoming follow-ups as a calendar file — open it once and your calendar app notifies you (and can email you).</div></div><button class="btn btn-ghost btn-sm" data-act="export-cal">'+I.calendar+'Calendar</button></div>'+
 
@@ -1448,7 +1528,8 @@ function wireModal(){
 
   ov.querySelectorAll('[data-type]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-type]').forEach(function(x){x.className='type-opt';}); this.className='type-opt '+(this.dataset.type==='residential'?'sel-res':'sel-com'); document.getElementById('f-type').value=this.dataset.type; var nl=document.getElementById('nameLbl'); if(nl) nl.innerHTML=(this.dataset.type==='commercial'?'Business name':'Name')+' <span class="req">*</span>'; }; });
   ov.querySelectorAll('[data-itype]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-itype]').forEach(function(x){x.className='type-opt';}); this.className='type-opt '+(this.dataset.itype==='residential'?'sel-res':'sel-com'); document.getElementById('imp-type').value=this.dataset.itype; }; });
-  ov.querySelectorAll('[data-method]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-method]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); document.getElementById('c-method').value=this.dataset.method; }; });
+  ov.querySelectorAll('[data-method]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-method]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); document.getElementById('c-method').value=this.dataset.method; recomputeFollowup(); }; });
+  var outSel=document.getElementById('c-outcome'); if(outSel) outSel.onchange=recomputeFollowup;
   ov.querySelectorAll('[data-conf]').forEach(function(b){ b.onclick=function(){ ov.querySelectorAll('[data-conf]').forEach(function(x){x.className='conf-opt';}); var c=CONF_MAP[this.dataset.conf]; this.className='conf-opt '+c.cls; document.getElementById('f-conf').value=this.dataset.conf; }; });
   ov.querySelectorAll('[data-tag]').forEach(function(b){ b.onclick=function(){ this.classList.toggle('sel'); }; });
   ov.querySelectorAll('[data-newtag]').forEach(function(b){ b.onclick=function(){ startNewTag(this); }; });
@@ -1457,6 +1538,7 @@ function wireModal(){
   ov.querySelectorAll('[data-quickfu]').forEach(function(b){ b.onclick=function(){ var d=addDaysISO(+this.dataset.quickfu),el=document.getElementById('c-fudate')||document.getElementById('fu-date'); if(el) el.value=d; }; });
   var fuChk=document.getElementById('c-setfu'); if(fuChk) fuChk.onchange=function(){ document.getElementById('c-fu-wrap').style.display=this.checked?'block':'none'; };
   var notify=document.getElementById('set-notify'); if(notify) notify.onchange=function(){ toggleNotify(this); };
+  var cad=document.getElementById('set-cadence'); if(cad) cad.onchange=function(){ settings.autoCadence=this.checked; saveSettings(); toast(this.checked?'Smart follow-ups on':'Smart follow-ups off'); };
   ov.querySelectorAll('[data-rcq]').forEach(function(b){ b.onclick=function(){ var el=document.getElementById('rc-months'); if(el) el.value=this.dataset.rcq; }; });
   // compose template selection
   ov.querySelectorAll('[data-tpl]').forEach(function(el){ el.onclick=function(){ ov.querySelectorAll('[data-tpl]').forEach(function(x){x.classList.remove('sel');}); this.classList.add('sel'); var lead=state.leads.find(function(l){return l.id===state.selectedId;}); var ta=document.getElementById('cm-body'); if(ta&&lead) ta.value=resolveTemplate(lead,this.dataset.tpl); }; });
@@ -1556,11 +1638,11 @@ function normalizeLead(l){
     value: (l.value!=null?l.value:''),
     source: l.source!=null&&String(l.source)?String(l.source):'Other',
     propertyType: l.propertyType!=null?String(l.propertyType):'',
-    stage: STAGE_MAP[l.stage]?l.stage:'new',
+    stage: migrateStage(l.stage),
     confidence: CONF_MAP[l.confidence]?l.confidence:'warm',
     notes: l.notes!=null?String(l.notes):'',
     services: Array.isArray(l.services)?l.services.filter(function(x){return typeof x==='string';}):[],
-    comms: Array.isArray(l.comms)?l.comms.map(function(c){ c=c||{}; return {id:c.id||cid(),method:METHOD_MAP[c.method]?c.method:'note',date:c.date||todayISO(),notes:c.notes!=null?String(c.notes):'',ts:c.ts||0}; }):[],
+    comms: Array.isArray(l.comms)?l.comms.map(function(c){ c=c||{}; return {id:c.id||cid(),method:METHOD_MAP[c.method]?c.method:'note',date:c.date||todayISO(),notes:c.notes!=null?String(c.notes):'',outcome:(OUTCOME_MAP[c.outcome]?c.outcome:''),ts:c.ts||0}; }):[],
     followUp: (l.followUp&&l.followUp.date)?{date:String(l.followUp.date),note:(l.followUp.note!=null?String(l.followUp.note):'')}:null,
     reclean: Number(l.reclean)||0,
     lostReason: l.lostReason!=null?String(l.lostReason):'',
@@ -1600,17 +1682,22 @@ function saveComm(leadId){
   var lead=state.leads.find(function(l){return l.id===leadId;});
   var method=document.getElementById('c-method').value,date=document.getElementById('c-date').value||todayISO();
   var outcome=document.getElementById('c-outcome').value,notes=document.getElementById('c-notes').value.trim();
-  if(outcome) notes=notes?(outcome+' — '+notes):outcome;
   var editEl=document.getElementById('c-editid'), editId=editEl?editEl.value:'';
   if(editId){
     var c=(lead.comms||[]).filter(function(x){return x.id===editId;})[0];
-    if(c){ c.method=method; c.date=date; c.notes=notes; }
+    if(c){ c.method=method; c.date=date; c.notes=notes; c.outcome=outcome; }
     lead.updated=Date.now(); save(); closeModal(); render(); renderOverlay(); toast('Contact updated'); return;
   }
-  lead.comms=lead.comms||[]; lead.comms.push({id:cid(),method:method,date:date,notes:notes,ts:Date.now()});
-  var setfu=document.getElementById('c-setfu');
-  if(setfu&&setfu.checked){ var fdate=document.getElementById('c-fudate').value,fnote=document.getElementById('c-funote').value.trim(); if(fdate) lead.followUp={date:fdate,note:fnote}; }
-  lead.updated=Date.now(); save(); closeModal(); render(); renderOverlay(); toast('Contact logged');
+  lead.comms=lead.comms||[]; lead.comms.push({id:cid(),method:method,date:date,notes:notes,outcome:outcome,ts:Date.now()});
+  var o=OUTCOME_MAP[outcome], movedTo='';
+  if(!(o&&o.lost)){
+    var setfu=document.getElementById('c-setfu');
+    if(setfu&&setfu.checked){ var fdate=document.getElementById('c-fudate').value,fnote=document.getElementById('c-funote').value.trim(); if(fdate) lead.followUp={date:fdate,note:fnote}; }
+    if(o&&o.stage&&lead.stage!==o.stage&&lead.stage!=='won'&&lead.stage!=='lost'){ lead.stage=o.stage; movedTo=STAGE_MAP[o.stage].name; }
+  }
+  lead.updated=Date.now(); save(); closeModal();
+  if(o&&o.lost){ lead.stage='lost'; lead.updated=Date.now(); save(); render(); openModal(lostModal(leadId)); return; }
+  render(); renderOverlay(); toast('Contact logged'+(movedTo?' · moved to '+movedTo:''));
 }
 function saveFu(leadId){
   var date=document.getElementById('fu-date').value,note=document.getElementById('fu-note').value.trim();
@@ -1807,6 +1894,7 @@ function boot(){
   if(!settings.customServices) settings.customServices=[];
   if(!settings.customSources) settings.customSources=[];
   if(!settings.customPropertyTypes) settings.customPropertyTypes=[];
+  if(settings.autoCadence===undefined) settings.autoCadence=true;
   if(!settings.tone) settings.tone='friendly';
   render();
   checkReminders(false);
