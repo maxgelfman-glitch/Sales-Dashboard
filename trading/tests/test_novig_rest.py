@@ -113,3 +113,41 @@ async def test_paper_gateway_records_without_sending():
     assert gw.open_orders[oid]["order_type"] == "LIMIT" and gw.live is False
     await gw.cancel_orders([oid])
     assert gw.open_orders == {} and gw.cancel_calls == [[oid]]
+
+
+async def test_bootstrap_warns_on_page_limit_and_missing_markets():
+    import logging as _l
+
+    class Capture(_l.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    cap = Capture()
+    _l.getLogger("trading.novig_rest").addHandler(cap)
+    events = {"events": [{"eventId": f"E{i}", "league": "NBA", "homeTeam": "A", "awayTeam": "B",
+                          "status": "OPEN_PREGAME"} for i in range(3)]}
+
+    async def handler(_request):
+        return web.json_response(events)
+
+    runner, base = await _serve([("GET", "/nbx/v2/emm/events", handler)])
+    client = NovigRestClient(f"{base}/nbx/v2/emm/events?status=OPEN_PREGAME&limit=3", token="tok")
+    try:
+        assert await client.fetch_open_markets() == []
+    finally:
+        await client.close()
+        await runner.cleanup()
+        _l.getLogger("trading.novig_rest").removeHandler(cap)
+    text = "\n".join(cap.lines)
+    assert "3 events = the page limit (3)" in text and "none embed markets/outcomes" in text
+
+
+def test_open_pregame_status_is_kept():
+    ev = {"eventId": "E", "league": "NBA", "homeTeam": "New York Knicks", "awayTeam": "Boston Celtics",
+          "status": "OPEN_PREGAME", "markets": [{"marketId": "M", "type": "moneyline", "outcomes": [
+              {"outcomeId": "A", "name": "New York Knicks"}, {"outcomeId": "B", "name": "Boston Celtics"}]}]}
+    assert len(parse_event_hierarchy({"events": [ev]})) == 2

@@ -1,25 +1,22 @@
 {
-  "_comment": "OpticOdds v3 /fixtures/odds (one fixture per record, per-side prices in `odds`). Field names reflect OpticOdds' published v3 schema as best known; VERIFY against developer.opticodds.com for your plan before going live. Copy to sharp_provider.json and export SHARP_API_KEY.",
-  "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&market=Moneyline&market=Point%20Spread&market=Total%20Points&league=NBA&league=NFL",
+  "_comment": "OpticOdds mapping per the brief: each record holds a nested `odds` object with `home_odds` / `away_odds` as decimal odds objects and `updated_at` as the provider timestamp (drives the 30s freshness rule). This layout covers moneyline and spread; totals need over/under prices (see sharp_provider.opticodds_v3_outcomes.example.json for the per-selection layout). Record-level paths (data, league, home_team, away_team, market, odds.points) and the URL are ASSUMED - verify against your OpticOdds account. Copy to sharp_provider.json and export SHARP_API_KEY.",
+  "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&league=NBA&league=NFL",
   "headers": {"X-Api-Key": "${SHARP_API_KEY}"},
-  "mode": "outcomes",
+  "mode": "flat",
   "list_path": "data",
-  "fixture_fields": {"league": "league.name", "home_team": "home_team_display", "away_team": "away_team_display"},
-  "outcomes_path": "odds",
-  "outcome_fields": {
-    "sportsbook": "sportsbook",
-    "market": "market",
-    "selection": "name",
-    "price": "price",
-    "points": "points",
-    "timestamp": "timestamp",
-    "is_main": "is_main"
+  "fields": {
+    "league": "league",
+    "home_team": "home_team",
+    "away_team": "away_team",
+    "market_type": "market",
+    "side": "home_team",
+    "odds_for": "odds.home_odds",
+    "odds_against": "odds.away_odds",
+    "line": "odds.points",
+    "updated_at": "odds.updated_at"
   },
-  "market_map": {"moneyline": "moneyline", "point spread": "spread", "total points": "total"},
-  "sportsbooks": ["Pinnacle"],
-  "main_only": true,
   "constants": {"source": "opticodds-pinnacle"},
-  "odds_format": "american",
-  "timestamp_format": "epoch",
+  "odds_format": "decimal",
+  "timestamp_format": "auto",
   "timeout_seconds": 5.0
 }

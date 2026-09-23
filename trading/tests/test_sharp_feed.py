@@ -228,7 +228,7 @@ def load_cfg(name, monkeypatch):
 
 
 def test_opticodds_fixture_pairs_into_two_way_lines(monkeypatch):
-    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    cfg = load_cfg("sharp_provider.opticodds_v3_outcomes.example.json", monkeypatch)
     lines, skipped = pair_fixture_outcomes(optic_fixture(), cfg)
     by_market = {l["market_type"]: l for l in lines}
     assert set(by_market) == {"moneyline", "spread", "total"} and skipped == 0
@@ -243,7 +243,7 @@ def test_opticodds_fixture_pairs_into_two_way_lines(monkeypatch):
 
 
 def test_paired_lines_load_into_book_with_freshness(monkeypatch):
-    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    cfg = load_cfg("sharp_provider.opticodds_v3_outcomes.example.json", monkeypatch)
     lines, _ = pair_fixture_outcomes(optic_fixture(), cfg)
     clock = FakeClock(NOW)
     book = SharpBook(clock=clock)
@@ -272,7 +272,7 @@ def test_oddsjam_shaped_fixture(monkeypatch):
 
 
 def test_bad_outcome_records_are_skipped_not_fatal(monkeypatch):
-    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    cfg = load_cfg("sharp_provider.opticodds_v3_outcomes.example.json", monkeypatch)
     fx = optic_fixture()
     fx["odds"] += [{"sportsbook": "Pinnacle", "market": "Moneyline", "name": "Gotham Rogues", "price": 100,
                     "timestamp": NOW}, {"sportsbook": "Pinnacle", "market": "Moneyline", "price": "abc"}]
@@ -282,7 +282,7 @@ def test_bad_outcome_records_are_skipped_not_fatal(monkeypatch):
 
 
 async def test_provider_outcomes_mode_over_http(monkeypatch):
-    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    cfg = load_cfg("sharp_provider.opticodds_v3_outcomes.example.json", monkeypatch)
 
     async def handler(request):
         assert request.headers["X-Api-Key"] == "k"
@@ -322,3 +322,77 @@ def test_on_move_listener_bug_does_not_break_ingest():
     book = SharpBook(on_move=boom)
     book.ingest([KNICKS])
     assert book.ingest([{**KNICKS, "odds_for": -130}]) == (1, 0)
+
+
+# ================================================================ OpticOdds mapping per the brief (nested `odds` object)
+from sharp_feed import unwrap_odds  # noqa: E402
+
+
+def brief_record(updated_at, home=1.8333333, away=2.0, market="moneyline", points=None):
+    return {"league": "NBA", "home_team": "NY Knicks", "away_team": "Boston", "market": market,
+            "odds": {"home_odds": {"decimal": home}, "away_odds": {"decimal": away},
+                     "points": points, "updated_at": updated_at}}
+
+
+def test_opticodds_brief_mapping_decimal_objects_and_updated_at(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    assert (cfg.mode, cfg.odds_format, cfg.timestamp_format) == ("flat", "decimal", "auto")
+    m = map_provider_record(brief_record("2026-09-23T12:00:00Z"), cfg)
+    assert m["side"] == "NY Knicks" and m["market_type"] == "moneyline"
+    assert m["odds_for"] == pytest.approx(-120, abs=0.01) and m["odds_against"] == 100
+    assert m["updated_at"] == 1790164800 and m["source"] == "opticodds-pinnacle"
+    spread = map_provider_record(brief_record(1790164800, 1.9090909, 1.9090909, "spread", -2.5), cfg)
+    assert (spread["line"], round(spread["odds_for"])) == (-2.5, -110)
+
+
+def test_opticodds_brief_updated_at_drives_30s_rule(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    clock = FakeClock(1790164800 + 10)
+    book = SharpBook(clock=clock)
+    assert book.ingest([map_provider_record(brief_record("2026-09-23T12:00:00Z"), cfg)]) == (1, 0)
+    assert book.age_of(*KEY) == pytest.approx(10)
+    clock.t += 20.001                                             # 30.001s after updated_at
+    assert book.lookup(*KEY) is None
+    stale = map_provider_record(brief_record(1790164800 - 60), cfg)
+    assert SharpBook(clock=FakeClock(1790164800)).ingest([stale]) == (0, 1)   # rejected on arrival
+
+
+async def test_opticodds_brief_over_http(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+
+    async def handler(request):
+        assert request.headers["X-Api-Key"] == "k"
+        return web.json_response({"data": [brief_record(9_999_999_999_000), {"league": "NBA", "odds": {}}]})
+
+    app = web.Application()
+    app.router.add_get("/odds", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    src = ProviderSharpSource(cfg.model_copy(update=dict(url=f"http://127.0.0.1:{port}/odds")))
+    try:
+        book = SharpBook()
+        assert book.ingest(await src()) == (1, 1)                # good record stored, empty one rejected
+    finally:
+        await src.close()
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize("obj,fmt,expected", [({"decimal": 1.91}, "decimal", 1.91), ({"value": 2.1}, "decimal", 2.1),
+                                              ({"american": -110, "decimal": 1.91}, "american", -110)])
+def test_unwrap_odds(obj, fmt, expected):
+    assert unwrap_odds(obj, fmt) == expected
+
+
+def test_unwrap_odds_rejects_unknown_shape():
+    with pytest.raises(ValueError):
+        unwrap_odds({"fractional": "10/11"}, "decimal")
+
+
+@pytest.mark.parametrize("value,expected", [(1790164800, 1790164800), (1790164800000, 1790164800),
+                                            ("1790164800.5", 1790164800.5), ("2026-09-23T12:00:00Z", 1790164800),
+                                            ("2026-09-23T12:00:00+00:00", 1790164800), (None, None)])
+def test_auto_timestamps(value, expected):
+    assert parse_timestamp(value, "auto") == expected

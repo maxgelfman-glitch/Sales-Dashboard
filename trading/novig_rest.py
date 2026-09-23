@@ -30,6 +30,7 @@ import itertools
 import logging
 import time
 from typing import Any, Optional, Protocol
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
@@ -137,7 +138,17 @@ class NovigRestClient:
             resp.raise_for_status()
             payload = await resp.json(content_type=None)
         rows = parse_event_hierarchy(payload)
-        log.info("BOOTSTRAP novig loaded %d tracked outcomes in %.0fms", len(rows), (time.monotonic() - started) * 1000)
+        events = payload if isinstance(payload, list) else (_first(payload, "events", "data", "results") or [])
+        n_events = len(events) if isinstance(events, list) else 0
+        limit = parse_qs(urlparse(self.events_url).query).get("limit", [None])[0]
+        if limit and limit.isdigit() and n_events >= int(limit):
+            log.warning("BOOTSTRAP novig returned %d events = the page limit (%s): some games may be missing "
+                        "(pagination not confirmed in Novig's docs)", n_events, limit)
+        if n_events and not any(isinstance(e, dict) and _first(e, "markets") for e in events):
+            log.warning("BOOTSTRAP novig: %d events but none embed markets/outcomes — the markets may need a "
+                        "separate endpoint (e.g. /nbx/v2/emm/markets/open); nothing is tradable yet", n_events)
+        log.info("BOOTSTRAP novig loaded %d tracked outcomes from %d events in %.0fms", len(rows), n_events,
+                 (time.monotonic() - started) * 1000)
         return rows
 
     async def close(self) -> None:

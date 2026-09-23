@@ -273,6 +273,17 @@ class ExposureMonitor:
         self._open[position_id] = stake_usd
         self._log_transition()
 
+    def adjust(self, position_id: str, stake_usd: float) -> None:
+        """Set a live position's exposure to its actual value (e.g. reservation -> filled cost).
+        0 removes it. Used when fills confirm less (or, rarely, more) than was reserved."""
+        if stake_usd <= 0:
+            self._open.pop(position_id, None)
+        else:
+            if self.open_exposure - self._open.get(position_id, 0.0) + stake_usd > self.limit + 1e-9:
+                log.error("KILL_SWITCH adjustment of %s to $%.2f takes exposure over the limit", position_id, stake_usd)
+            self._open[position_id] = stake_usd
+        self._log_transition()
+
     def settle(self, position_id: str) -> float:
         """Release a settled position's exposure. Returns the amount released (0 if unknown)."""
         released = self._open.pop(position_id, 0.0)
@@ -402,7 +413,7 @@ def maker_quote_prices(fair_prob: float, min_edge: float = MIN_EDGE) -> tuple[Op
     return (bid if 1 <= bid <= 99 else None), (ask if 1 <= ask <= 99 else None)
 
 
-def maker_quote_contracts(fair_prob: float, price_cents: int, side: str) -> int:
+def maker_quote_contracts(fair_prob: float, price_cents: int, side: str, max_stake: float = MAX_STAKE_USD) -> int:
     """1/4 Kelly size for one quote, capped at the $1,000 ceiling (cost = collateral at risk)."""
     c = price_cents / 100.0
     if side == "buy":
@@ -411,6 +422,7 @@ def maker_quote_contracts(fair_prob: float, price_cents: int, side: str) -> int:
         p, cost = 1.0 - fair_prob, 1.0 - c           # selling at c == buying the other side at 1-c
     f = kelly_fraction_for_contract(p, cost)
     stake, _ = apply_safety_ceiling(KELLY_FRACTION * f * BANKROLL_USD)
+    stake = min(stake, max_stake)
     return _whole_contracts(stake, cost) if stake > 0 else 0
 
 
@@ -459,8 +471,14 @@ class MakerEngine:
 
     def __init__(self, gateway: QuoteGateway, exposure: "ExposureMonitor",
                  targets: Callable[[], list[MakerTarget]], refresh_interval: float = MAKER_REFRESH_SECONDS,
-                 quiet_seconds: float = MAKER_QUIET_SECONDS, clock: Callable[[], float] = time.monotonic) -> None:
+                 quiet_seconds: float = MAKER_QUIET_SECONDS, clock: Callable[[], float] = time.monotonic,
+                 max_stake: float = MAX_STAKE_USD,
+                 on_posted: Optional[Callable[["RestingQuote"], None]] = None,
+                 can_quote: Optional[Callable[[], bool]] = None) -> None:
         self.gateway = gateway
+        self.max_stake = min(max_stake, MAX_STAKE_USD)   # may only LOWER the ceiling
+        self.on_posted = on_posted                        # live mode: register the order for fill tracking
+        self.can_quote = can_quote                        # live mode: False while the private channel is down
         self.exposure = exposure
         self.targets = targets
         self.refresh_interval = refresh_interval
@@ -533,7 +551,7 @@ class MakerEngine:
         for side, price in (("buy", bid), ("sell", ask)):
             if price is None:
                 continue
-            n = maker_quote_contracts(t.fair_prob, price, side)
+            n = maker_quote_contracts(t.fair_prob, price, side, self.max_stake)
             if n > 0:
                 out.append((side, price, n))
         return out
@@ -543,6 +561,10 @@ class MakerEngine:
             if self.exposure.taker_halted:
                 if self.quotes:
                     await self._cancel(list(self.quotes), "exposure kill-switch engaged", kill=True)
+                return
+            if self.can_quote is not None and not self.can_quote():
+                if self.quotes:
+                    await self._cancel(list(self.quotes), "quoting not allowed (private fill channel down)", kill=True)
                 return
             if not self.is_quiet():
                 return
@@ -571,6 +593,8 @@ class MakerEngine:
                     self.quotes[oid] = RestingQuote(order_id=oid, outcome_id=t.outcome_id, market_key=t.market_key,
                                                     side=side, price_cents=price, contracts=n,
                                                     fair_prob=t.fair_prob, placed_at=time.time())
+                    if self.on_posted is not None:
+                        self.on_posted(self.quotes[oid])
                     log.info("MAKER_POST LIMIT %s %s %d @ %dc (fair %.2fc) id=%s %s", t.outcome_id, side, n, price,
                              t.fair_prob * 100, oid, t.label)
 

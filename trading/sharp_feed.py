@@ -200,9 +200,26 @@ def decimal_to_american(decimal_odds: float) -> float:
     return round(-100.0 / (decimal_odds - 1.0), 4)
 
 
+ODDS_OBJECT_KEYS = {"decimal": ("decimal", "decimal_odds", "value", "price", "odds"),
+                    "american": ("american", "american_odds", "value", "price", "odds")}
+
+
+def unwrap_odds(obj: dict, odds_format: str) -> Any:
+    """Pull the number out of an odds object like {"decimal": 1.91} (keys tried in order)."""
+    for key in ODDS_OBJECT_KEYS[odds_format]:
+        if obj.get(key) is not None:
+            return obj[key]
+    raise ValueError(f"odds object has none of {ODDS_OBJECT_KEYS[odds_format]}: {obj}")
+
+
 def parse_timestamp(value: Any, fmt: str) -> Optional[float]:
     if value is None or value == "":
         return None
+    if fmt == "auto":   # numbers: epoch seconds, or milliseconds if too large; strings: ISO-8601
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.replace(".", "", 1).isdigit()):
+            v = float(value)
+            return v / 1000.0 if v > 1e11 else v
+        fmt = "iso"
     if fmt == "epoch":
         return float(value)
     if fmt == "epoch_ms":
@@ -252,7 +269,7 @@ class ProviderConfig(BaseModel):
     fields: dict[str, str] = Field(default_factory=dict)       # our field -> provider path
     constants: dict[str, Any] = Field(default_factory=dict)    # fixed values, e.g. {"source": "pinnacle"}
     odds_format: Literal["american", "decimal"] = "american"
-    timestamp_format: Literal["epoch", "epoch_ms", "iso"] = "epoch"
+    timestamp_format: Literal["epoch", "epoch_ms", "iso", "auto"] = "epoch"
     timeout_seconds: float = 5.0
     # ---- "outcomes" mode only ----
     fixture_fields: dict[str, str] = Field(default_factory=dict)   # league / home_team / away_team -> path
@@ -285,6 +302,9 @@ def map_provider_record(record: Any, cfg: ProviderConfig) -> dict[str, Any]:
             out[field] = value
     if isinstance(out.get("market_type"), str):
         out["market_type"] = out["market_type"].strip().lower()
+    for k in ("odds_for", "odds_against"):
+        if isinstance(out.get(k), dict):        # odds objects, e.g. {"decimal": 1.91, "american": -110}
+            out[k] = unwrap_odds(out[k], cfg.odds_format)
     if cfg.odds_format == "decimal":
         for k in ("odds_for", "odds_against"):
             if k in out:

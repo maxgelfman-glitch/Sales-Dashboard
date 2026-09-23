@@ -27,10 +27,8 @@ from main_supervisor import (
     DEMO_KALSHI_MARKETS,
     DEMO_MARKETS,
     DEMO_SHARP_LINES,
-    ConfigError,
     Supervisor,
     arbitrage_scenarios,
-    build_live_supervisor,
     setup_logging,
 )
 from mock_novig_server import MockNovigServer, kalshi_snapshot, make_outcome, make_tick
@@ -266,14 +264,32 @@ async def test_nfl_moneyline_arb_allowed_on_novig_because_tie_pays_50c_per_leg()
     assert s == {"first_side_wins": 10.0, "other_side_wins": 10.0, "tie": 10.0}   # 1000 x (0.5 + 0.5) - $990
 
 
-async def test_nfl_moneyline_cross_venue_arb_refused_because_tie_would_lose():
+async def test_nfl_moneyline_cross_venue_arb_allowed_now_both_venues_dead_heat():
+    """
+    Kalshi NFL ties settle each team at 50c (brief; matches public Kalshi FAQs), like Novig.
+    Novig NYG 1000 @ 0.36 ($360) + Kalshi NYJ 1000 @ 0.55 ($550 + fee ceil(0.07*1000*0.55*0.45)=$17.33)
+    total $927.33. Payout $1,000 if either team wins, and 1000 x (0.50 + 0.50) = $1,000 on a tie.
+    """
     sup = make_sup()
     sup.kalshi_registry.register(INFO[K_NYG])
     sup.kalshi_registry.register(INFO[K_NYJ])
     await sup.on_market_update(upd("O-NYG", 0.36, volume=1000), None)
-    await sup.on_market_update(upd(K_NYJ, 0.55), None)          # cheap on Kalshi: wins either way...
-    # ...but in a tie only the Novig leg pays (50c): 500 - (360 + 550 + fee) < 0
-    assert sup.stats["arbs"] == 0 and len(sup.orders) == 1
+    await sup.on_market_update(upd(K_NYJ, 0.55), None)
+    assert sup.stats["arbs"] == 1
+    first, hedge = sup.orders
+    assert (hedge.venue, hedge.fee_usd, hedge.stake_usd) == ("kalshi", 17.33, 567.33)
+    s = arbitrage_scenarios(first, "kalshi", 1000, hedge.stake_usd, "NFL", "moneyline")
+    assert s == {"first_side_wins": 72.67, "other_side_wins": 72.67, "tie": 72.67}
+
+
+def test_tie_scenario_still_refuses_venues_without_dead_heat(monkeypatch):
+    import main_supervisor
+    monkeypatch.setattr(main_supervisor, "DEAD_HEAT_VENUES", frozenset({"novig"}))
+
+    class Leg:
+        venue, stake_usd = "novig", 360.0
+    s = arbitrage_scenarios(Leg, "other_exchange", 1000, 567.33, "NFL", "moneyline")
+    assert s["tie"] == round(500 - 927.33, 2) < 0          # only the Novig leg pays on a tie
 
 
 def test_scenarios_for_nba_have_no_tie():
@@ -421,19 +437,7 @@ async def test_kalshi_drop_does_not_touch_novig_quotes():
     assert sup.maker.quotes and sup.maker.kill_count == 0
 
 
-# ---------------- configuration safety
-def test_live_trading_mode_is_refused():
-    with pytest.raises(ConfigError, match="TRADING_MODE=live is refused"):
-        build_live_supervisor({"TRADING_MODE": "live"})
-
-
-def test_live_inputs_required():
-    with pytest.raises(ConfigError, match="SHARP_PROVIDER_CONFIG"):
-        build_live_supervisor({})
-    with pytest.raises(ConfigError, match="NOVIG_EVENTS_URL"):
-        build_live_supervisor({"SHARP_PROVIDER_CONFIG": "x"})
-
-
+# ---------------- configuration safety (live config: see test_live_execution.py)
 def test_supervisor_requires_a_sharp_source():
     with pytest.raises(ValueError):
         Supervisor()
