@@ -474,10 +474,12 @@ class MakerEngine:
                  quiet_seconds: float = MAKER_QUIET_SECONDS, clock: Callable[[], float] = time.monotonic,
                  max_stake: float = MAX_STAKE_USD,
                  on_posted: Optional[Callable[["RestingQuote"], None]] = None,
+                 on_cancelled: Optional[Callable[[list, str], None]] = None,
                  can_quote: Optional[Callable[[], bool]] = None) -> None:
         self.gateway = gateway
         self.max_stake = min(max_stake, MAX_STAKE_USD)   # may only LOWER the ceiling
         self.on_posted = on_posted                        # live mode: register the order for fill tracking
+        self.on_cancelled = on_cancelled                  # live mode: ledger every cancellation
         self.can_quote = can_quote                        # live mode: False while the private channel is down
         self.exposure = exposure
         self.targets = targets
@@ -522,6 +524,11 @@ class MakerEngine:
         for oid in order_ids:
             self.quotes.pop(oid, None)
         elapsed_ms = (time.perf_counter() - started) * 1000
+        if self.on_cancelled is not None:
+            try:
+                self.on_cancelled(list(order_ids), reason)
+            except Exception:  # noqa: BLE001 — bookkeeping must never block a cancel
+                log.exception("MAKER_CANCEL on_cancelled hook failed")
         if kill:
             self.kill_count += 1
             self.last_cancel_ms = elapsed_ms

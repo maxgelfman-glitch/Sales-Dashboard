@@ -3,11 +3,15 @@ novig_feed.py — Real-time Novig tape ingestion.
 
 WHAT THIS MODULE DOES
     1. Connects to Novig's tape (QA by default) with the NOVIG_BEARER_TOKEN.
-    2. Immediately sends the subscription payload {"event": "subscribe", "data": "tape"}.
+    2. Immediately subscribes on the SAME socket to the public tape
+       {"event": "subscribe", "channel": "tape"} and, in live mode, to our private
+       executions {"event": "subscribe", "channel": "orders"}.
     3. Parses tape ticks keyed by outcomeId (outcomeId, price_cents, side, volume),
        keeps a live order book per outcome, and reports the best ask (what we
        can buy at) and best bid (what we can sell at) whenever either changes.
-    4. Reconnect / heartbeat / watchdog behaviour comes from ws_base.py.
+    4. Routes private execution slips (anything carrying an order_id) to on_slip;
+       a slip is NEVER applied to the public order book.
+    5. Reconnect / heartbeat / watchdog behaviour comes from ws_base.py.
 
 NOVIG DATA MODEL (per the brief and docs.novig.com)
     Event (a game) -> Markets -> exactly two mutually exclusive Outcomes (outcomeId).
@@ -37,6 +41,7 @@ from typing import Any, Awaitable, Callable, Iterable, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
 
+from novig_private import parse_slips
 from ws_base import (  # re-exported: tests and callers use novig_feed.RECONNECT_DELAY_SECONDS etc.
     OPEN_TIMEOUT_SECONDS,
     PING_INTERVAL_SECONDS,
@@ -55,7 +60,10 @@ __all__ = ["RECONNECT_DELAY_SECONDS", "StaleStreamError", "NovigFeed", "MarketRe
 DEFAULT_NOVIG_WS_URL = "wss://api-qa.novig.us/tape"  # QA / staging — safe default
 NOVIG_PROD_WS_URL = "wss://api.novig.com/tape"       # production — use deliberately
 TOKEN_ENV_VAR = "NOVIG_BEARER_TOKEN"
-SUBSCRIBE_PAYLOAD = {"event": "subscribe", "data": "tape"}
+# One socket, two channels (per the brief): public prices + our private executions.
+TAPE_SUBSCRIBE = {"event": "subscribe", "channel": "tape"}
+ORDERS_SUBSCRIBE = {"event": "subscribe", "channel": "orders"}
+SUBSCRIBE_PAYLOAD = TAPE_SUBSCRIBE        # paper mode needs only public prices
 
 TRACKED_LEAGUES = frozenset({"NFL", "NBA"})
 MARKET_TYPE_ALIASES = {
@@ -282,8 +290,8 @@ def parse_message(raw: Union[str, bytes]) -> list[TapeTick]:
 
     ticks: list[TapeTick] = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict) or "order_id" in item or "orderId" in item:
+            continue          # private execution slips are handled by novig_private.parse_slips
         if envelope_action and "action" not in item and "type" not in item:
             item = {**item, "action": envelope_action}
         try:
@@ -312,6 +320,7 @@ class NovigFeed(ResilientWebSocketFeed):
         on_update: Optional[UpdateCallback] = None,
         on_state_change: Optional[StateCallback] = None,
         subscribe_messages: Optional[Iterable[dict]] = None,
+        on_slip: Optional[Callable[[Any], Union[None, Awaitable[None]]]] = None,
         reconnect_delay: float = RECONNECT_DELAY_SECONDS,
         ping_interval: float = PING_INTERVAL_SECONDS,
         ping_timeout: float = PING_TIMEOUT_SECONDS,
@@ -323,6 +332,8 @@ class NovigFeed(ResilientWebSocketFeed):
         self._token = token if token is not None else os.environ.get(TOKEN_ENV_VAR)
         self.registry = registry if registry is not None else MarketRegistry()
         self.on_update = on_update
+        self.on_slip = on_slip
+        self.slips_received = 0
         self.subscribe_messages = [SUBSCRIBE_PAYLOAD] if subscribe_messages is None else list(subscribe_messages)
         self.books: dict[str, OrderBook] = {}
         self.latest: dict[str, MarketUpdate] = {}
@@ -341,6 +352,11 @@ class NovigFeed(ResilientWebSocketFeed):
     async def _handle_raw(self, raw) -> None:
         for tick in parse_message(raw):
             await self._process(tick)
+        if self.on_slip is not None:
+            for slip in parse_slips(raw):
+                self.slips_received += 1
+                log.info("FILL_SLIP %s", slip.model_dump_json())
+                await safe_call(self.on_slip, slip, logger=log)
 
     def _clear_state(self) -> dict[str, int]:
         counts = {"stale_price_frames": len(self.latest), "order_books": len(self.books)}

@@ -1,7 +1,9 @@
 {
-  "_comment": "OpticOdds mapping per the brief: each record holds a nested `odds` object with `home_odds` / `away_odds` as decimal odds objects and `updated_at` as the provider timestamp (drives the 30s freshness rule). This layout covers moneyline and spread; totals need over/under prices (see sharp_provider.opticodds_v3_outcomes.example.json for the per-selection layout). Record-level paths (data, league, home_team, away_team, market, odds.points) and the URL are ASSUMED - verify against your OpticOdds account. Copy to sharp_provider.json and export SHARP_API_KEY.",
+  "_comment": "OpticOdds mapping per the brief. Each record holds a nested `odds` object: moneyline/spread use home_odds / away_odds, totals use over / under (via market_overrides). Each price may be a decimal number, an odds object ({\"decimal\": 1.91}) or an ARRAY of such objects carrying their own \"points\" (alternate lines; the entry with is_main=true, else the first, is the main line). `updated_at` (record- or entry-level) drives the 30s freshness rule. Record paths and the URL are ASSUMED - verify against a real response from your OpticOdds account. Copy to sharp_provider.json and export SHARP_API_KEY.",
   "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&league=NBA&league=NFL",
-  "headers": {"X-Api-Key": "${SHARP_API_KEY}"},
+  "headers": {
+    "X-Api-Key": "${SHARP_API_KEY}"
+  },
   "mode": "flat",
   "list_path": "data",
   "fields": {
@@ -15,8 +17,31 @@
     "line": "odds.points",
     "updated_at": "odds.updated_at"
   },
-  "constants": {"source": "opticodds-pinnacle"},
+  "constants": {
+    "source": "opticodds-pinnacle"
+  },
   "odds_format": "decimal",
   "timestamp_format": "auto",
-  "timeout_seconds": 5.0
+  "timeout_seconds": 5.0,
+  "market_map": {
+    "moneyline": "moneyline",
+    "ml": "moneyline",
+    "spread": "spread",
+    "point spread": "spread",
+    "total": "total",
+    "totals": "total",
+    "total points": "total"
+  },
+  "market_overrides": {
+    "total": {
+      "fields": {
+        "odds_for": "odds.over",
+        "odds_against": "odds.under",
+        "line": "odds.total"
+      },
+      "constants": {
+        "side": "Over"
+      }
+    }
+  }
 }

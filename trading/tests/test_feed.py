@@ -1,7 +1,7 @@
 """
 Self-test: novig_feed.py (+ the shared ws_base.py reconnect loop)
 
-    * {"event": "subscribe", "data": "tape"} is sent immediately on every (re)connect
+    * {"event": "subscribe", "channel": "tape"} (+ "orders" in live mode) sent on every (re)connect
     * enveloped ticks keyed by outcomeId (outcomeId, price_cents, side, volume) are parsed
     * hierarchical registry: every outcome knows its market and sibling
     * best ask / best bid reporting; HARSH drop -> state wiped -> reconnect < 3.0s
@@ -141,11 +141,31 @@ async def test_subscribe_payload_sent_on_every_connect(server, monkeypatch):
     feed = NovigFeed(url=server.url, reconnect_delay=0.1)
     task = asyncio.create_task(feed.run())
     await wait_until(lambda: len(server.received) == 1)
-    assert json.loads(server.received[0]) == {"event": "subscribe", "data": "tape"}
+    assert json.loads(server.received[0]) == {"event": "subscribe", "channel": "tape"}
     assert server.auth_headers_seen[-1] == "Bearer secret-abc"
     server.drop_all_clients()
     await wait_until(lambda: len(server.received) == 2)          # resubscribed after reconnect
-    assert json.loads(server.received[1]) == {"event": "subscribe", "data": "tape"}
+    assert json.loads(server.received[1]) == {"event": "subscribe", "channel": "tape"}
+    await shutdown(feed, task)
+
+
+async def test_one_socket_two_channels_routes_slips_away_from_the_book(server):
+    slips, rec = [], Recorder()
+    feed = NovigFeed(url=server.url, token="t", registry=registry(), on_update=rec.on_update,
+                     subscribe_messages=[novig_feed.TAPE_SUBSCRIBE, novig_feed.ORDERS_SUBSCRIBE],
+                     on_slip=slips.append)
+    task = asyncio.create_task(feed.run())
+    await wait_until(lambda: len(server.received) == 2)
+    assert [json.loads(m) for m in server.received] == [{"event": "subscribe", "channel": "tape"},
+                                                        {"event": "subscribe", "channel": "orders"}]
+    await server.broadcast(make_tick("O-NYK", 50))
+    # an execution slip that ALSO carries outcomeId / price_cents / side / volume must not touch the book
+    await server.broadcast({"channel": "orders", "data": {"order_id": "ex-1", "status": "PARTIAL",
+                                                          "filled_volume": 10, "price_cents": 50,
+                                                          "outcomeId": "O-NYK", "side": "sell", "volume": 999}})
+    await wait_until(lambda: slips)
+    assert slips[0].order_id == "ex-1" and feed.slips_received == 1
+    assert feed.books["O-NYK"].asks == {50: 5000}                  # untouched by the slip
     await shutdown(feed, task)
 
 

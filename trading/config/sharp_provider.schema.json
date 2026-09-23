@@ -1,0 +1,120 @@
+{
+  "properties": {
+    "constants": {
+      "additionalProperties": true,
+      "title": "Constants",
+      "type": "object"
+    },
+    "fields": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Fields",
+      "type": "object"
+    },
+    "fixture_fields": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Fixture Fields",
+      "type": "object"
+    },
+    "headers": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Headers",
+      "type": "object"
+    },
+    "list_path": {
+      "default": "",
+      "title": "List Path",
+      "type": "string"
+    },
+    "main_only": {
+      "default": true,
+      "title": "Main Only",
+      "type": "boolean"
+    },
+    "market_map": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Market Map",
+      "type": "object"
+    },
+    "market_overrides": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "type": "object"
+      },
+      "title": "Market Overrides",
+      "type": "object"
+    },
+    "mode": {
+      "default": "flat",
+      "enum": [
+        "flat",
+        "outcomes"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "odds_format": {
+      "default": "american",
+      "enum": [
+        "american",
+        "decimal"
+      ],
+      "title": "Odds Format",
+      "type": "string"
+    },
+    "outcome_fields": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Outcome Fields",
+      "type": "object"
+    },
+    "outcomes_path": {
+      "default": "odds",
+      "title": "Outcomes Path",
+      "type": "string"
+    },
+    "sportsbooks": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Sportsbooks",
+      "type": "array"
+    },
+    "timeout_seconds": {
+      "default": 5.0,
+      "title": "Timeout Seconds",
+      "type": "number"
+    },
+    "timestamp_format": {
+      "default": "epoch",
+      "enum": [
+        "epoch",
+        "epoch_ms",
+        "iso",
+        "auto"
+      ],
+      "title": "Timestamp Format",
+      "type": "string"
+    },
+    "url": {
+      "title": "Url",
+      "type": "string"
+    }
+  },
+  "required": [
+    "url"
+  ],
+  "title": "ProviderConfig",
+  "type": "object"
+}

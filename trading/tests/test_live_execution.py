@@ -1,5 +1,6 @@
 """
-Self-test: live execution path (novig_private.py + Supervisor live mode + build_live_supervisor).
+Self-test: live execution path (single Novig socket: tape + orders channels; Supervisor live mode;
+canary / scale-up gate; live_ledger.jsonl; build_live_supervisor).
 
 Nothing here touches a real exchange: orders go to a recording fake or a local HTTP
 mock, fills are injected or pushed over a local WebSocket.
@@ -23,12 +24,14 @@ from main_supervisor import (
     ConfigError,
     Supervisor,
     build_live_supervisor,
+    format_state_report,
+    resolve_live_plan,
     setup_logging,
     validate_ws_url,
 )
 from mock_novig_server import MockNovigServer, make_tick
 from novig_feed import NOVIG_PROD_WS_URL, MarketRegistry, MarketUpdate
-from novig_private import FillSlip, NovigPrivateFeed, parse_slips
+from novig_private import FillSlip, parse_slips
 from sharp_feed import MockSharpSource
 
 INFO = {m["outcome_id"]: m for m in DEMO_MARKETS + DEMO_KALSHI_MARKETS}
@@ -66,16 +69,17 @@ class FakeGateway:
         pass
 
 
-def live_sup(mode="cumulative", gateway=None, limit=None, maker=False, timeout=60.0, ready=True, **kw):
+def live_sup(mode="cumulative", gateway=None, limit=None, maker=False, timeout=60.0, ready=True,
+             confirmed=True, **kw):
     sup = Supervisor(feed_url="ws://127.0.0.1:1/unused", token="t", sharp_fetch=MockSharpSource(DEMO_SHARP_LINES),
                      registry=MarketRegistry(DEMO_MARKETS), kalshi_registry=MarketRegistry(DEMO_KALSHI_MARKETS),
-                     live=True, order_gateway=gateway or FakeGateway(), private_url="ws://127.0.0.1:1/private",
+                     live=True, order_gateway=gateway or FakeGateway(),
                      fill_volume_mode=mode, maker_enabled=maker, taker_fill_timeout=timeout,
                      exposure=ExposureMonitor(limit) if limit else None, maker_kwargs=dict(quiet_seconds=0), **kw)
     sup.book.ingest(DEMO_SHARP_LINES)
+    sup.orders_channel_confirmed = confirmed        # most tests model a session whose orders channel is proven
     if ready:
         sup.feed.connected.set()
-        sup.private.connected.set()
     return sup
 
 
@@ -139,6 +143,19 @@ async def test_partial_fill_timeout_cancels_remainder_and_releases_reservation()
     assert sup.positions                                                        # 500 contracts still held
 
 
+async def test_zero_fill_before_channel_confirmed_keeps_lock_and_reservation():
+    """The orders channel is unproven: an order that 'saw no fill' may have filled unseen."""
+    sup = live_sup(timeout=0.05, confirmed=False)
+    await sup.on_market_update(upd("O-NYK", 0.49), None)
+    await asyncio.sleep(0.15)
+    assert sup.stats["unconfirmed_zero_fill"] == 1
+    assert sup.total_exposure() == 999.60 and sup.positions                 # nothing released
+    await sup.on_market_update(upd("O-NYK", 0.45), None)                      # game stays locked
+    assert len(sup.order_gateway.placed) == 1
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 2040, 49))                  # the truth arrives late
+    assert sup.orders_channel_confirmed and sup.orders[0].contracts == 2040 and sup.total_exposure() == 999.60
+
+
 async def test_zero_fill_timeout_releases_lock_and_exposure():
     sup = live_sup(timeout=0.05)
     await sup.on_market_update(upd("O-NYK", 0.49), None)
@@ -163,9 +180,8 @@ async def test_rejected_order_releases_everything():
     assert sup.total_exposure() == 0 and sup.positions == {} and sup.stats["live_rejected"] == 1
 
 
-async def test_no_orders_while_private_channel_down():
-    sup = live_sup(ready=False)
-    sup.feed.connected.set()                                                  # tape up, private down
+async def test_no_orders_while_socket_down():
+    sup = live_sup(ready=False)                                               # single socket down
     await sup.on_market_update(upd("O-NYK", 0.49), None)
     assert sup.order_gateway.placed == [] and sup.total_exposure() == 0 and sup.positions == {}
 
@@ -260,54 +276,32 @@ async def test_live_maker_sell_fill_is_long_sibling():
     assert fill.side == "New York Knicks" and fill.price == pytest.approx(1 - ask.price_cents / 100)
 
 
-async def test_private_channel_drop_pulls_quotes_and_halts():
+async def test_socket_drop_pulls_quotes_and_halts():
     sup = live_sup(maker=True)
     await sup.maker.refresh()
     assert sup.maker.quotes
-    sup.private.connected.clear()
-    await sup.on_feed_state("DISCONNECTED", {"venue": "novig_private", "error": "test"})
+    sup.feed.connected.clear()
+    await sup.on_feed_state("DISCONNECTED", {"venue": "novig", "error": "test"})
     assert sup.maker.quotes == {} and sup.maker.last_cancel_ms < MAKER_CANCEL_BUDGET_MS
     await sup.maker.refresh()
     assert sup.maker.quotes == {}                                               # no requoting while down
 
 
-# ================================================================ private feed over a socket
-async def test_private_feed_subscribes_and_delivers_slips():
-    srv = await MockNovigServer().start()
-    got = []
-    feed = NovigPrivateFeed(srv.url, token="tok", on_slip=got.append,
-                            subscribe_messages=[{"event": "subscribe", "data": "orders"}])
-    task = asyncio.create_task(feed.run())
-    try:
-        await asyncio.wait_for(feed.connected.wait(), 5)
-        while not srv.received:
-            await asyncio.sleep(0.01)
-        assert json.loads(srv.received[0]) == {"event": "subscribe", "data": "orders"}
-        assert srv.auth_headers_seen[-1] == "Bearer tok"
-        await srv.broadcast({"event": "orders", "data": {"order_id": "x", "status": "FILLED",
-                                                         "filled_volume": 5, "price_cents": 50}})
-        while not got:
-            await asyncio.sleep(0.01)
-        assert got[0].order_id == "x" and feed.stale_after == 3600.0
-    finally:
-        await feed.stop()
-        await asyncio.wait_for(task, 5)
-        await srv.stop()
-
-
-async def test_end_to_end_live_over_sockets(tmp_path):
-    """tape tick -> POST /v1/orders (HTTP mock) -> exchange pushes a FILLED slip on the private socket."""
+# ================================================================ end to end over one socket
+async def test_end_to_end_live_single_socket(tmp_path):
+    """tape tick -> POST /v1/orders (HTTP mock) -> the SAME socket pushes the execution slip."""
     path = setup_logging(tmp_path, console=False)
-    tape, private = await MockNovigServer().start(), await MockNovigServer().start()
+    ledger = tmp_path / "live_ledger.jsonl"
+    novig = await MockNovigServer().start()
     posted = []
 
     async def post(request):
         body = await request.json()
         posted.append(body)
         oid = f"srv-{len(posted)}"
-        asyncio.get_running_loop().call_later(0.05, lambda: asyncio.ensure_future(private.broadcast(
-            {"event": "orders", "data": {"order_id": oid, "status": "FILLED",
-                                         "filled_volume": body["volume"], "price_cents": body["price_cents"]}})))
+        asyncio.get_running_loop().call_later(0.05, lambda: asyncio.ensure_future(novig.broadcast(
+            {"channel": "orders", "data": {"order_id": oid, "status": "FILLED",
+                                           "filled_volume": body["volume"], "price_cents": body["price_cents"]}})))
         return web.json_response({"orderId": oid})
 
     async def delete(_request):
@@ -323,17 +317,18 @@ async def test_end_to_end_live_over_sockets(tmp_path):
     base = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
 
     from novig_rest import NovigOrderGateway
-    sup = Supervisor(feed_url=tape.url, token="tok", registry=MarketRegistry(DEMO_MARKETS),
+    sup = Supervisor(feed_url=novig.url, token="tok", registry=MarketRegistry(DEMO_MARKETS),
                      sharp_fetch=MockSharpSource(DEMO_SHARP_LINES), sharp_poll_interval=0.1,
-                     live=True, order_gateway=NovigOrderGateway(base, "tok"), private_url=private.url,
-                     maker_enabled=False, taker_fill_timeout=2.0)
+                     live=True, order_gateway=NovigOrderGateway(base, "tok"), maker_enabled=False,
+                     taker_fill_timeout=2.0, max_stake=10.0, exposure=ExposureMonitor(100.0), ledger_path=ledger)
     run = asyncio.create_task(sup.run())
     try:
         await asyncio.wait_for(sup.feed.connected.wait(), 5)
-        await asyncio.wait_for(sup.private.connected.wait(), 5)
-        while len(sup.book) == 0:
+        while len(novig.received) < 2 or len(sup.book) == 0:
             await asyncio.sleep(0.01)
-        await tape.broadcast(make_tick("O-NYK", 49))
+        assert [json.loads(m) for m in novig.received] == [{"event": "subscribe", "channel": "tape"},
+                                                           {"event": "subscribe", "channel": "orders"}]
+        await novig.broadcast(make_tick("O-NYK", 49))
         for _ in range(300):
             if sup.orders and not sup.orders[0].pending:
                 break
@@ -341,19 +336,43 @@ async def test_end_to_end_live_over_sockets(tmp_path):
     finally:
         run.cancel()
         await asyncio.gather(run, return_exceptions=True)
-        for s in (tape, private):
-            await s.stop()
+        await novig.stop()
         await runner.cleanup()
-    assert posted[0]["order_type"] == "LIMIT" and posted[0]["outcomeId"] == "O-NYK"
+    assert posted[0] == {"outcomeId": "O-NYK", "side": "buy", "price_cents": 49.0, "volume": 20,
+                         "order_type": "LIMIT", "clientOrderId": "tk-1"}             # canary: floor($10/0.49)
     leg = sup.orders[0]
-    assert (leg.contracts, leg.stake_usd, leg.pending, leg.exchange_order_id) == (2040, 999.60, False, "srv-1")
-    assert sup.total_exposure() == 999.60
+    assert (leg.contracts, leg.stake_usd, leg.pending, leg.exchange_order_id) == (20, 9.80, False, "srv-1")
+    assert sup.total_exposure() == 9.80 and sup.orders_channel_confirmed
+    events = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [e["event"] for e in events] == ["SESSION_START", "ORDER", "SLIP", "FILL", "DONE"]
+    assert events[1]["payload"] == posted[0]                                           # exact body sent
+    assert (events[3]["filled_total"], events[3]["cost_total_usd"]) == (20, 9.8)
     for h in logging.getLogger("trading").handlers:
         h.flush()
     text = path.read_text()
     for needle in ("LIVE TRADING ENABLED", "ORDER LIVE DIRECTIONAL id=srv-1", "FILL_SLIP",
-                   "LIVE_DONE DIRECTIONAL srv-1 filled 2040/2040 cost=$999.60"):
+                   "LIVE orders channel confirmed", "LIVE_DONE DIRECTIONAL srv-1 filled 20/20 cost=$9.80"):
         assert needle in text, needle
+
+
+async def test_ledger_records_maker_posts_cancels_and_rejections(tmp_path):
+    ledger = tmp_path / "l.jsonl"
+    sup = live_sup(maker=True, ledger_path=ledger, timeout=0.05)
+    await sup.maker.refresh()
+    await sup.maker.cancel_all("test kill")
+    sup.order_gateway.fail = True
+    await sup.on_market_update(upd("O-NYK", 0.49), None)
+    sup.order_gateway.fail = False
+    await sup.on_market_update(upd("O-NYK", 0.49), None)
+    await asyncio.sleep(0.15)                                                        # taker timeout cancel
+    ev = [json.loads(line) for line in ledger.read_text().splitlines()]
+    kinds = [e["event"] for e in ev]
+    assert kinds.count("ORDER") == len([e for e in ev if e.get("kind") == "MAKER"]) + 1
+    maker_cancel = next(e for e in ev if e["event"] == "CANCEL" and e["source"] == "maker")
+    assert maker_cancel["reason"] == "test kill" and len(maker_cancel["exchange_order_ids"]) >= 2
+    assert any(e["event"] == "REJECTED" and e["payload"]["order_type"] == "LIMIT" for e in ev)
+    assert any(e["event"] == "CANCEL" and e["source"] == "taker" for e in ev)
+    assert all("ts" in e for e in ev)
 
 
 # ================================================================ configuration gate
@@ -363,22 +382,18 @@ def sharp_env(monkeypatch):
     return {"SHARP_PROVIDER_CONFIG": "config/sharp_provider.opticodds.example.json"}
 
 
-def test_live_refused_until_every_requirement_is_met(sharp_env):
+LIVE_ENV = {"TRADING_MODE": "live", "LIVE_TRADING_ACKNOWLEDGED": "yes", "NOVIG_BEARER_TOKEN": "tok"}
+
+
+def test_live_refused_until_acknowledged_with_token(sharp_env):
     with pytest.raises(ConfigError) as err:
         build_live_supervisor({**sharp_env, "TRADING_MODE": "live"})
-    msg = str(err.value)
-    for need in ("LIVE_TRADING_ACKNOWLEDGED=yes", "NOVIG_BEARER_TOKEN", "NOVIG_FILL_VOLUME_MODE",
-                 "NOVIG_PRIVATE_WS_URL"):
-        assert need in msg
+    assert "LIVE_TRADING_ACKNOWLEDGED=yes" in str(err.value) and "NOVIG_BEARER_TOKEN" in str(err.value)
 
 
-LIVE_ENV = {"TRADING_MODE": "live", "LIVE_TRADING_ACKNOWLEDGED": "yes", "NOVIG_BEARER_TOKEN": "tok",
-            "NOVIG_FILL_VOLUME_MODE": "cumulative", "NOVIG_PRIVATE_WS_URL": "wss://api.novig.com/tape"}
-
-
-def test_malformed_private_url_from_brief_is_rejected(sharp_env):
+def test_malformed_socket_url_from_brief_is_rejected(sharp_env):
     with pytest.raises(ConfigError, match="not a valid WebSocket URL"):
-        build_live_supervisor({**sharp_env, **LIVE_ENV, "NOVIG_PRIVATE_WS_URL": "wss://://novig.com"})
+        build_live_supervisor({**sharp_env, **LIVE_ENV, "NOVIG_WS_URL": "wss://://novig.com"})
 
 
 @pytest.mark.parametrize("url,ok", [("wss://api.novig.com/tape", True), ("wss://://novig.com", False),
@@ -392,25 +407,86 @@ def test_validate_ws_url(url, ok):
             validate_ws_url(url, "X")
 
 
+def test_live_starts_on_canary_caps_with_one_socket_two_channels(sharp_env, tmp_path):
+    sup = build_live_supervisor({**sharp_env, **LIVE_ENV, "TRADING_LOG_DIR": str(tmp_path)})
+    assert sup.live and sup.feed.url == NOVIG_PROD_WS_URL
+    assert sup.feed.subscribe_messages == [{"event": "subscribe", "channel": "tape"},
+                                           {"event": "subscribe", "channel": "orders"}]
+    assert sup.feed.on_slip == sup.on_fill_slip and sup.fill_volume_mode == "cumulative"
+    assert (sup.max_stake, sup.exposure.limit, sup.maker) == (10.0, 100.0, None)       # canary, maker off
+    assert sup.novig_rest.events_url == NOVIG_PROD_EVENTS_URL == \
+        "https://api.novig.us/nbx/v2/emm/events?status=OPEN_PREGAME&limit=100"
+    assert sup.order_gateway.api_base == "https://api.novig.us"
+    assert not (tmp_path / "live_ledger.jsonl").exists()            # building / --check-config writes nothing
+    sup.record_live_plan()                                          # what run() does at launch
+    [line] = [json.loads(l) for l in (tmp_path / "live_ledger.jsonl").read_text().splitlines()]
+    assert (line["event"], line["max_stake_usd"], line["exposure_limit_usd"], line["maker"]) == \
+        ("CANARY_LIMITS", 10.0, 100.0, False)
+
+
+@pytest.mark.parametrize("override", [{"LIVE_MAX_STAKE_USD": "1000"}, {"LIVE_EXPOSURE_LIMIT_USD": "15000"},
+                                      {"MAKER_MODE": "true"}, {"LIVE_MAX_STAKE_USD": "10.01"}])
+def test_any_scale_up_without_approval_is_refused(sharp_env, override):
+    with pytest.raises(ConfigError, match="LIVE_SCALE_APPROVED_BY"):
+        build_live_supervisor({**sharp_env, **LIVE_ENV, **override})
+
+
+def test_scale_up_with_approval_is_logged_critical_to_ledger(sharp_env, tmp_path):
+    sup = build_live_supervisor({**sharp_env, **LIVE_ENV, "TRADING_LOG_DIR": str(tmp_path),
+                                 "LIVE_MAX_STAKE_USD": "1000", "LIVE_EXPOSURE_LIMIT_USD": "15000",
+                                 "MAKER_MODE": "true", "LIVE_SCALE_APPROVED_BY": "PM 2026-10-01 ledger reconciled"})
+    assert (sup.max_stake, sup.exposure.limit, sup.maker is not None) == (1000.0, 15000.0, True)
+    sup.record_live_plan()
+    [line] = [json.loads(l) for l in (tmp_path / "live_ledger.jsonl").read_text().splitlines()]
+    assert (line["event"], line["level"], line["approved_by"]) == ("SCALE_UP_AUTHORIZED", "CRITICAL",
+                                                                   "PM 2026-10-01 ledger reconciled")
+
+
 @pytest.mark.parametrize("name,value", [("LIVE_MAX_STAKE_USD", "5000"), ("LIVE_EXPOSURE_LIMIT_USD", "20000"),
                                         ("LIVE_MAX_STAKE_USD", "abc"), ("LIVE_MAX_STAKE_USD", "0")])
-def test_live_caps_may_only_be_lowered(sharp_env, name, value):
+def test_hard_ceilings_hold_even_with_approval(sharp_env, name, value):
     with pytest.raises(ConfigError):
-        build_live_supervisor({**sharp_env, **LIVE_ENV, name: value})
+        build_live_supervisor({**sharp_env, **LIVE_ENV, "LIVE_SCALE_APPROVED_BY": "x", name: value})
 
 
-def test_valid_live_config_builds_with_production_defaults(sharp_env):
-    sup = build_live_supervisor({**sharp_env, **LIVE_ENV, "LIVE_MAX_STAKE_USD": "250",
-                                 "LIVE_EXPOSURE_LIMIT_USD": "2500",
-                                 "NOVIG_PRIVATE_SUBSCRIBE": '{"event": "subscribe", "data": "orders"}'})
-    assert sup.live and sup.feed.url == NOVIG_PROD_WS_URL
-    assert sup.novig_rest.events_url == NOVIG_PROD_EVENTS_URL
-    assert sup.order_gateway.api_base == "https://novig.com"
-    assert (sup.max_stake, sup.exposure.limit, sup.fill_volume_mode) == (250.0, 2500.0, "cumulative")
-    assert sup.private.subscribe_messages == [{"event": "subscribe", "data": "orders"}]
-    assert sup.maker_gateway is sup.order_gateway
+def test_lower_than_canary_needs_no_approval():
+    plan = resolve_live_plan({"LIVE_MAX_STAKE_USD": "5", "LIVE_EXPOSURE_LIMIT_USD": "50"})
+    assert (plan.max_stake, plan.exposure_limit, plan.scaled_up) == (5.0, 50.0, False)
+
+
+def test_fill_mode_defaults_cumulative_and_rejects_nonsense(sharp_env):
+    with pytest.raises(ConfigError, match="NOVIG_FILL_VOLUME_MODE"):
+        build_live_supervisor({**sharp_env, **LIVE_ENV, "NOVIG_FILL_VOLUME_MODE": "sometimes"})
+
+
+def test_overrides_for_hosts_and_subscriptions(sharp_env, tmp_path):
+    sup = build_live_supervisor({**sharp_env, **LIVE_ENV, "TRADING_LOG_DIR": str(tmp_path),
+                                 "NOVIG_API_BASE": "https://novig.us", "NOVIG_WS_URL": "wss://api-qa.novig.us/tape",
+                                 "NOVIG_SUBSCRIBE_MESSAGES": '[{"event":"subscribe","channel":"tape"}]'})
+    assert sup.order_gateway.api_base == "https://novig.us" and sup.feed.url == "wss://api-qa.novig.us/tape"
+    assert sup.novig_rest.events_url.startswith("https://novig.us/nbx/v2/emm/events")
+    assert sup.feed.subscribe_messages == [{"event": "subscribe", "channel": "tape"}]
+
+
+def test_check_config_report_is_plain_text_and_offline(sharp_env, tmp_path):
+    sup = build_live_supervisor({**sharp_env, **LIVE_ENV, "TRADING_LOG_DIR": str(tmp_path)})
+    report = format_state_report(sup)
+    for needle in ("Trading mode", "LIVE", "wss://api.novig.com/tape", '{"event": "subscribe", "channel": "orders"}',
+                   "https://api.novig.us/v1/orders", "$10.00", "$100.00", "Taker fill timeout", "2.0s",
+                   "Maker                                  off", "kalshi, novig", "UNVERIFIED"):
+        assert needle in report, needle
+    assert not sup.feed.connected.is_set()                                          # nothing was opened
 
 
 def test_paper_is_default(sharp_env):
     sup = build_live_supervisor(dict(sharp_env))
-    assert not sup.live and sup.private is None and sup.order_gateway is None
+    assert not sup.live and sup.order_gateway is None and sup.feed.on_slip is None
+    assert sup.feed.subscribe_messages == [{"event": "subscribe", "channel": "tape"}]
+
+
+def test_committed_provider_schema_is_current():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gen", "config/generate_schemas.py")
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    assert open("config/sharp_provider.schema.json").read() == gen.provider_schema()

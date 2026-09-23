@@ -48,6 +48,13 @@ ORDER_BODY_KEYS = dict(outcome="outcomeId", side="side", price="price_cents", si
 BULK_CANCEL_KEY = "orderIds"
 
 
+def order_body(outcome_id: str, side: str, price_cents: float, contracts: int, client_id: str) -> dict:
+    """The exact JSON body sent with POST /v1/orders (also written to live_ledger.jsonl)."""
+    k = ORDER_BODY_KEYS
+    return {k["outcome"]: outcome_id, k["side"]: side, k["price"]: price_cents, k["size"]: contracts,
+            k["order_type"]: "LIMIT", k["client_id"]: client_id}
+
+
 # ==========================================================================
 # Bootstrap parsing
 # ==========================================================================
@@ -217,9 +224,7 @@ class NovigOrderGateway:
         return self._session
 
     async def place_limit(self, outcome_id, side, price_cents, contracts, client_id) -> str:
-        k = ORDER_BODY_KEYS
-        body = {k["outcome"]: outcome_id, k["side"]: side, k["price"]: price_cents, k["size"]: contracts,
-                k["order_type"]: "LIMIT", k["client_id"]: client_id}
+        body = order_body(outcome_id, side, price_cents, contracts, client_id)
         async with self._sess().post(f"{self.api_base}/v1/orders", json=body) as resp:
             resp.raise_for_status()
             data = await resp.json(content_type=None)

@@ -40,16 +40,22 @@ MAKER KILL-SWITCH (one bulk cancel of every resting quote, timed vs 200ms)
 TRADING MODE
     paper (default)  every order is simulated; fills are simulated from the tape.
     live             Novig orders go to the exchange through NovigOrderGateway.
-        * A taker order RESERVES its full stake against the $15,000 limit and
-          locks the game BEFORE it is sent; fill slips from the private channel
-          (novig_private.py) then set the position and exposure to what really
-          filled. Any remainder still open after TAKER_FILL_TIMEOUT_SECONDS is
+        * Public prices and our private executions arrive on ONE Novig socket
+          (channels "tape" and "orders").
+        * A taker order RESERVES its full stake against the exposure limit and
+          locks the game BEFORE it is sent; execution slips then set the
+          position and exposure to what really filled (filled_volume is a
+          cumulative total per order id: delta = new - previous). Any remainder still open after TAKER_FILL_TIMEOUT_SECONDS is
           cancelled, releasing the unused reservation (and the lock if nothing filled).
         * Maker quotes are registered as they are posted; their fills arrive as
           slips, become positions, and pull every other quote in that game.
-        * If the private channel (or the tape) is down, no new taker orders or
-          quotes are sent and all resting quotes are bulk-cancelled: fills we
-          cannot see would make the exposure count wrong.
+        * Until the first execution slip of the session proves the "orders"
+          channel works, an order that ends with NO observed fill keeps its lock
+          and reservation (it may have filled unseen) and is logged CRITICAL.
+        * If the socket is down, no new orders or quotes are sent and all resting
+          quotes are bulk-cancelled: fills we cannot see would corrupt exposure.
+        * Every live order and fill is appended to live_ledger.jsonl for
+          line-by-line reconciliation with Novig's order history.
         * Kalshi is DATA-ONLY in live mode: there is no Kalshi order routing or
           Kalshi fill channel yet, and a hedge whose second leg is only simulated
           would be reported as risk-free while it is not.
@@ -75,6 +81,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from execution import (
+    MAKER_CANCEL_BUDGET_MS,
     MAKER_LINE_MOVE_POINTS,
     MAKER_ML_FAIR_MOVE,
     MAX_STAKE_USD,
@@ -101,9 +108,16 @@ from kalshi_feed import (
     load_private_key,
     series_from_env,
 )
-from novig_feed import DEFAULT_NOVIG_WS_URL, NOVIG_PROD_WS_URL, MarketRegistry, MarketUpdate, NovigFeed
-from novig_private import NovigPrivateFeed
-from novig_rest import NovigOrderGateway, NovigRestClient, PaperOrderGateway
+from novig_feed import (
+    DEFAULT_NOVIG_WS_URL,
+    NOVIG_PROD_WS_URL,
+    ORDERS_SUBSCRIBE,
+    TAPE_SUBSCRIBE,
+    MarketRegistry,
+    MarketUpdate,
+    NovigFeed,
+)
+from novig_rest import NovigOrderGateway, NovigRestClient, PaperOrderGateway, order_body
 from sharp_feed import (
     MockSharpSource,
     ProviderConfig,
@@ -218,6 +232,16 @@ class MarketPosition(BaseModel):
 GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — venue independent
 
 
+def write_ledger_line(path: Path, event: str, **fields) -> None:
+    """Append-only JSON line (opened in "a" mode, flushed per line). Never raises."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": round(time.time(), 3), "event": event, **fields}, default=str) + "\n")
+    except OSError as exc:
+        log.error("LEDGER write failed (%s): %s", path, exc)
+
+
 def _floor_cents(x: float) -> float:
     return math.floor(x * 100 + 1e-9) / 100.0
 
@@ -273,21 +297,24 @@ class Supervisor:
         # --- live trading ---
         live: bool = False,
         order_gateway=None,
-        private_url: Optional[str] = None,
-        private_subscribe: Optional[list] = None,
-        private_kwargs: Optional[dict] = None,
+        subscribe_messages: Optional[list] = None,
         fill_volume_mode: Literal["cumulative", "incremental"] = "cumulative",
         max_stake: float = MAX_STAKE_USD,
         taker_fill_timeout: float = TAKER_FILL_TIMEOUT_SECONDS,
+        ledger_path: Optional[str | Path] = None,
+        live_plan: Optional["LivePlan"] = None,
     ) -> None:
-        if live and (order_gateway is None or not private_url):
-            raise ValueError("live mode needs an order_gateway and a private fill channel URL")
+        if live and order_gateway is None:
+            raise ValueError("live mode needs an order_gateway")
+        if subscribe_messages is None:
+            subscribe_messages = [TAPE_SUBSCRIBE, ORDERS_SUBSCRIBE] if live else [TAPE_SUBSCRIBE]
         if sharp_fetch is None:
             raise ValueError("a sharp_fetch source is required (ProviderSharpSource live, MockSharpSource in tests)")
         self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move)
         self.registry = registry if registry is not None else MarketRegistry()
         self.feed = NovigFeed(url=feed_url, token=token, registry=self.registry, on_update=self.on_market_update,
-                              on_state_change=self.on_feed_state, **(feed_kwargs or {}))
+                              on_state_change=self.on_feed_state, subscribe_messages=subscribe_messages,
+                              on_slip=self.on_fill_slip if live else None, **(feed_kwargs or {}))
         self.kalshi_registry = kalshi_registry if kalshi_registry is not None else MarketRegistry()
         self.kalshi: Optional[KalshiFeed] = None
         if kalshi_url or kalshi_rest or len(self.kalshi_registry):
@@ -305,16 +332,16 @@ class Supervisor:
         self.max_stake = min(max_stake, MAX_STAKE_USD)          # may only LOWER the $1,000 ceiling
         self.taker_fill_timeout = taker_fill_timeout
         self.live_orders: dict[str, LiveOrder] = {}
-        self.private: Optional[NovigPrivateFeed] = None
-        if live:
-            self.private = NovigPrivateFeed(private_url, token=token, on_slip=self.on_fill_slip,
-                                            on_state_change=self.on_feed_state,
-                                            subscribe_messages=private_subscribe, **(private_kwargs or {}))
+        self.orders_channel_confirmed = False     # set by the first execution slip of the session
+        self.ledger_path = Path(ledger_path) if ledger_path else None
+        self.live_plan = live_plan
         self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
         mk.setdefault("max_stake", self.max_stake)
         if live:
-            mk.update(on_posted=self._register_quote, can_quote=self._live_ready)
+            mk.update(on_posted=self._register_quote, can_quote=self._live_ready,
+                      on_cancelled=lambda ids, reason: self._ledger("CANCEL", exchange_order_ids=ids, reason=reason,
+                                                                    source="maker"))
         self.maker: Optional[MakerEngine] = (
             MakerEngine(self.maker_gateway, self.exposure, self._maker_targets, **mk) if maker_enabled else None)
         self.positions: dict[GameKey, MarketPosition] = {}
@@ -327,8 +354,6 @@ class Supervisor:
             "novig_feed": self.feed.run, "sharp_poller": self.poller.run, "heartbeat": self._heartbeat_loop}
         if self.kalshi is not None:
             self._task_factories["kalshi_feed"] = self.kalshi.run
-        if self.private is not None:
-            self._task_factories["novig_private"] = self.private.run
         if self.maker is not None:
             self._task_factories["maker"] = self.maker.run
         if novig_rest is not None or kalshi_rest is not None:
@@ -373,17 +398,31 @@ class Supervisor:
         venue = details.get("venue", "novig")
         self.stats[f"conn_{venue}_{state.lower()}"] += 1
         log.info("CONN_STATE %s %s %s", venue, state, json.dumps(details, default=str))
-        if state == "DISCONNECTED" and venue in {"novig", "novig_private"} and self.maker is not None \
-                and self.maker.quotes:
-            await self.maker.cancel_all("novig websocket drop" if venue == "novig" else "private fill channel down")
-        if state == "DISCONNECTED" and venue == "novig_private":
-            log.critical("LIVE private fill channel down: new orders halted; fills during the outage may be "
-                         "missed — reconcile open orders in the Novig UI if this persists")
+        if state == "DISCONNECTED" and venue == "novig" and self.maker is not None and self.maker.quotes:
+            await self.maker.cancel_all("novig websocket drop")
+        if state == "DISCONNECTED" and venue == "novig" and self.live:
+            log.critical("LIVE novig socket down (prices AND executions): new orders halted; fills during the "
+                         "outage may be missed — reconcile with the Novig order history if this persists")
 
     def _live_ready(self) -> bool:
-        """Live orders may only be sent while BOTH the tape and the private fill channel are up."""
-        return (self.private is not None and self.private.connected.is_set()
-                and self.feed.connected.is_set())
+        """Live orders only while the single Novig socket (prices + executions) is connected."""
+        return self.live and self.feed.connected.is_set()
+
+    def record_live_plan(self) -> None:
+        """Written at LAUNCH (not by --check-config): which limits this live session runs under and who approved."""
+        plan = self.live_plan
+        if plan is None:
+            return
+        self._ledger("SCALE_UP_AUTHORIZED" if plan.scaled_up else "CANARY_LIMITS",
+                     level="CRITICAL" if plan.scaled_up else "WARNING", approved_by=plan.approved_by,
+                     max_stake_usd=plan.max_stake, exposure_limit_usd=plan.exposure_limit, maker=plan.maker_enabled,
+                     canary={"max_stake_usd": CANARY_MAX_STAKE_USD, "exposure_limit_usd": CANARY_EXPOSURE_LIMIT_USD,
+                             "maker": CANARY_MAKER_ENABLED})
+
+    def _ledger(self, event: str, **fields) -> None:
+        """Append one line per live order / cancel / slip / fill for reconciliation with Novig's order history."""
+        if self.ledger_path is not None:
+            write_ledger_line(self.ledger_path, event, **fields)
 
     def _on_sharp_move(self, key, old: SharpLine, new: SharpLine) -> None:
         """Called synchronously by SharpBook when a stored sharp line changes."""
@@ -450,7 +489,7 @@ class Supervisor:
                 await self._try_arbitrage(update, key, side, held)
             return
 
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side)
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line)
         if sharp is None:
             self.stats["no_sharp"] += 1
             log.info("DECISION PASS %s %s %s: no fresh sharp line (<=%.0fs)", update.venue, key, side,
@@ -601,7 +640,7 @@ class Supervisor:
         """Reserve exposure + lock the game, then send a marketable LIMIT order at the best ask."""
         if not self._live_ready():
             self.stats["live_not_ready"] += 1
-            log.warning("LIVE order not sent on %s: private fill channel or tape is down", update.outcome_id)
+            log.warning("LIVE order not sent on %s: novig socket is down", update.outcome_id)
             if held is not None:
                 held.hedged = False
             return
@@ -615,11 +654,13 @@ class Supervisor:
             self.positions[key] = MarketPosition(legs=[leg])
         else:
             held.legs.append(leg)
+        payload = order_body(update.outcome_id, "buy", round(update.price * 100, 4), contracts, f"tk-{leg.order_id}")
         try:
             oid = await self.order_gateway.place_limit(update.outcome_id, "buy", round(update.price * 100, 4),
                                                        contracts, f"tk-{leg.order_id}")
         except Exception as exc:  # noqa: BLE001 — a rejected order must release everything it reserved
             log.error("LIVE_ORDER rejected %s %s x%d: %s", update.outcome_id, side, contracts, exc)
+            self._ledger("REJECTED", kind=kind, payload=payload, error=f"{type(exc).__name__}: {exc}")
             self.stats["live_rejected"] += 1
             self.exposure.adjust(leg.position_id, 0)
             self._drop_leg(key, leg)
@@ -632,6 +673,8 @@ class Supervisor:
         self.stats["live_orders"] += 1
         order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f reserved=$%.2f", kind, oid, update.outcome_id, side,
                        contracts, update.price, stake)
+        self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side, reserved_usd=stake,
+                     payload=payload)
         self._spawn(self._taker_timeout(oid))
         await self._after_taker(key)
 
@@ -643,8 +686,11 @@ class Supervisor:
         try:
             await self.order_gateway.cancel_orders([oid])
             reason = "unfilled remainder cancelled"
+            self._ledger("CANCEL", exchange_order_ids=[oid], reason=f"taker timeout {self.taker_fill_timeout}s",
+                         source="taker", filled_so_far=lo.filled)
         except Exception as exc:  # noqa: BLE001
             log.critical("LIVE_ORDER could not cancel remainder of %s (%s); reservation KEPT", oid, exc)
+            self._ledger("CANCEL_FAILED", exchange_order_ids=[oid], error=str(exc))
             return
         self._finalize(lo, reason)
 
@@ -665,8 +711,16 @@ class Supervisor:
         if leg is None:
             return
         leg.pending = False
-        self.exposure.adjust(leg.position_id, round(lo.fill_cost, 2))
         pos = self.positions.get(lo.key)
+        if lo.filled <= 0 and not self.orders_channel_confirmed:
+            self.stats["unconfirmed_zero_fill"] += 1
+            log.critical("LIVE_UNCONFIRMED %s %s ended with no observed fill, but no execution slip has been seen "
+                         "this session: it may have filled unseen. Lock and $%.2f reservation KEPT — check the "
+                         "Novig order history", lo.kind, lo.exchange_order_id, lo.requested * lo.limit_price)
+            self.exposure.adjust(leg.position_id, round(lo.requested * lo.limit_price, 2))
+            self._ledger("UNCONFIRMED", exchange_order_id=lo.exchange_order_id, reason=reason)
+            return
+        self.exposure.adjust(leg.position_id, round(lo.fill_cost, 2))
         if lo.filled <= 0:
             self._drop_leg(lo.key, leg)
             if lo.kind == "ARB_HEDGE" and pos is not None:
@@ -679,16 +733,25 @@ class Supervisor:
                         lo.exchange_order_id, lo.filled, pos.primary.contracts, pos.primary.contracts - lo.filled)
         log.info("LIVE_DONE %s %s filled %g/%d cost=$%.2f (%s)", lo.kind, lo.exchange_order_id, lo.filled,
                  lo.requested, lo.fill_cost, reason)
+        self._ledger("DONE", exchange_order_id=lo.exchange_order_id, filled=lo.filled, cost_usd=round(lo.fill_cost, 2),
+                     reason=reason)
 
     def _register_quote(self, q) -> None:
         """MakerEngine hook: remember every live quote so its fills can be booked."""
         buy_price = q.price_cents / 100 if q.side == "buy" else 1 - q.price_cents / 100
+        self._ledger("ORDER", exchange_order_id=q.order_id, kind="MAKER", market=list(q.market_key),
+                     fair_prob=round(q.fair_prob, 6),
+                     payload=order_body(q.outcome_id, q.side, q.price_cents, q.contracts, q.order_id))
         self.live_orders[q.order_id] = LiveOrder(exchange_order_id=q.order_id, kind="MAKER", outcome_id=q.outcome_id,
                                                  key=q.market_key, requested=q.contracts, limit_price=buy_price,
                                                  maker_side=q.side, fair_prob=q.fair_prob)
 
     async def on_fill_slip(self, slip) -> None:
-        """Private channel: book real fills into positions and the exposure count."""
+        """Execution slips: book real fills into positions and the exposure count."""
+        if not self.orders_channel_confirmed:
+            self.orders_channel_confirmed = True
+            log.info("LIVE orders channel confirmed by first execution slip")
+        self._ledger("SLIP", **slip.model_dump())
         lo = self.live_orders.get(slip.order_id)
         if lo is None:
             self.stats["unknown_fills"] += 1
@@ -720,6 +783,9 @@ class Supervisor:
                         self.exposure.adjust(leg.position_id, round(lo.fill_cost, 2))
             log.info("FILL %s %s +%g (total %g/%d) @ %.4f cost=$%.2f", lo.kind, lo.exchange_order_id, delta,
                      lo.filled, lo.requested, price, lo.fill_cost)
+            self._ledger("FILL", exchange_order_id=lo.exchange_order_id, kind=lo.kind, delta=delta,
+                         filled_total=lo.filled, requested=lo.requested, price=round(price, 6),
+                         cost_total_usd=round(lo.fill_cost, 2), open_exposure_usd=self.exposure.open_exposure)
         elif slip.filled_volume > 0:
             log.debug("FILL duplicate/replayed slip for %s ignored", slip.order_id)
         if lo.kind != "MAKER" and not lo.done and (slip.terminal or lo.filled >= lo.requested - 1e-9):
@@ -783,7 +849,7 @@ class Supervisor:
             key, side = canon
             if key in self.positions:
                 continue
-            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side)
+            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
             if sharp is None or (info.line is not None and sharp.line is not None
                                  and not math.isclose(info.line, sharp.line)):
                 continue
@@ -842,6 +908,10 @@ class Supervisor:
         log.info("SUPERVISOR starting (novig=%s, kalshi=%s, maker=%s, paper trading only)", self.feed.url,
                  "off" if self.kalshi is None else self.kalshi.url, self.maker is not None)
         if self.live:
+            self.record_live_plan()
+            self._ledger("SESSION_START", novig_socket=self.feed.url, max_stake_usd=self.max_stake,
+                         exposure_limit_usd=self.exposure.limit, maker=self.maker is not None,
+                         fill_volume_mode=self.fill_volume_mode)
             log.warning("LIVE TRADING ENABLED: real orders will be sent to %s. Orders resting from earlier sessions "
                         "are unknown to this engine — cancel them in the Novig UI first.",
                         self.order_gateway.api_base if hasattr(self.order_gateway, "api_base") else "the gateway")
@@ -870,10 +940,8 @@ class Supervisor:
         await self.feed.stop()
         if self.kalshi is not None:
             await self.kalshi.stop()
-        if self.private is not None:
-            await self.private.stop()        # must stop BEFORE the gather below, or shutdown waits forever
         for name, task in tasks.items():
-            if name not in {"novig_feed", "kalshi_feed", "novig_private"}:
+            if name not in {"novig_feed", "kalshi_feed"}:
                 task.cancel()
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         for name, result in zip(tasks, results):
@@ -895,12 +963,22 @@ class ConfigError(RuntimeError):
     pass
 
 
-# Production endpoints as given in the brief. The events path (/nbx/v2/emm/events,
-# OPEN_PREGAME) matches Novig's public docs; note the docs' example host is
-# api.novig.us, so override NOVIG_EVENTS_URL / NOVIG_API_BASE if novig.com answers 404.
-NOVIG_PROD_EVENTS_URL = "https://novig.com/nbx/v2/emm/events?status=OPEN_PREGAME&limit=100"
-NOVIG_PROD_API_BASE = "https://novig.com"
+# ---- production endpoints -------------------------------------------------
+# Tape: wss://api.novig.com/tape (Novig docs). The brief's "wss://://novig.com" has no host and is rejected.
+# REST: Novig's docs example serves /nbx/v2/emm/* from https://api.novig.us (the brief asks for the docs'
+#       host; "novig.us" without "api." does not appear in the docs). Override with NOVIG_API_BASE.
+NOVIG_PROD_API_BASE = "https://api.novig.us"
+NOVIG_EVENTS_PATH = "/nbx/v2/emm/events?status=OPEN_PREGAME&limit=100"
+NOVIG_PROD_EVENTS_URL = NOVIG_PROD_API_BASE + NOVIG_EVENTS_PATH
 LIVE_ACK_VALUE = "yes"
+
+# ---- guarded rollout ---------------------------------------------------------
+# Live trading ALWAYS starts at these caps. Anything larger (up to the hard
+# $1,000 / $15,000 ceilings) or turning the maker on requires LIVE_SCALE_APPROVED_BY,
+# which is written to the log as a CRITICAL audit line on every start.
+CANARY_MAX_STAKE_USD = 10.0
+CANARY_EXPOSURE_LIMIT_USD = 100.0
+CANARY_MAKER_ENABLED = False
 
 
 def validate_ws_url(url: Optional[str], name: str) -> str:
@@ -908,23 +986,48 @@ def validate_ws_url(url: Optional[str], name: str) -> str:
     parsed = urlparse(url or "")
     host = parsed.hostname or ""
     if parsed.scheme not in {"ws", "wss"} or not host or ("." not in host and host != "localhost"):
-        raise ConfigError(f"{name}={url!r} is not a valid WebSocket URL (expected e.g. wss://api.novig.com/...)")
+        raise ConfigError(f"{name}={url!r} is not a valid WebSocket URL (expected e.g. wss://api.novig.com/tape)")
     if parsed.scheme == "ws" and host not in {"localhost", "127.0.0.1"}:
         raise ConfigError(f"{name} must use wss:// (encrypted) for a remote host")
     return url
 
 
-def _lower_only(env: dict, name: str, ceiling: float) -> float:
+def _cap(env: dict, name: str, ceiling: float, default: float) -> float:
     raw = env.get(name)
     if not raw:
-        return ceiling
+        return default
     try:
         value = float(raw)
     except ValueError:
         raise ConfigError(f"{name}={raw!r} is not a number") from None
     if not 0 < value <= ceiling:
-        raise ConfigError(f"{name} must be > 0 and may only LOWER the built-in limit of ${ceiling:,.0f}")
+        raise ConfigError(f"{name} must be > 0 and at most the hard ceiling ${ceiling:,.0f}")
     return value
+
+
+class LivePlan(BaseModel):
+    """Resolved live-trading limits (what --check-config prints)."""
+    max_stake: float
+    exposure_limit: float
+    maker_enabled: bool
+    scaled_up: bool
+    approved_by: Optional[str] = None
+
+
+def resolve_live_plan(env: dict) -> LivePlan:
+    """Canary caps by default; any increase requires LIVE_SCALE_APPROVED_BY."""
+    stake = _cap(env, "LIVE_MAX_STAKE_USD", MAX_STAKE_USD, CANARY_MAX_STAKE_USD)
+    exposure = _cap(env, "LIVE_EXPOSURE_LIMIT_USD", GLOBAL_EXPOSURE_LIMIT_USD, CANARY_EXPOSURE_LIMIT_USD)
+    maker = env.get("MAKER_MODE", env.get("MAKER_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    scaled = stake > CANARY_MAX_STAKE_USD or exposure > CANARY_EXPOSURE_LIMIT_USD or (maker and not CANARY_MAKER_ENABLED)
+    approver = (env.get("LIVE_SCALE_APPROVED_BY") or "").strip() or None
+    if scaled and not approver:
+        raise ConfigError(
+            f"live limits above the canary (${CANARY_MAX_STAKE_USD:,.0f} stake / ${CANARY_EXPOSURE_LIMIT_USD:,.0f} "
+            f"exposure / maker off) require LIVE_SCALE_APPROVED_BY='<name, date, reconciliation reference>' "
+            f"— set it only after live_ledger.jsonl has been reconciled against Novig's order history")
+    return LivePlan(max_stake=stake, exposure_limit=exposure, maker_enabled=maker, scaled_up=scaled,
+                    approved_by=approver if scaled else None)
 
 
 def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None) -> Supervisor:
@@ -932,54 +1035,69 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     Build the production supervisor from environment variables.
 
     Paper (default): SHARP_PROVIDER_CONFIG, NOVIG_BEARER_TOKEN (bootstrap auth).
-    Live (TRADING_MODE=live) additionally REQUIRES:
-        LIVE_TRADING_ACKNOWLEDGED=yes   explicit human sign-off
-        NOVIG_PRIVATE_WS_URL            private fill channel (validated)
-        NOVIG_FILL_VOLUME_MODE          cumulative | incremental (see novig_private.py)
-    Optional: NOVIG_PRIVATE_SUBSCRIBE (JSON), NOVIG_API_BASE, NOVIG_EVENTS_URL, NOVIG_WS_URL,
-              LIVE_MAX_STAKE_USD / LIVE_EXPOSURE_LIMIT_USD (may only LOWER $1,000 / $15,000).
+    Live (TRADING_MODE=live) additionally REQUIRES LIVE_TRADING_ACKNOWLEDGED=yes and the token.
+    Live limits: canary $10 / $100 / maker off unless LIVE_SCALE_APPROVED_BY is set (see resolve_live_plan).
+    Optional: NOVIG_WS_URL, NOVIG_API_BASE, NOVIG_EVENTS_URL, NOVIG_SUBSCRIBE_MESSAGES (JSON list),
+              NOVIG_FILL_VOLUME_MODE (default cumulative, per Novig), TRADING_LOG_DIR.
     """
     env = os.environ if env is None else env
     live = env.get("TRADING_MODE", "paper").lower() == "live"
     if not env.get("SHARP_PROVIDER_CONFIG"):
         raise ConfigError("SHARP_PROVIDER_CONFIG is required (use --simulate for a demo without it)")
     token = env.get("NOVIG_BEARER_TOKEN")
-    events_url = env.get("NOVIG_EVENTS_URL") or NOVIG_PROD_EVENTS_URL
+    api_base = (env.get("NOVIG_API_BASE") or NOVIG_PROD_API_BASE).rstrip("/")
+    events_url = env.get("NOVIG_EVENTS_URL") or api_base + NOVIG_EVENTS_PATH
+    fill_mode = env.get("NOVIG_FILL_VOLUME_MODE", "cumulative")
+    if fill_mode not in {"cumulative", "incremental"}:
+        raise ConfigError(f"NOVIG_FILL_VOLUME_MODE={fill_mode!r} must be cumulative or incremental")
+    subscribe = None
+    if env.get("NOVIG_SUBSCRIBE_MESSAGES"):
+        try:
+            subscribe = json.loads(env["NOVIG_SUBSCRIBE_MESSAGES"])
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"NOVIG_SUBSCRIBE_MESSAGES is not valid JSON: {exc}") from None
+        if not isinstance(subscribe, list) or not all(isinstance(m, dict) for m in subscribe):
+            raise ConfigError("NOVIG_SUBSCRIBE_MESSAGES must be a JSON list of objects")
+    if env.get("NOVIG_PRIVATE_WS_URL"):
+        log.warning("NOVIG_PRIVATE_WS_URL is no longer used: executions arrive on the main Novig socket")
+
+    feed_url = url or env.get("NOVIG_WS_URL") or (NOVIG_PROD_WS_URL if live else DEFAULT_NOVIG_WS_URL)
     live_kw: dict = {}
     exposure = None
+    maker_enabled = env.get("MAKER_MODE", env.get("MAKER_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
     if live:
         problems = []
         if env.get("LIVE_TRADING_ACKNOWLEDGED", "").lower() != LIVE_ACK_VALUE:
             problems.append("LIVE_TRADING_ACKNOWLEDGED=yes (explicit sign-off that real money will trade)")
         if not token:
             problems.append("NOVIG_BEARER_TOKEN")
-        if env.get("NOVIG_FILL_VOLUME_MODE") not in {"cumulative", "incremental"}:
-            problems.append("NOVIG_FILL_VOLUME_MODE=cumulative|incremental (confirm with Novig which one "
-                            "filled_volume means)")
-        if not env.get("NOVIG_PRIVATE_WS_URL"):
-            problems.append("NOVIG_PRIVATE_WS_URL (the private fill channel)")
-        else:
-            try:
-                validate_ws_url(env["NOVIG_PRIVATE_WS_URL"], "NOVIG_PRIVATE_WS_URL")
-            except ConfigError as exc:
-                problems.append(str(exc))
+        try:
+            validate_ws_url(feed_url, "NOVIG_WS_URL")
+        except ConfigError as exc:
+            problems.append(str(exc))
+        try:
+            plan = resolve_live_plan(env)
+        except ConfigError as exc:
+            problems.append(str(exc))
+            plan = None
         if problems:
             raise ConfigError("TRADING_MODE=live refused; missing/invalid: " + "; ".join(problems))
-        private_url = env["NOVIG_PRIVATE_WS_URL"]
-        try:
-            private_subscribe = json.loads(env["NOVIG_PRIVATE_SUBSCRIBE"]) if env.get("NOVIG_PRIVATE_SUBSCRIBE") else None
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"NOVIG_PRIVATE_SUBSCRIBE is not valid JSON: {exc}") from None
-        if isinstance(private_subscribe, dict):
-            private_subscribe = [private_subscribe]
-        exposure = ExposureMonitor(_lower_only(env, "LIVE_EXPOSURE_LIMIT_USD", GLOBAL_EXPOSURE_LIMIT_USD))
-        live_kw = dict(live=True, order_gateway=NovigOrderGateway(env.get("NOVIG_API_BASE") or NOVIG_PROD_API_BASE,
-                                                                   token),
-                       private_url=private_url, private_subscribe=private_subscribe,
-                       fill_volume_mode=env["NOVIG_FILL_VOLUME_MODE"],
-                       max_stake=_lower_only(env, "LIVE_MAX_STAKE_USD", MAX_STAKE_USD))
-    feed_url = url or env.get("NOVIG_WS_URL") or (NOVIG_PROD_WS_URL if live else DEFAULT_NOVIG_WS_URL)
-    validate_ws_url(feed_url, "NOVIG_WS_URL")
+        if plan.scaled_up:
+            log.critical("LIVE SCALE-UP AUTHORIZED by %r: max stake $%.2f, exposure limit $%.2f, maker %s "
+                         "(canary is $%.0f / $%.0f / maker off)", plan.approved_by, plan.max_stake,
+                         plan.exposure_limit, "ON" if plan.maker_enabled else "off", CANARY_MAX_STAKE_USD,
+                         CANARY_EXPOSURE_LIMIT_USD)
+        else:
+            log.warning("LIVE CANARY limits in force: max stake $%.0f, exposure limit $%.0f, maker off. Scaling "
+                        "up requires LIVE_SCALE_APPROVED_BY after reconciling live_ledger.jsonl.",
+                        plan.max_stake, plan.exposure_limit)
+        exposure = ExposureMonitor(plan.exposure_limit)
+        maker_enabled = plan.maker_enabled
+        ledger = Path(env.get("TRADING_LOG_DIR", "logs")) / "live_ledger.jsonl"
+        live_kw = dict(live=True, order_gateway=NovigOrderGateway(api_base, token), fill_volume_mode=fill_mode,
+                       max_stake=plan.max_stake, ledger_path=ledger, live_plan=plan)
+    else:
+        validate_ws_url(feed_url, "NOVIG_WS_URL")
     registry = MarketRegistry.from_json_file(env["NOVIG_MARKETS_FILE"]) if env.get("NOVIG_MARKETS_FILE") else None
     kw: dict = {}
     if env.get("KALSHI_ENABLED", "0") == "1":
@@ -993,7 +1111,99 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"])),
-                      maker_enabled=env.get("MAKER_ENABLED", "1") == "1", exposure=exposure, **kw, **live_kw)
+                      maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,
+                      **kw, **live_kw)
+
+
+def describe_state(sup: Supervisor) -> dict:
+    """Structured summary of what the engine WILL do if started (no network access)."""
+    cfg = getattr(sup.poller.fetch, "config", None)
+    return {
+        "mode": "LIVE" if sup.live else "paper",
+        "novig_socket": sup.feed.url,
+        "subscriptions": sup.feed.subscribe_messages,
+        "fill_volume_mode": sup.fill_volume_mode if sup.live else "n/a (paper)",
+        "bootstrap_url": sup.novig_rest.events_url if sup.novig_rest else "NOVIG_MARKETS_FILE",
+        "bootstrap_refresh_s": sup.bootstrap_refresh,
+        "orders_endpoint": f"{sup.order_gateway.api_base}/v1/orders" if sup.live else "paper (nothing sent)",
+        "max_stake_usd": sup.max_stake,
+        "exposure_limit_usd": sup.exposure.limit,
+        "min_edge": MIN_EDGE,
+        "maker": "on" if sup.maker is not None else "off",
+        "maker_cancel_budget_ms": MAKER_CANCEL_BUDGET_MS,
+        "taker_fill_timeout_s": sup.taker_fill_timeout,
+        "reconnect_delay_s": sup.feed.reconnect_delay,
+        "ping_interval_s": sup.feed.ping_interval,
+        "ping_timeout_s": sup.feed.ping_timeout,
+        "stale_stream_s": sup.feed.stale_after,
+        "kalshi": "off" if sup.kalshi is None else ("data-only" if sup.live else "paper execution"),
+        "kalshi_socket": None if sup.kalshi is None else sup.kalshi.url,
+        "kalshi_rest": None if sup.kalshi_rest is None else sup.kalshi_rest.base_url,
+        "dead_heat_venues": sorted(DEAD_HEAT_VENUES),
+        "ledger": str(sup.ledger_path) if sup.ledger_path else None,
+        "sharp_url": cfg.url if cfg else "mock",
+        "sharp_mode": cfg.mode if cfg else "mock",
+        "sharp_odds_format": cfg.odds_format if cfg else "-",
+        "sharp_timestamp_format": cfg.timestamp_format if cfg else "-",
+        "sharp_markets": sorted(set(cfg.market_map.values())) if cfg else [],
+        "sharp_overrides": sorted(cfg.market_overrides) if cfg else [],
+        "sharp_http_timeout_s": cfg.timeout_seconds if cfg else None,
+        "sharp_poll_s": sup.poller.interval,
+        "sharp_max_age_s": sup.book.max_age,
+    }
+
+
+def format_state_report(sup: Supervisor) -> str:
+    """Plain-text configuration report for --check-config."""
+    st = describe_state(sup)
+    rows = [
+        ("MODE", None),
+        ("Trading mode", st["mode"]),
+        ("NOVIG", None),
+        ("Socket (prices + executions)", st["novig_socket"]),
+        ("Subscriptions", " + ".join(json.dumps(m) for m in st["subscriptions"])),
+        ("Fill volume mode", st["fill_volume_mode"]),
+        ("Bootstrap (REST)", st["bootstrap_url"]),
+        ("Bootstrap refresh", f"{st['bootstrap_refresh_s']:.0f}s"),
+        ("Orders endpoint", st["orders_endpoint"]),
+        ("RISK", None),
+        ("Max stake per position", f"${st['max_stake_usd']:,.2f}   (hard ceiling ${MAX_STAKE_USD:,.0f})"),
+        ("Exposure limit", f"${st['exposure_limit_usd']:,.2f}   (hard ceiling ${GLOBAL_EXPOSURE_LIMIT_USD:,.0f})"),
+        ("Minimum edge", f"> {st['min_edge']:.1%}"),
+        ("Maker", st["maker"]),
+        ("Dead-heat venues (NFL ML ties = 50c)", ", ".join(st["dead_heat_venues"])),
+        ("Ledger", st["ledger"] or "(paper: none)"),
+        ("TIMEOUTS", None),
+        ("Reconnect delay", f"{st['reconnect_delay_s']}s"),
+        ("Ping interval / timeout", f"{st['ping_interval_s']}s / {st['ping_timeout_s']}s"),
+        ("Silent-stream watchdog", f"{st['stale_stream_s']}s"),
+        ("Taker fill timeout", f"{st['taker_fill_timeout_s']}s"),
+        ("Maker bulk-cancel budget", f"{st['maker_cancel_budget_ms']:.0f}ms"),
+        ("SHARP DATA", None),
+        ("Provider URL", st["sharp_url"]),
+        ("Mode / odds / timestamps", f"{st['sharp_mode']} / {st['sharp_odds_format']} / {st['sharp_timestamp_format']}"),
+        ("Markets", ", ".join(st["sharp_markets"]) or "-"),
+        ("Per-market overrides", ", ".join(st["sharp_overrides"]) or "none"),
+        ("HTTP timeout / poll / freshness", f"{st['sharp_http_timeout_s']}s / {st['sharp_poll_s']}s / {st['sharp_max_age_s']}s"),
+        ("KALSHI", None),
+        ("Status", st["kalshi"]),
+        ("Socket", st["kalshi_socket"] or "-"),
+        ("REST", st["kalshi_rest"] or "-"),
+    ]
+    lines = ["=" * 78, "TRADING ENGINE CONFIGURATION REPORT (no network connections were opened)", "=" * 78]
+    for label, value in rows:
+        if value is None:
+            lines.append(f"\n[{label}]")
+        else:
+            lines.append(f"  {label:<38} {value}")
+    lines.append("\n[UNVERIFIED AGAINST A LIVE EXCHANGE]")
+    for item in ("Novig order body keys + DELETE body key (novig_rest.ORDER_BODY_KEYS / BULK_CANCEL_KEY)",
+                 "Novig 'orders' channel slip shape (confirmed only once the first slip arrives)",
+                 "Novig REST host api.novig.us for /v1/orders; whether events embed markets; pagination",
+                 "OpticOdds record paths in the sharp provider config"):
+        lines.append(f"  - {item}")
+    lines.append("=" * 78)
+    return "\n".join(lines)
 
 
 # ==========================================================================
@@ -1090,6 +1300,8 @@ def main() -> None:
     parser.add_argument("--simulate", type=float, metavar="SECONDS", help="self-contained local simulation")
     parser.add_argument("--log-dir", default=os.environ.get("TRADING_LOG_DIR", "logs"))
     parser.add_argument("--url", default=None, help="override the Novig WebSocket URL")
+    parser.add_argument("--check-config", action="store_true",
+                        help="build from the environment, print the system state, connect to nothing")
     args = parser.parse_args()
 
     path = setup_logging(args.log_dir)
@@ -1104,6 +1316,9 @@ def main() -> None:
         except (ConfigError, ValueError, OSError) as exc:
             log.error("SUPERVISOR cannot start: %s", exc)
             sys.exit(2)
+        if args.check_config:
+            print(format_state_report(sup))
+            return
         asyncio.run(sup.run())
     except KeyboardInterrupt:
         log.info("SUPERVISOR interrupted by user")

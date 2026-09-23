@@ -73,6 +73,7 @@ class SharpLine(BaseModel):
     line: Optional[float] = None       # spread from `side`'s perspective, or the total
     source: str = "sharp"
     updated_at: Optional[float] = None # provider timestamp, epoch seconds (UTC)
+    is_main: bool = True               # False = alternate line (stored by its exact number only)
 
     def mirrored(self) -> "SharpLine":
         """The same market seen from the other side (assumes names are already canonical)."""
@@ -97,7 +98,8 @@ class SharpBook:
         self.max_age = max_age_seconds
         self.clock = clock
         self.on_move = on_move    # called with (key, old, new) whenever a stored line/price changes
-        self._lines: dict[BookKey, tuple[SharpLine, float]] = {}   # value: (line, observed_at epoch)
+        self._lines: dict[BookKey, tuple[SharpLine, float]] = {}   # MAIN line per side: (line, observed_at)
+        self._by_line: dict[tuple[BookKey, Optional[float]], tuple[SharpLine, float]] = {}  # every line incl. alts
         self._seen: set[tuple[str, str]] = set()
 
     def __len__(self) -> int:
@@ -147,9 +149,12 @@ class SharpBook:
                 continue
             canon = line.model_copy(update=dict(league=league, home_team=home, away_team=away, side=side))
             key = (league, home, away, canon.market_type, canon.side)
-            old = self._lines.get(key)
+            old = self._lines.get(key) if canon.is_main else None
             for item in (canon, canon.mirrored()):
-                self._lines[(league, home, away, item.market_type, item.side)] = (item, observed_at)
+                item_key = (league, home, away, item.market_type, item.side)
+                self._by_line[(item_key, item.line)] = (item, observed_at)
+                if canon.is_main:
+                    self._lines[item_key] = (item, observed_at)
             stored += 1
             if old is not None and self.on_move is not None and (
                     old[0].line != canon.line or old[0].odds_for != canon.odds_for
@@ -163,15 +168,20 @@ class SharpBook:
                               stale, self.max_age)
         return stored, rejected
 
-    def lookup(self, league: str, home: str, away: str, market_type: str, side: str) -> Optional[SharpLine]:
-        """The fresh line for this side, or None if missing or older than max_age."""
-        hit = self._lines.get((league, home, away, market_type, side))
-        if hit is None:
-            return None
-        line, observed_at = hit
-        if self.clock() - observed_at > self.max_age:
-            return None
-        return line
+    def lookup(self, league: str, home: str, away: str, market_type: str, side: str,
+               line: Optional[float] = None) -> Optional[SharpLine]:
+        """
+        The fresh sharp line for this side, or None if missing or older than max_age.
+        With `line`, an exact-number match (main OR alternate) is preferred, so a Novig
+        total of 223.5 is compared with the sharp 223.5 alternate, not the 221.5 main.
+        """
+        key = (league, home, away, market_type, side)
+        now = self.clock()
+        candidates = [self._by_line.get((key, line)) if line is not None else None, self._lines.get(key)]
+        for hit in candidates:
+            if hit is not None and now - hit[1] <= self.max_age:
+                return hit[0]      # a stale exact match falls back to the fresh main line
+        return None
 
     def age_of(self, league: str, home: str, away: str, market_type: str, side: str) -> Optional[float]:
         hit = self._lines.get((league, home, away, market_type, side))
@@ -182,7 +192,13 @@ class SharpBook:
         dead = [k for k, (_, t) in self._lines.items() if now - t > self.max_age]
         for k in dead:
             del self._lines[k]
+        for k in [k for k, (_, t) in self._by_line.items() if now - t > self.max_age]:
+            del self._by_line[k]
         return len(dead)
+
+    def alternates(self, league: str, home: str, away: str, market_type: str, side: str) -> list[float]:
+        key = (league, home, away, market_type, side)
+        return sorted(l for (k, l) in self._by_line if k == key and l is not None)
 
 
 # ==========================================================================
@@ -271,6 +287,12 @@ class ProviderConfig(BaseModel):
     odds_format: Literal["american", "decimal"] = "american"
     timestamp_format: Literal["epoch", "epoch_ms", "iso", "auto"] = "epoch"
     timeout_seconds: float = 5.0
+    # ---- "flat" mode: per-market field overrides (e.g. totals use over/under instead of home/away) ----
+    #   {"total": {"fields": {"odds_for": "odds.over", "odds_against": "odds.under", "line": "odds.total"},
+    #              "constants": {"side": "Over"}}}
+    # odds_for / odds_against may be a number, an odds object ({"decimal": 1.91}) or an ARRAY of such
+    # objects carrying their own "points" (alternate lines); arrays are paired over<->under by points.
+    market_overrides: dict[str, dict[str, dict[str, Any]]] = Field(default_factory=dict)
     # ---- "outcomes" mode only ----
     fixture_fields: dict[str, str] = Field(default_factory=dict)   # league / home_team / away_team -> path
     outcomes_path: str = "odds"                                     # path to the per-side array in a fixture
@@ -292,26 +314,108 @@ OUR_FIELDS = ("league", "home_team", "away_team", "market_type", "side",
               "odds_for", "odds_against", "line", "source", "updated_at")
 
 
-def map_provider_record(record: Any, cfg: ProviderConfig) -> dict[str, Any]:
-    """Translate one provider record into SharpLine fields (validation happens in SharpBook)."""
+ENTRY_POINTS_KEYS = ("points", "line", "total", "handicap")
+ENTRY_TIME_KEYS = ("updated_at", "timestamp", "last_updated")
+
+
+def _entry_points(entry: Any) -> Optional[float]:
+    if isinstance(entry, dict):
+        for k in ENTRY_POINTS_KEYS:
+            if entry.get(k) is not None:
+                return float(entry[k])
+    return None
+
+
+def _entry_time(entry: Any, fmt: str) -> Optional[float]:
+    if isinstance(entry, dict):
+        for k in ENTRY_TIME_KEYS:
+            if entry.get(k) is not None:
+                return parse_timestamp(entry[k], fmt)
+    return None
+
+
+def _entry_price(entry: Any, odds_format: str) -> float:
+    value = unwrap_odds(entry, odds_format) if isinstance(entry, dict) else entry
+    value = float(value)
+    return decimal_to_american(value) if odds_format == "decimal" else value
+
+
+def map_provider_records(record: Any, cfg: ProviderConfig) -> list[dict[str, Any]]:
+    """
+    Translate one provider record into one or more SharpLine dicts (validation happens in SharpBook).
+
+    * market type is canonicalised with cfg.market_map ("Total Points" -> "total")
+    * cfg.market_overrides[<market>] replaces field paths / constants for that market
+      (e.g. totals read odds.over / odds.under and side = "Over")
+    * scalar or object odds -> one line (the main line)
+    * arrays of odds objects (alternate lines) -> one line per over/under pair with equal points;
+      the entry flagged is_main (or else the first) is the main line
+    """
     out: dict[str, Any] = dict(cfg.constants)
     for field in OUR_FIELDS:
-        path = cfg.fields.get(field, field)       # unmapped fields default to identical names
-        value = _dig(record, path)
+        value = _dig(record, cfg.fields.get(field, field))   # unmapped fields default to identical names
         if value is not None:
             out[field] = value
     if isinstance(out.get("market_type"), str):
-        out["market_type"] = out["market_type"].strip().lower()
-    for k in ("odds_for", "odds_against"):
-        if isinstance(out.get(k), dict):        # odds objects, e.g. {"decimal": 1.91, "american": -110}
-            out[k] = unwrap_odds(out[k], cfg.odds_format)
-    if cfg.odds_format == "decimal":
-        for k in ("odds_for", "odds_against"):
-            if k in out:
-                out[k] = decimal_to_american(float(out[k]))
-    if "updated_at" in out:
-        out["updated_at"] = parse_timestamp(out["updated_at"], cfg.timestamp_format)
-    return out
+        raw_market = out["market_type"].strip().lower()
+        out["market_type"] = cfg.market_map.get(raw_market, raw_market)
+    override = cfg.market_overrides.get(out.get("market_type") or "")
+    if override:
+        for field, path in override.get("fields", {}).items():
+            out[field] = _dig(record, path)
+        out.update(override.get("constants", {}))
+    record_ts = parse_timestamp(out.pop("updated_at", None), cfg.timestamp_format)
+
+    for_raw, against_raw = out.get("odds_for"), out.get("odds_against")
+    if not isinstance(for_raw, list) and not isinstance(against_raw, list):
+        if for_raw is None or against_raw is None:
+            raise ValueError("record has no two-way prices")
+        out["odds_for"] = _entry_price(for_raw, cfg.odds_format)
+        out["odds_against"] = _entry_price(against_raw, cfg.odds_format)
+        pts = _entry_points(for_raw)
+        if pts is not None and out.get("line") is None:
+            out["line"] = pts
+        stamps = [t for t in (record_ts, _entry_time(for_raw, cfg.timestamp_format),
+                              _entry_time(against_raw, cfg.timestamp_format)) if t is not None]
+        out["updated_at"] = min(stamps) if stamps else None
+        out["is_main"] = True
+        return [out]
+
+    fors = for_raw if isinstance(for_raw, list) else [for_raw]
+    againsts = against_raw if isinstance(against_raw, list) else [against_raw]
+    market = out.get("market_type")
+    lines: list[dict[str, Any]] = []
+    for ef in fors:
+        pf = _entry_points(ef)
+        if pf is None:
+            pf = out.get("line")
+        for ea in againsts:
+            pa = _entry_points(ea)
+            pa = out.get("line") if pa is None else pa
+            if pf is None or pa is None:
+                continue
+            if market == "spread" and abs(pf + pa) > 1e-9:
+                continue                          # spreads: home -x pairs with away +x
+            if market != "spread" and abs(pf - pa) > 1e-9:
+                continue                          # totals: over x pairs with under x
+            stamps = [t for t in (record_ts, _entry_time(ef, cfg.timestamp_format),
+                                  _entry_time(ea, cfg.timestamp_format)) if t is not None]
+            flagged = isinstance(ef, dict) and ef.get("is_main") is True
+            lines.append({**out, "odds_for": _entry_price(ef, cfg.odds_format),
+                          "odds_against": _entry_price(ea, cfg.odds_format), "line": pf,
+                          "updated_at": min(stamps) if stamps else None, "is_main": flagged})
+            break
+    if lines and not any(l["is_main"] for l in lines):
+        lines[0]["is_main"] = True                # no flag from the provider: first entry is the main line
+    if not lines:
+        raise ValueError("no over/under (or home/away) entries could be paired")
+    return lines
+
+
+def map_provider_record(record: Any, cfg: ProviderConfig) -> dict[str, Any]:
+    """Main line only (see map_provider_records for alternates)."""
+    rows = map_provider_records(record, cfg)
+    return next(r for r in rows if r["is_main"])
 
 
 def _outcome_value(rec: dict, cfg: ProviderConfig, field: str) -> Any:
@@ -427,7 +531,7 @@ class ProviderSharpSource:
         mapped, bad = [], 0
         for rec in records:
             try:
-                mapped.append(map_provider_record(rec, self.config))
+                mapped.extend(map_provider_records(rec, self.config))
             except (ValueError, TypeError) as exc:
                 bad += 1
                 sharp_log.debug("SHARP_POLL provider record skipped: %s", exc)

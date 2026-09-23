@@ -175,8 +175,9 @@ async def test_provider_source_end_to_end_over_http():
                                                          headers={"Authorization": "Bearer k"})))
     try:
         lines = await src()
+        assert len(lines) == 1                   # garbage record rejected at the source (no prices)
         book = SharpBook()
-        assert book.ingest(lines) == (1, 1)      # good record stored, garbage rejected
+        assert book.ingest(lines) == (1, 0)
         assert book.lookup(*KEY).source == "pinnacle"
     finally:
         await src.close()
@@ -325,7 +326,7 @@ def test_on_move_listener_bug_does_not_break_ingest():
 
 
 # ================================================================ OpticOdds mapping per the brief (nested `odds` object)
-from sharp_feed import unwrap_odds  # noqa: E402
+from sharp_feed import map_provider_records, unwrap_odds  # noqa: E402
 
 
 def brief_record(updated_at, home=1.8333333, away=2.0, market="moneyline", points=None):
@@ -373,8 +374,9 @@ async def test_opticodds_brief_over_http(monkeypatch):
     port = site._server.sockets[0].getsockname()[1]
     src = ProviderSharpSource(cfg.model_copy(update=dict(url=f"http://127.0.0.1:{port}/odds")))
     try:
-        book = SharpBook()
-        assert book.ingest(await src()) == (1, 1)                # good record stored, empty one rejected
+        lines = await src()
+        assert len(lines) == 1                                    # empty record rejected at the source
+        assert SharpBook().ingest(lines) == (1, 0)
     finally:
         await src.close()
         await runner.cleanup()
@@ -396,3 +398,88 @@ def test_unwrap_odds_rejects_unknown_shape():
                                             ("2026-09-23T12:00:00+00:00", 1790164800), (None, None)])
 def test_auto_timestamps(value, expected):
     assert parse_timestamp(value, "auto") == expected
+
+
+# ================================================================ totals: over/under + alternate lines
+def totals_record(over, under, total=None, updated_at=1790164800, market="Total Points"):
+    return {"league": "NBA", "home_team": "NY Knicks", "away_team": "Boston", "market": market,
+            "odds": {"over": over, "under": under, "total": total, "updated_at": updated_at}}
+
+
+TOT_KEY = ("NBA", "New York Knicks", "Boston Celtics", "total", "over")
+
+
+def test_totals_single_line_from_over_under_objects(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    [row] = map_provider_records(totals_record({"decimal": 1.9523810}, {"decimal": 1.8695652}, total=221.5), cfg)
+    assert (row["market_type"], row["side"], row["line"], row["is_main"]) == ("total", "Over", 221.5, True)
+    assert (round(row["odds_for"]), round(row["odds_against"])) == (-105, -115)
+
+
+def test_totals_alternate_line_arrays_pair_by_points(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    over = [{"points": 219.5, "decimal": 1.80}, {"points": 221.5, "decimal": 1.9523810, "is_main": True},
+            {"points": 223.5, "decimal": 2.10}, {"points": 230.5, "decimal": 3.0}]            # 230.5 has no under
+    under = [{"points": 223.5, "decimal": 1.75}, {"points": 221.5, "decimal": 1.8695652},
+             {"points": 219.5, "decimal": 2.05}]
+    rows = map_provider_records(totals_record(over, under), cfg)
+    assert [(r["line"], r["is_main"]) for r in rows] == [(219.5, False), (221.5, True), (223.5, False)]
+    assert map_provider_record(totals_record(over, under), cfg)["line"] == 221.5
+
+
+def test_book_serves_exact_alternate_or_falls_back_to_main(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    over = [{"points": 221.5, "decimal": 1.9523810, "is_main": True}, {"points": 223.5, "decimal": 2.10}]
+    under = [{"points": 221.5, "decimal": 1.8695652}, {"points": 223.5, "decimal": 1.75}]
+    book = SharpBook(clock=FakeClock(1790164800))
+    assert book.ingest(map_provider_records(totals_record(over, under), cfg)) == (2, 0)
+    assert book.lookup(*TOT_KEY).line == 221.5                              # main
+    alt = book.lookup(*TOT_KEY, line=223.5)
+    assert alt.line == 223.5 and round(alt.odds_for) == 110                # 2.10 decimal = +110
+    under_alt = book.lookup("NBA", "New York Knicks", "Boston Celtics", "total", "under", line=223.5)
+    assert round(under_alt.odds_for) == -133                                 # 1.75 decimal
+    assert book.lookup(*TOT_KEY, line=250.5).line == 221.5                  # unknown number -> main
+    assert book.alternates(*TOT_KEY) == [221.5, 223.5]
+
+
+def test_alternate_updates_do_not_fire_main_line_moves(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    moves = []
+    book = SharpBook(clock=FakeClock(1790164800), on_move=lambda *a: moves.append(a))
+    base_over = [{"points": 221.5, "decimal": 1.95, "is_main": True}, {"points": 223.5, "decimal": 2.10}]
+    base_under = [{"points": 221.5, "decimal": 1.87}, {"points": 223.5, "decimal": 1.75}]
+    book.ingest(map_provider_records(totals_record(base_over, base_under), cfg))
+    base_over[1]["decimal"] = 2.30                                           # only the alternate moved
+    book.ingest(map_provider_records(totals_record(base_over, base_under), cfg))
+    assert moves == []
+    base_over[0]["points"] = base_under[0]["points"] = 222.5                  # main line moves 1 point
+    book.ingest(map_provider_records(totals_record(base_over, base_under), cfg))
+    assert len(moves) == 1 and (moves[0][1].line, moves[0][2].line) == (221.5, 222.5)
+
+
+def test_alternates_expire_with_the_30s_rule(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    over = [{"points": 221.5, "decimal": 1.95, "is_main": True}, {"points": 223.5, "decimal": 2.1,
+                                                                   "updated_at": 1790164800 - 20}]
+    under = [{"points": 221.5, "decimal": 1.87}, {"points": 223.5, "decimal": 1.75}]
+    clock = FakeClock(1790164800)
+    book = SharpBook(clock=clock)
+    book.ingest(map_provider_records(totals_record(over, under), cfg))
+    clock.t += 10.001                                   # alternate's own timestamp is now 30.001s old
+    assert book.lookup(*TOT_KEY, line=223.5).line == 221.5   # stale alternate ignored -> main (still fresh)
+    assert book.purge_stale() == 0 and book.alternates(*TOT_KEY) == [221.5]
+
+
+def test_spread_arrays_pair_home_minus_with_away_plus(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    rec = brief_record(1790164800, market="spread")
+    rec["odds"]["home_odds"] = [{"points": -2.5, "decimal": 1.91, "is_main": True}, {"points": -4.5, "decimal": 2.2}]
+    rec["odds"]["away_odds"] = [{"points": 4.5, "decimal": 1.7}, {"points": 2.5, "decimal": 1.91}]
+    rows = map_provider_records(rec, cfg)
+    assert [(r["line"], r["is_main"]) for r in rows] == [(-2.5, True), (-4.5, False)]
+
+
+def test_unpairable_totals_raise_and_are_skipped(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    with pytest.raises(ValueError):
+        map_provider_records(totals_record([{"points": 221.5, "decimal": 1.9}], [{"points": 225.5, "decimal": 1.9}]), cfg)

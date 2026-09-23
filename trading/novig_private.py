@@ -1,42 +1,29 @@
 """
-novig_private.py — Novig private order channel (our own fills).
+novig_private.py — Parsing of Novig private execution slips (our own fills).
 
-Novig's docs (search result; docs site unreachable from the build sandbox) say
-private place / fill / cancel notifications arrive over the NBX WebSocket API.
-This module listens for "execution slips" and hands each one to the supervisor,
-which updates positions and the global exposure count in real time.
+Novig carries public prices AND private execution data on ONE WebSocket (per the
+brief and Novig's docs). NovigFeed (novig_feed.py) subscribes to both channels on
+that socket and hands every slip it sees to the supervisor via parse_slips().
 
-SLIP FIELDS (per the brief)
+SLIP FIELDS
     order_id       our order's id (as returned by POST /v1/orders)
-    status         FILLED | PARTIAL   (CANCELLED/CANCELED/EXPIRED also accepted)
-    filled_volume  contracts filled — see FILL_VOLUME_MODE below
+    status         FILLED | PARTIAL   (CANCELLED/CANCELED/EXPIRED/REJECTED also accepted)
+    filled_volume  running CUMULATIVE total filled for the life of that order id
+                   (confirmed in the brief). The supervisor books
+                   delta = filled_volume - previous filled_volume, so duplicate or
+                   replayed slips add nothing. "incremental" remains available as a
+                   setting only in case Novig's behaviour ever changes.
     price_cents    execution price
-
-FILL_VOLUME_MODE (must be set explicitly for live trading: NOVIG_FILL_VOLUME_MODE)
-    "cumulative"   filled_volume = TOTAL filled so far for the order. Duplicate or
-                   replayed slips are harmless (delta <= 0 is ignored).
-    "incremental"  filled_volume = contracts filled by THIS slip.
-    Getting this wrong mis-states positions (cumulative read as incremental
-    over-counts; incremental read as cumulative UNDER-counts exposure), which is
-    why the engine refuses to go live until it is set.
-
-ASSUMED (confirm with Novig): the channel URL (NOVIG_PRIVATE_WS_URL — the brief's
-"wss://://novig.com" is not a valid URL) and the subscribe message
-(NOVIG_PRIVATE_SUBSCRIBE, default {"event": "subscribe", "data": "orders"}).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-from typing import Any, Awaitable, Callable, Iterable, Optional, Union
+from typing import Any, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
 
-from ws_base import RECONNECT_DELAY_SECONDS, ResilientWebSocketFeed, StateCallback, safe_call
-
-DEFAULT_PRIVATE_SUBSCRIBE = {"event": "subscribe", "data": "orders"}
 TERMINAL_STATUSES = {"FILLED", "CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}
 
 log = logging.getLogger("trading.private")
@@ -88,37 +75,3 @@ def parse_slips(raw: Union[str, bytes]) -> list[FillSlip]:
         except ValidationError as exc:
             log.warning("PRIVATE_PARSE_ERROR bad slip (%d errors): %s", exc.error_count(), item)
     return out
-
-
-SlipCallback = Callable[[FillSlip], Union[None, Awaitable[None]]]
-
-
-class NovigPrivateFeed(ResilientWebSocketFeed):
-    venue = "novig_private"
-
-    def __init__(self, url: str, token: Optional[str] = None, on_slip: Optional[SlipCallback] = None,
-                 on_state_change: Optional[StateCallback] = None,
-                 subscribe_messages: Optional[Iterable[dict]] = None,
-                 reconnect_delay: float = RECONNECT_DELAY_SECONDS, **kw: Any) -> None:
-        # Fills can be hours apart: liveness comes from ping/pong, not message flow,
-        # so the silent-stream watchdog is relaxed to one hour for this channel.
-        kw.setdefault("stale_after", 3600.0)
-        super().__init__(url, on_state_change, reconnect_delay, logger=log, **kw)
-        self._token = token if token is not None else os.environ.get("NOVIG_BEARER_TOKEN")
-        self.on_slip = on_slip
-        self.subscribe_messages = [DEFAULT_PRIVATE_SUBSCRIBE] if subscribe_messages is None else list(subscribe_messages)
-        self.slips_received = 0
-
-    def _headers(self) -> Optional[dict[str, str]]:
-        return {"Authorization": f"Bearer {self._token}"} if self._token else None
-
-    async def _on_open(self, ws) -> None:
-        for msg in self.subscribe_messages:
-            await ws.send(json.dumps(msg))
-            log.info("CONN novig_private sent subscription %s", json.dumps(msg))
-
-    async def _handle_raw(self, raw) -> None:
-        for slip in parse_slips(raw):
-            self.slips_received += 1
-            log.info("FILL_SLIP %s", slip.model_dump_json())
-            await safe_call(self.on_slip, slip, logger=log)

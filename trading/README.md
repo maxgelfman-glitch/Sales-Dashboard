@@ -11,7 +11,7 @@ exception and a $15,000 global exposure kill-switch.
 |---|---|
 | `ws_base.py` | Shared self-healing WebSocket loop (reconnect < 3s, ping/pong, watchdog) |
 | `novig_feed.py` | Novig tape: `{"event":"subscribe","data":"tape"}`, outcomeId ticks, order books, registry |
-| `novig_private.py` | Private fill channel: execution slips (`order_id`, `status`, `filled_volume`, `price_cents`) |
+| `novig_private.py` | Execution-slip parsing (`order_id`, `status`, cumulative `filled_volume`, `price_cents`) |
 | `novig_rest.py` | Startup bootstrap (events → markets → 2 outcomes) + order gateway (`POST`/`DELETE /v1/orders`) |
 | `kalshi_feed.py` | Kalshi orderbook_delta feed, RSA-PSS auth, cents→probability→American translator, bootstrap |
 | `sharp_feed.py` | Sharp provider polling (flat or OpticOdds/OddsJam per-outcome arrays), strict 30s freshness |
@@ -40,34 +40,38 @@ python main_supervisor.py
 ```
 
 ## Live mode (real orders on Novig)
-Refused unless every item is present and valid:
+Template: `config/live.env.example`. Always run the offline report first:
 ```bash
-export TRADING_MODE=live
-export LIVE_TRADING_ACKNOWLEDGED=yes                  # explicit human sign-off
-export NOVIG_BEARER_TOKEN=...
-export NOVIG_PRIVATE_WS_URL=wss://...                 # private fill channel (validated; must be wss://host/...)
-export NOVIG_FILL_VOLUME_MODE=cumulative              # or incremental — confirm with Novig
-# optional
-export NOVIG_PRIVATE_SUBSCRIBE='{"event":"subscribe","data":"orders"}'
-export LIVE_MAX_STAKE_USD=50 LIVE_EXPOSURE_LIMIT_USD=500   # may only LOWER $1,000 / $15,000
+python main_supervisor.py --check-config      # plain-text report; opens no connections, writes no ledger
 ```
-Defaults in live mode: tape `wss://api.novig.com/tape`, bootstrap
-`https://novig.com/nbx/v2/emm/events?status=OPEN_PREGAME&limit=100`, orders `https://novig.com/v1/orders`
-(override with `NOVIG_WS_URL`, `NOVIG_EVENTS_URL`, `NOVIG_API_BASE`).
+Minimum for `TRADING_MODE=live`: `LIVE_TRADING_ACKNOWLEDGED=yes`, `NOVIG_BEARER_TOKEN`, a valid
+`NOVIG_WS_URL` (default `wss://api.novig.com/tape`). Prices and our executions share that ONE socket:
+the engine sends `{"event":"subscribe","channel":"tape"}` and `{"event":"subscribe","channel":"orders"}`.
+`filled_volume` is treated as a cumulative total per order id (`NOVIG_FILL_VOLUME_MODE=cumulative`).
 
-How live orders are accounted: stake is reserved and the game locked before sending; private fill
-slips set the real position; any remainder is cancelled after 2s and the unused reservation released.
-If the private channel or tape drops, all quotes are bulk-cancelled and no new orders are sent.
+**Canary lock:** live always starts at **$10 max stake, $100 exposure, maker off**. Raising any of these
+(up to the hard $1,000 / $15,000 ceilings) is refused unless `LIVE_SCALE_APPROVED_BY` is set; the
+approval is logged CRITICAL and written to `live_ledger.jsonl` at launch.
 
-### Recommended rollout
-1. Paper mode against real feeds for several sessions; compare logged decisions with the Novig UI.
-2. Live canary: `LIVE_MAX_STAKE_USD=10`, `LIVE_EXPOSURE_LIMIT_USD=100`, `MAKER_ENABLED=0`; reconcile
-   every `ORDER LIVE` / `FILL` log line against Novig's order history.
-3. Enable the maker, then raise caps step by step.
+**Ledger** (`$TRADING_LOG_DIR/live_ledger.jsonl`, append-only JSON lines): `CANARY_LIMITS` /
+`SCALE_UP_AUTHORIZED`, `SESSION_START`, `ORDER` (exact POST body), `REJECTED`, `SLIP` (raw execution
+slip), `FILL` (delta + running total + cost), `CANCEL` (taker timeout / maker, with reason),
+`CANCEL_FAILED`, `DONE`, `UNCONFIRMED`.
+
+Safety behaviour: stake reserved + game locked before sending; remainder cancelled after 2s; until the
+first execution slip proves the orders channel, a no-fill order KEEPS its lock and reservation
+(`LIVE_UNCONFIRMED`, CRITICAL); socket down ⇒ quotes bulk-cancelled, no new orders.
+
+### Rollout
+1. Paper mode against real feeds; compare decisions with the Novig UI.
+2. Canary (default live limits). Reconcile every ledger line against Novig's order history.
+3. Only then set `LIVE_SCALE_APPROVED_BY` and raise limits / enable `MAKER_MODE` step by step.
+
+Regenerate config schemas with `python config/generate_schemas.py` (a test fails if they drift).
 
 ## Still to confirm before real money
-* Novig private channel URL + subscribe message, and whether `filled_volume` is cumulative or incremental.
-* Novig host for REST (`novig.com` per brief vs `api.novig.us` in Novig's docs example), order body keys,
-  whether events embed markets, and pagination beyond `limit=100` (the bootstrap logs a warning for both).
+* Novig `orders` channel slip shape and order body keys (first canary order proves or disproves them).
+* Novig REST host `api.novig.us` for `/v1/orders`; whether events embed markets; pagination beyond
+  `limit=100` (the bootstrap logs a warning for both).
 * OpticOdds record paths in `config/sharp_provider.opticodds.example.json`.
 * Kalshi order routing + fills (not built: Kalshi is data-only in live mode).

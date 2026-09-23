@@ -159,7 +159,7 @@ async def test_full_dual_venue_runtime_is_fully_logged(log_path):
     assert all(TS_LINE.match(l) for l in lines)
     required = {
         "bootstrap": "BOOTSTRAP novig registry now holds 6 outcomes",
-        "novig subscription": 'CONN novig sent subscription {"event": "subscribe", "data": "tape"}',
+        "novig subscription": 'CONN novig sent subscription {"event": "subscribe", "channel": "tape"}',
         "kalshi subscription": "CONN kalshi subscribed orderbook_delta for 2 tickers",
         "maker post": "MAKER_POST LIMIT",
         "maker cleared on position": "MAKER_CANCEL",
