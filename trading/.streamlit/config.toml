@@ -1,0 +1,16 @@
+# Dark financial theme + a quiet, local-only server for dashboard.py
+[theme]
+base = "dark"
+backgroundColor = "#07090d"
+secondaryBackgroundColor = "#0e131b"
+textColor = "#e6edf3"
+primaryColor = "#00e676"
+font = "sans serif"
+
+[server]
+headless = true
+address = "127.0.0.1"          # local only: the cockpit shows positions and order ids
+runOnSave = false
+
+[browser]
+gatherUsageStats = false

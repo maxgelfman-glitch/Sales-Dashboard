@@ -1,0 +1,6 @@
+# Dashboard only (kept separate so the trading engine does not depend on it).
+# pip install -r requirements-dashboard.txt
+streamlit>=1.37   # st.fragment(run_every=...) partial refresh
+plotly>=5.20      # fillgradient on the profit curve
+pandas>=2.0
+numpy>=1.24

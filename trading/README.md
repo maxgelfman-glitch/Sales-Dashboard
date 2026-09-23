@@ -18,6 +18,7 @@ exception and a $15,000 global exposure kill-switch.
 | `execution.py` | De-vig, edge, Kelly, caps, Kalshi fee, `ExposureMonitor`, `MakerEngine` (quotes + <200ms bulk cancel) |
 | `team_normalizer.py` | Cross-feed team-name mapping |
 | `main_supervisor.py` | Orchestrator: bootstrap, lock, arbitrage scenarios (incl. NFL ties), maker wiring, logging |
+| `dashboard.py` | Read-only Streamlit cockpit (separate process; tails `live_ledger.jsonl` + `trading_engine.log`) |
 | `mock_novig_server.py` | Local fake exchange used by tests and `--simulate` |
 
 ## Quick start
@@ -38,6 +39,14 @@ export SHARP_PROVIDER_CONFIG=config/sharp_provider.json
 export KALSHI_ENABLED=1 KALSHI_ENV=demo KALSHI_KEY_ID=... KALSHI_PRIVATE_KEY_PATH=/secure/kalshi.pem
 python main_supervisor.py
 ```
+
+## Dashboard (read-only cockpit)
+```bash
+pip install -r requirements-dashboard.txt
+nice -n 10 streamlit run dashboard.py        # http://127.0.0.1:8501 (local only)
+```
+Runs as its own process, imports no engine code, opens no exchange connections and only reads the ledger
+and engine log (new bytes only). Settled P&L needs `SETTLE` ledger events, which the engine does not write yet.
 
 ## Live mode (real orders on Novig)
 Template: `config/live.env.example`. Always run the offline report first:
