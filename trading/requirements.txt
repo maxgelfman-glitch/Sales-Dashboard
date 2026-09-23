@@ -1,0 +1,7 @@
+# Runtime + test dependencies for the trading engine.
+# Install with:  pip install -r requirements.txt
+websockets>=13.0      # async WebSocket client/server (we use the modern websockets.asyncio API)
+aiohttp>=3.9          # async HTTP client for REST polls of sharp-book feeds
+pydantic>=2.0         # typed, validated data models for every payload
+pytest>=8.0           # test runner
+pytest-asyncio>=0.23  # lets pytest run `async def` tests

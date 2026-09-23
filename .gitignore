@@ -7,3 +7,9 @@
 .DS_Store
 Thumbs.db
 *.log
+
+# Trading engine: runtime logs, caches, local secrets
+trading/logs/
+__pycache__/
+.pytest_cache/
+.env
