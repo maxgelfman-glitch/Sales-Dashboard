@@ -18,3 +18,8 @@ trading/config/sharp_provider.json
 *.key
 .coverage
 htmlcov/
+
+# Real credentials: never commit
+live.env
+*.env
+!*.env.example
