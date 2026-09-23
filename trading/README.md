@@ -18,6 +18,7 @@ exception and a $15,000 global exposure kill-switch.
 | `execution.py` | De-vig, edge, Kelly, caps, Kalshi fee, `ExposureMonitor`, `MakerEngine` (quotes + <200ms bulk cancel) |
 | `team_normalizer.py` | Cross-feed team-name mapping |
 | `main_supervisor.py` | Orchestrator: bootstrap, lock, arbitrage scenarios (incl. NFL ties), maker wiring, logging |
+| `settlement.py` | Exchange positions: parsing, settlement P&L (WIN/LOSS/TIE 50¢/VOID), positions REST client |
 | `dashboard.py` | Read-only Streamlit cockpit (separate process; tails `live_ledger.jsonl` + `trading_engine.log`) |
 | `mock_novig_server.py` | Local fake exchange used by tests and `--simulate` |
 
@@ -46,7 +47,7 @@ pip install -r requirements-dashboard.txt
 nice -n 10 streamlit run dashboard.py        # http://127.0.0.1:8501 (local only)
 ```
 Runs as its own process, imports no engine code, opens no exchange connections and only reads the ledger
-and engine log (new bytes only). Settled P&L needs `SETTLE` ledger events, which the engine does not write yet.
+and engine log (new bytes only). Capital and the profit curve come from the engine's `SETTLE` rows (`net_profit_usd`, `resulting_capital_pool`).
 
 ## Live mode (real orders on Novig)
 Template: `config/live.env.example`. Always run the offline report first:
@@ -71,6 +72,13 @@ Safety behaviour: stake reserved + game locked before sending; remainder cancell
 first execution slip proves the orders channel, a no-fill order KEEPS its lock and reservation
 (`LIVE_UNCONFIRMED`, CRITICAL); socket down ⇒ quotes bulk-cancelled, no new orders.
 
+**Settlement & restart safety (live):** before any order, the engine loads every OPEN Novig position
+(`RESTORE` rows) and refuses to trade if that fails. Every 15 minutes (`SETTLEMENT_SWEEP_SECONDS`) it fetches
+SETTLED positions, releases their exposure and writes one `SETTLE` row each (idempotent across sweeps and
+restarts). The same sweep resolves `UNCONFIRMED` orders against the exchange and restores untracked
+positions (e.g. manual trades). Endpoint settings: `NOVIG_POSITIONS_PATH` (default `/v1/positions`),
+`NOVIG_POSITIONS_STATUS_PARAM` (`status`), `NOVIG_OPEN_STATUS` (`OPEN`), `NOVIG_SETTLED_STATUS` (`SETTLED`).
+
 ### Rollout
 1. Paper mode against real feeds; compare decisions with the Novig UI.
 2. Canary (default live limits). Reconcile every ledger line against Novig's order history.
@@ -80,6 +88,7 @@ Regenerate config schemas with `python config/generate_schemas.py` (a test fails
 
 ## Still to confirm before real money
 * Novig `orders` channel slip shape and order body keys (first canary order proves or disproves them).
+* Novig positions endpoint: path, status filter values, field names, pagination (`settlement.py`).
 * Novig REST host `api.novig.us` for `/v1/orders`; whether events embed markets; pagination beyond
   `limit=100` (the bootstrap logs a warning for both).
 * OpticOdds record paths in `config/sharp_provider.opticodds.example.json`.

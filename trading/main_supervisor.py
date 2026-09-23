@@ -73,6 +73,7 @@ import random
 import sys
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, Optional
@@ -127,6 +128,14 @@ from sharp_feed import (
     SharpLine,
     SharpPoller,
 )
+from settlement import (
+    BASELINE_CAPITAL_USD,
+    DEFAULT_POSITIONS_PATH,
+    SETTLEMENT_SWEEP_SECONDS,
+    PositionsClient,
+    load_ledger_settlements,
+    settlement_pnl,
+)
 from team_normalizer import normalize_outcome, normalize_team_name
 
 LOG_FILE_NAME = "trading_engine.log"
@@ -179,7 +188,7 @@ def setup_logging(log_dir: str | Path = "logs", level: int = logging.INFO, conso
 # ==========================================================================
 class PaperOrder(BaseModel):
     order_id: int
-    kind: Literal["DIRECTIONAL", "ARB_HEDGE", "MAKER_FILL"]
+    kind: Literal["DIRECTIONAL", "ARB_HEDGE", "MAKER_FILL", "RESTORED"]
     venue: str
     outcome_id: str
     event_id: str
@@ -303,6 +312,10 @@ class Supervisor:
         taker_fill_timeout: float = TAKER_FILL_TIMEOUT_SECONDS,
         ledger_path: Optional[str | Path] = None,
         live_plan: Optional["LivePlan"] = None,
+        positions_client: Optional[PositionsClient] = None,
+        settlement_interval: float = SETTLEMENT_SWEEP_SECONDS,
+        sync_retries: int = 5,
+        sync_retry_delay: float = 10.0,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -335,6 +348,13 @@ class Supervisor:
         self.orders_channel_confirmed = False     # set by the first execution slip of the session
         self.ledger_path = Path(ledger_path) if ledger_path else None
         self.live_plan = live_plan
+        # ---- settlement / reconciliation (live) ----
+        self.positions_client = positions_client
+        self.settlement_interval = settlement_interval
+        self.sync_retries, self.sync_retry_delay = sync_retries, sync_retry_delay
+        self.processed_settlements, self.cumulative_pnl = load_ledger_settlements(self.ledger_path)
+        self.synced = positions_client is None          # nothing to sync without a positions client
+        self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
         mk.setdefault("max_stake", self.max_stake)
@@ -358,6 +378,8 @@ class Supervisor:
             self._task_factories["maker"] = self.maker.run
         if novig_rest is not None or kalshi_rest is not None:
             self._task_factories["bootstrap"] = self._bootstrap_loop
+        if positions_client is not None:
+            self._task_factories["settlement"] = self._settlement_loop
 
     # backwards-compatible alias used by older callers/tests
     @property
@@ -406,7 +428,7 @@ class Supervisor:
 
     def _live_ready(self) -> bool:
         """Live orders only while the single Novig socket (prices + executions) is connected."""
-        return self.live and self.feed.connected.is_set()
+        return self.live and self.synced and self.feed.connected.is_set()
 
     def record_live_plan(self) -> None:
         """Written at LAUNCH (not by --check-config): which limits this live session runs under and who approved."""
@@ -719,6 +741,7 @@ class Supervisor:
                          "Novig order history", lo.kind, lo.exchange_order_id, lo.requested * lo.limit_price)
             self.exposure.adjust(leg.position_id, round(lo.requested * lo.limit_price, 2))
             self._ledger("UNCONFIRMED", exchange_order_id=lo.exchange_order_id, reason=reason)
+            self.unconfirmed_legs[leg.order_id] = time.time()   # the settlement sweep reconciles it
             return
         self.exposure.adjust(leg.position_id, round(lo.fill_cost, 2))
         if lo.filled <= 0:
@@ -810,6 +833,7 @@ class Supervisor:
             leg = self._record("MAKER_FILL", upd, side, int(round(delta)), round(delta * price, 2), 0.0, edge, False,
                                price=price, force=True)
             leg.live = True
+            leg.exchange_order_id = lo.exchange_order_id
             lo.leg_id = leg.order_id
             if key in self.positions:
                 self.positions[key].legs.append(leg)
@@ -822,6 +846,168 @@ class Supervisor:
         if self.maker is not None:
             self.maker.on_fill(lo.exchange_order_id)
             await self.maker.cancel_market(lo.key, "maker fill: position lock")
+
+    # ---------------- settlement & reconciliation ----------------
+    @property
+    def capital_pool(self) -> float:
+        return round(BASELINE_CAPITAL_USD + self.cumulative_pnl, 2)
+
+    def _legs_for_outcome(self, outcome_id: str) -> list[tuple[GameKey, PaperOrder]]:
+        return [(key, leg) for key, pos in self.positions.items() for leg in pos.legs
+                if leg.live and leg.outcome_id == outcome_id]
+
+    def _restore(self, pos, source: str) -> PaperOrder:
+        """Book an exchange position the engine did not know about as a real liability."""
+        info = self.registry.get(pos.outcome_id)
+        canon = self._canonical(MarketUpdate.from_info(info)) if info is not None else None
+        key, side = canon if canon else (("UNMAPPED", pos.outcome_id, "", ""), pos.outcome_id)
+        # exposure = what the position cost; unknown cost -> contracts x $1 (the most it can lose is its cost <= $1)
+        stake = round(pos.cost_usd if pos.cost_usd is not None else pos.contracts * 1.0, 2)
+        price = (pos.cost_usd / pos.contracts) if pos.cost_usd and pos.contracts else 0.5
+        leg = PaperOrder(order_id=len(self.orders) + 1, kind="RESTORED", venue="novig", outcome_id=pos.outcome_id,
+                         event_id=(info.event_id if info else pos.event_id) or "", league=info.league if info else "",
+                         market_type=info.market_type if info else "", side=side, line=info.line if info else None,
+                         price=min(max(price, 0.0001), 0.9999), contracts=int(round(pos.contracts)), stake_usd=stake,
+                         edge=None, capped=False, placed_at=time.time(), live=True)
+        self.exposure.record_fill(leg.position_id, stake)
+        self.orders.append(leg)
+        self.positions.setdefault(key, MarketPosition(legs=[])).legs.append(leg)
+        self._ledger("RESTORE", source=source, restore_id=leg.position_id, outcome_id=pos.outcome_id,
+                     game_id=leg.event_id, market_type=leg.market_type, side=side, contracts=leg.contracts,
+                     exposure_usd=stake, mapped=canon is not None, open_exposure_usd=self.exposure.open_exposure)
+        if canon is None:
+            log.warning("RESTORE outcome %s is not in the market registry: exposure counted, game cannot be locked",
+                        pos.outcome_id)
+        return leg
+
+    async def startup_sync(self) -> bool:
+        """Live: load every OPEN exchange position before trading. Returns False if it could not be done."""
+        if self.positions_client is None:
+            return True
+        for attempt in range(1, self.sync_retries + 1):
+            try:
+                open_positions = await self.positions_client.open_positions()
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.error("SYNC attempt %d/%d failed (%s: %s)", attempt, self.sync_retries, type(exc).__name__, exc)
+                if attempt == self.sync_retries:
+                    log.critical("SYNC could not load open positions from Novig: live trading will NOT start")
+                    self._ledger("SYNC_FAILED", attempts=attempt, error=f"{type(exc).__name__}: {exc}")
+                    return False
+                await asyncio.sleep(self.sync_retry_delay)
+        restored = [self._restore(p, "startup") for p in open_positions if not p.is_settled]
+        self.synced = True
+        total = round(sum(l.stake_usd for l in restored), 2)
+        log.warning("SYNC restored %d open exchange position(s) worth $%.2f; open exposure $%.2f of $%.2f%s",
+                    len(restored), total, self.exposure.open_exposure, self.exposure.limit,
+                    " — taker orders HALTED until settlements free room" if self.exposure.taker_halted else "")
+        self._ledger("SYNC", restored=len(restored), restored_exposure_usd=total,
+                     open_exposure_usd=self.exposure.open_exposure, capital_pool=self.capital_pool)
+        return True
+
+    def _apply_settlement(self, pos, legs: list[tuple[GameKey, PaperOrder]]) -> dict:
+        """ATOMIC (no await): release exposure, drop the legs / lock, append the SETTLE row."""
+        stake = round(sum(l.stake_usd for _, l in legs), 2)
+        ours = sum(l.contracts for _, l in legs)
+        if pos.contracts and abs(pos.contracts - ours) > 1e-6:
+            log.warning("SETTLE %s: exchange reports %g contracts, engine tracked %d", pos.outcome_id,
+                        pos.contracts, ours)
+        if not pos.contracts:
+            pos = pos.model_copy(update=dict(contracts=float(ours)))
+        net, payout, method = settlement_pnl(pos, stake)
+        released = 0.0
+        for key, leg in legs:
+            released += self.exposure.settle(leg.position_id)
+            self.unconfirmed_legs.pop(leg.order_id, None)
+            self._drop_leg(key, leg)
+        self.processed_settlements.add(pos.settlement_id)
+        self.cumulative_pnl = round(self.cumulative_pnl + (net or 0.0), 2)
+        first = legs[0][1]
+        row = dict(timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                   settlement_id=pos.settlement_id, game_id=first.event_id or pos.event_id,
+                   market_type=first.market_type, outcome_id=pos.outcome_id, side=first.side,
+                   contracts=pos.contracts, stake_usd=stake, payout_usd=payout, net_profit_usd=net,
+                   pnl_method=method, result=pos.result, released_exposure_usd=round(released, 2),
+                   released_position_ids=[l.position_id for _, l in legs],
+                   released_order_ids=[l.exchange_order_id for _, l in legs if l.exchange_order_id],
+                   open_exposure_usd=self.exposure.open_exposure, resulting_capital_pool=self.capital_pool)
+        self._ledger("SETTLE", **row)
+        self.stats["settlements"] += 1
+        if net is None:
+            log.critical("SETTLE %s: exposure $%.2f released but P&L UNKNOWN (no pnl/payout/result from Novig)",
+                         pos.outcome_id, released)
+        else:
+            log.info("SETTLE %s %s net %+.2f (stake $%.2f, payout $%.2f, %s); released $%.2f; exposure $%.2f; "
+                     "capital $%.2f", row["game_id"], pos.outcome_id, net, stake, payout, method, released,
+                     self.exposure.open_exposure, self.capital_pool)
+        return row
+
+    async def settlement_sweep(self) -> list[dict]:
+        """Settle what the exchange says settled; restore untracked open positions; resolve UNCONFIRMED orders."""
+        client = self.positions_client
+        if client is None:
+            return []
+        settled = await client.settled_positions()
+        open_positions = await client.open_positions()
+        rows = []
+        for pos in settled:
+            if pos.settlement_id in self.processed_settlements or not pos.is_settled:
+                continue
+            legs = self._legs_for_outcome(pos.outcome_id)
+            if legs:
+                rows.append(self._apply_settlement(pos, legs))
+        open_by_outcome = {p.outcome_id: p for p in open_positions if not p.is_settled}
+        settled_outcomes = {p.outcome_id for p in settled}
+        now = time.time()
+        for leg_id, since in list(self.unconfirmed_legs.items()):
+            leg = self._leg(leg_id)
+            if leg is None:
+                self.unconfirmed_legs.pop(leg_id, None)
+                continue
+            key = next((k for k, pos in self.positions.items() if leg in pos.legs), None)
+            if leg.outcome_id in open_by_outcome:
+                exch = open_by_outcome[leg.outcome_id]
+                leg.contracts = int(round(exch.contracts))
+                leg.stake_usd = round(exch.cost_usd if exch.cost_usd is not None else leg.contracts * leg.price, 2)
+                self.exposure.adjust(leg.position_id, leg.stake_usd)
+                self.unconfirmed_legs.pop(leg_id)
+                self._ledger("UNCONFIRMED_RESOLVED", exchange_order_id=leg.exchange_order_id, filled=leg.contracts,
+                             exposure_usd=leg.stake_usd)
+                log.warning("UNCONFIRMED %s resolved from exchange positions: %d contracts, $%.2f",
+                            leg.exchange_order_id, leg.contracts, leg.stake_usd)
+            elif leg.outcome_id not in settled_outcomes and now - since >= 60 and key is not None:
+                self.exposure.adjust(leg.position_id, 0)
+                self._drop_leg(key, leg)
+                self.unconfirmed_legs.pop(leg_id)
+                self._ledger("UNCONFIRMED_RELEASED", exchange_order_id=leg.exchange_order_id,
+                             reason="no open or settled exchange position for this outcome")
+                log.warning("UNCONFIRMED %s released: the exchange holds no position for %s", leg.exchange_order_id,
+                            leg.outcome_id)
+        for outcome, exch in open_by_outcome.items():
+            if outcome in settled_outcomes:
+                continue          # the exchange's open list can lag its settlements: never resurrect a settled one
+            tracked = self._legs_for_outcome(outcome)
+            if not tracked:
+                rows.append({"restored": self._restore(exch, "sweep").position_id})
+            else:
+                ours = sum(l.contracts for _, l in tracked)
+                if abs(ours - exch.contracts) > 1e-6 and not any(l.pending for _, l in tracked):
+                    self._ledger("POSITION_MISMATCH", outcome_id=outcome, engine_contracts=ours,
+                                 exchange_contracts=exch.contracts)
+                    log.warning("POSITION_MISMATCH %s: engine %d vs exchange %g contracts", outcome, ours,
+                                exch.contracts)
+        return rows
+
+    async def _settlement_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settlement_interval)
+            try:
+                await self.settlement_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — a failed sweep just waits for the next one
+                log.error("SETTLEMENT sweep failed (%s: %s); retrying in %.0fs", type(exc).__name__, exc,
+                          self.settlement_interval)
 
     def settle_event(self, event_id: str) -> float:
         """Mark positions containing this event id as settled: releases exposure and the lock."""
@@ -916,6 +1102,10 @@ class Supervisor:
                         "are unknown to this engine — cancel them in the Novig UI first.",
                         self.order_gateway.api_base if hasattr(self.order_gateway, "api_base") else "the gateway")
         await self.bootstrap()
+        if self.live and self.positions_client is not None and not await self.startup_sync():
+            log.critical("SUPERVISOR stopping: startup position sync failed, refusing to trade blind")
+            await self.shutdown({})
+            return
         tasks = {name: asyncio.create_task(factory(), name=name) for name, factory in self._task_factories.items()}
         deadline = None if duration is None else time.monotonic() + duration
         try:
@@ -948,7 +1138,7 @@ class Supervisor:
             if isinstance(result, Exception):
                 log.error("SUPERVISOR task %s raised during shutdown: %r", name, result)
         closeables = {id(c): c for c in (self.poller.fetch, self.novig_rest, self.kalshi_rest, self.maker_gateway,
-                                         self.order_gateway) if c is not None}
+                                         self.order_gateway, self.positions_client) if c is not None}
         for closeable in closeables.values():
             closer = getattr(closeable, "close", None)
             if closer is not None:
@@ -1094,8 +1284,13 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         exposure = ExposureMonitor(plan.exposure_limit)
         maker_enabled = plan.maker_enabled
         ledger = Path(env.get("TRADING_LOG_DIR", "logs")) / "live_ledger.jsonl"
+        positions = PositionsClient(
+            api_base, token, path=env.get("NOVIG_POSITIONS_PATH", DEFAULT_POSITIONS_PATH),
+            status_param=env.get("NOVIG_POSITIONS_STATUS_PARAM", "status"),
+            open_status=env.get("NOVIG_OPEN_STATUS", "OPEN"), settled_status=env.get("NOVIG_SETTLED_STATUS", "SETTLED"))
         live_kw = dict(live=True, order_gateway=NovigOrderGateway(api_base, token), fill_volume_mode=fill_mode,
-                       max_stake=plan.max_stake, ledger_path=ledger, live_plan=plan)
+                       max_stake=plan.max_stake, ledger_path=ledger, live_plan=plan, positions_client=positions,
+                       settlement_interval=float(env.get("SETTLEMENT_SWEEP_SECONDS", SETTLEMENT_SWEEP_SECONDS)))
     else:
         validate_ws_url(feed_url, "NOVIG_WS_URL")
     registry = MarketRegistry.from_json_file(env["NOVIG_MARKETS_FILE"]) if env.get("NOVIG_MARKETS_FILE") else None
@@ -1126,6 +1321,11 @@ def describe_state(sup: Supervisor) -> dict:
         "bootstrap_url": sup.novig_rest.events_url if sup.novig_rest else "NOVIG_MARKETS_FILE",
         "bootstrap_refresh_s": sup.bootstrap_refresh,
         "orders_endpoint": f"{sup.order_gateway.api_base}/v1/orders" if sup.live else "paper (nothing sent)",
+        "positions_endpoint": (f"{sup.positions_client.url}?{sup.positions_client.status_param}="
+                               f"{sup.positions_client.open_status}|{sup.positions_client.settled_status}"
+                               if sup.positions_client else "n/a (paper)"),
+        "settlement_sweep": (f"every {sup.settlement_interval:.0f}s; startup sync before trading"
+                             if sup.positions_client else "n/a (paper)"),
         "max_stake_usd": sup.max_stake,
         "exposure_limit_usd": sup.exposure.limit,
         "min_edge": MIN_EDGE,
@@ -1166,6 +1366,8 @@ def format_state_report(sup: Supervisor) -> str:
         ("Bootstrap (REST)", st["bootstrap_url"]),
         ("Bootstrap refresh", f"{st['bootstrap_refresh_s']:.0f}s"),
         ("Orders endpoint", st["orders_endpoint"]),
+        ("Positions endpoint (sync/settle)", st["positions_endpoint"]),
+        ("Settlement sweep", st["settlement_sweep"]),
         ("RISK", None),
         ("Max stake per position", f"${st['max_stake_usd']:,.2f}   (hard ceiling ${MAX_STAKE_USD:,.0f})"),
         ("Exposure limit", f"${st['exposure_limit_usd']:,.2f}   (hard ceiling ${GLOBAL_EXPOSURE_LIMIT_USD:,.0f})"),
@@ -1200,6 +1402,7 @@ def format_state_report(sup: Supervisor) -> str:
     for item in ("Novig order body keys + DELETE body key (novig_rest.ORDER_BODY_KEYS / BULK_CANCEL_KEY)",
                  "Novig 'orders' channel slip shape (confirmed only once the first slip arrives)",
                  "Novig REST host api.novig.us for /v1/orders; whether events embed markets; pagination",
+                 "Novig positions endpoint path, status values and field names (settlement.py)",
                  "OpticOdds record paths in the sharp provider config"):
         lines.append(f"  - {item}")
     lines.append("=" * 78)

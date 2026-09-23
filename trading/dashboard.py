@@ -237,8 +237,10 @@ def order_book_state(session: pd.DataFrame, now: float) -> pd.DataFrame:
     """One row per live order with status, contracts, entry price and current exposure."""
     cols = ["order_id", "kind", "outcome", "side", "ts", "reserved_usd", "contracts", "cost_usd", "status",
             "exposure_usd", "window"]
-    if session.empty or not session["event"].eq("ORDER").any():
+    if session.empty or not session["event"].isin(["ORDER", "RESTORE"]).any():
         return pd.DataFrame(columns=cols)
+    if not session["event"].eq("ORDER").any():
+        return apply_reconciliation(session, pd.DataFrame(columns=cols + ["quote_side"]))[cols]
     orders = session[session["event"].eq("ORDER")]
     payload = _col(orders, "payload", None)
     out = pd.DataFrame({
@@ -283,7 +285,53 @@ def order_book_state(session: pd.DataFrame, now: float) -> pd.DataFrame:
                                       np.where(left > 0, pd.Series(left).map("{:.1f}s left".format).to_numpy(),
                                                "cancel pending"),
                                       np.where(out["status"].eq("UNCONFIRMED").to_numpy(), "UNCONFIRMED", "closed")))
-    return out.reset_index()[cols]
+    out = out.reset_index()
+    return apply_reconciliation(session, out)[cols]
+
+
+def _ids(session: pd.DataFrame, event: str, column: str) -> set[str]:
+    """All ids listed (scalar or list) in `column` of `event` rows."""
+    if column not in session.columns:
+        return set()
+    vals = session.loc[session["event"].eq(event), column].explode().dropna()
+    return set(vals.astype("string"))
+
+
+def apply_reconciliation(session: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
+    """Apply RESTORE / SETTLE / UNCONFIRMED_* ledger rows so exposure matches the engine's own ledger of record."""
+    settled_orders = _ids(session, "SETTLE", "released_order_ids")
+    settled_positions = _ids(session, "SETTLE", "released_position_ids")
+    not_filled = _ids(session, "UNCONFIRMED_RELEASED", "exchange_order_id")
+    resolved = session[session["event"].eq("UNCONFIRMED_RESOLVED")]
+    if not resolved.empty and not book.empty:
+        r = resolved.drop_duplicates("exchange_order_id", keep="last").set_index(
+            resolved["exchange_order_id"].astype("string"))
+        hit = book["order_id"].isin(r.index)
+        ids = book.loc[hit, "order_id"]
+        book.loc[hit, "contracts"] = pd.to_numeric(r.loc[ids, "filled"], errors="coerce").to_numpy()
+        book.loc[hit, "cost_usd"] = pd.to_numeric(r.loc[ids, "exposure_usd"], errors="coerce").to_numpy()
+        book.loc[hit, "exposure_usd"] = book.loc[hit, "cost_usd"]
+        book.loc[hit, "status"], book.loc[hit, "window"] = "RESOLVED", "closed"
+    if not book.empty:
+        gone = book["order_id"].isin(settled_orders)
+        book.loc[gone, ["exposure_usd"]] = 0.0
+        book.loc[gone, "status"], book.loc[gone, "window"] = "SETTLED", "closed"
+        nf = book["order_id"].isin(not_filled)
+        book.loc[nf, ["exposure_usd"]] = 0.0
+        book.loc[nf, "status"], book.loc[nf, "window"] = "NOT FILLED", "closed"
+    restores = session[session["event"].eq("RESTORE")]
+    if not restores.empty:
+        rid = _col(restores, "restore_id").astype("string")
+        cost = pd.to_numeric(_col(restores, "exposure_usd", 0.0), errors="coerce").fillna(0.0)
+        is_settled = rid.isin(settled_positions)
+        extra = pd.DataFrame({
+            "order_id": rid, "kind": "RESTORED", "outcome": _col(restores, "outcome_id").astype("string"),
+            "side": _col(restores, "side").astype("string"), "ts": restores["ts"].astype(float),
+            "reserved_usd": 0.0, "contracts": pd.to_numeric(_col(restores, "contracts", 0), errors="coerce").fillna(0),
+            "cost_usd": cost, "status": np.where(is_settled, "SETTLED", "RESTORED"),
+            "exposure_usd": np.where(is_settled, 0.0, cost), "window": "restored at sync"})
+        book = pd.concat([book, extra], ignore_index=True) if not book.empty else extra
+    return book
 
 
 def open_positions(book: pd.DataFrame) -> pd.DataFrame:
@@ -291,12 +339,13 @@ def open_positions(book: pd.DataFrame) -> pd.DataFrame:
     if book.empty:
         return pd.DataFrame(columns=["Game / Outcome ID", "Side", "Exchange Pool", "Contracts", "Entry Price",
                                      "Exposure $", "Taker Fill Window", "Status"])
-    rows = book[(book["contracts"] > 0) | book["status"].isin(["FILLING", "UNCONFIRMED"])]
+    rows = book[((book["contracts"] > 0) | book["status"].isin(["FILLING", "UNCONFIRMED", "RESTORED"]))
+                & ~book["status"].isin(["SETTLED", "NOT FILLED"])]
     entry = np.where(rows["contracts"] > 0, rows["cost_usd"] / rows["contracts"].where(rows["contracts"] > 0), np.nan)
     return pd.DataFrame({
         "Game / Outcome ID": rows["outcome"].fillna("?"),
-        "Side": rows["side"].fillna(rows["quote_side"] if "quote_side" in rows else "?"),
-        "Exchange Pool": "Novig (live)",
+        "Side": rows["side"].fillna(rows["quote_side"]) if "quote_side" in rows else rows["side"].fillna("?"),
+        "Exchange Pool": np.where(rows["status"].eq("RESTORED"), "Novig (restored)", "Novig (live)"),
         "Contracts": rows["contracts"].astype(int),
         "Entry Price": pd.Series(entry, index=rows.index).map(lambda v: "—" if np.isnan(v) else f"{v * 100:.1f}¢"),
         "Exposure $": rows["exposure_usd"].round(2),
@@ -314,13 +363,18 @@ def rolling_volume(ledger: pd.DataFrame, now: float, days: int = 30) -> float:
 
 
 def settled_curve(ledger: pd.DataFrame) -> pd.DataFrame:
-    """Cumulative settled net P&L from SETTLE events (empty if the engine wrote none)."""
-    if ledger.empty or not ledger["event"].eq("SETTLE").any() or "pnl_usd" not in ledger.columns:
-        return pd.DataFrame(columns=["time", "cum_pnl"])
+    """Cumulative settled net P&L from SETTLE rows (net_profit_usd; pnl_usd accepted). Empty if none."""
+    if ledger.empty or not ledger["event"].eq("SETTLE").any():
+        return pd.DataFrame(columns=["time", "cum_pnl", "capital", "unknown"])
     s = ledger[ledger["event"].eq("SETTLE")]
+    net = pd.to_numeric(_col(s, "net_profit_usd"), errors="coerce")
+    net = net.fillna(pd.to_numeric(_col(s, "pnl_usd"), errors="coerce"))
+    cum = net.fillna(0.0).cumsum()
+    pool = pd.to_numeric(_col(s, "resulting_capital_pool"), errors="coerce")
     return pd.DataFrame({"time": pd.to_datetime(s["ts"].astype(float), unit="s", utc=True)
                                  .dt.tz_convert(LOCAL_TZ).dt.tz_localize(None),
-                         "cum_pnl": pd.to_numeric(s["pnl_usd"], errors="coerce").fillna(0.0).cumsum()})
+                         "cum_pnl": cum, "capital": pool.fillna(BASELINE_CAPITAL_USD + cum),
+                         "unknown": net.isna()})
 
 
 def heartbeat(log: pd.DataFrame, now_local: datetime) -> dict:
@@ -346,16 +400,21 @@ def audit_feed(ledger: pd.DataFrame, log: pd.DataFrame, rows: int = AUDIT_ROWS) 
     if not ledger.empty:
         tail = ledger.tail(rows * 2)
         ev = tail["event"].astype("string")
+        net = pd.to_numeric(_col(tail, "net_profit_usd"), errors="coerce").map(
+            lambda v: "" if pd.isna(v) else f"net {v:+,.2f} USD")
         ids = _col(tail, "exchange_order_ids", None).map(lambda v: ",".join(map(str, v)) if isinstance(v, list) else "")
         pnl = pd.to_numeric(_col(tail, "pnl_usd"), errors="coerce").map(lambda v: "" if pd.isna(v) else f"{v:+,.2f} USD")
         detail = (_col(tail, "kind", "").fillna("").astype("string") + " " +
                   _col(tail, "exchange_order_id", "").fillna("").astype("string") + " " +
                   _col(tail, "order_id", "").fillna("").astype("string") + " " +
                   _col(tail, "status", "").fillna("").astype("string") + " " + ids.astype("string") + " " +
-                  pnl.astype("string") + " " +
+                  pnl.astype("string") + " " + net.astype("string") + " " +
+                  _col(tail, "outcome_id", "").fillna("").astype("string") + " " +
                   _col(tail, "reason", "").fillna("").astype("string")).str.replace(r"\s+", " ", regex=True).str.strip()
-        sev = np.select([ev.isin(["UNCONFIRMED", "REJECTED", "CANCEL_FAILED", "SCALE_UP_AUTHORIZED"]),
-                         ev.isin(["CANCEL", "CANARY_LIMITS"])], ["crimson", "amber"], default="normal")
+        sev = np.select([ev.isin(["UNCONFIRMED", "REJECTED", "CANCEL_FAILED", "SCALE_UP_AUTHORIZED", "SYNC_FAILED",
+                                  "POSITION_MISMATCH"]),
+                         ev.isin(["CANCEL", "CANARY_LIMITS", "RESTORE", "UNCONFIRMED_RELEASED",
+                                  "UNCONFIRMED_RESOLVED"])], ["crimson", "amber"], default="normal")
         parts.append(pd.DataFrame({
             # ledger ts is UTC epoch; engine-log ts is local wall time -> compare in local time
             "time": pd.to_datetime(tail["ts"].astype(float), unit="s", utc=True)
@@ -390,7 +449,9 @@ def snapshot(ledger: pd.DataFrame, log: pd.DataFrame, now: Optional[float] = Non
     curve = settled_curve(ledger)
     limits = active_limits(ledger)
     return {
-        "capital": BASELINE_CAPITAL_USD + (float(curve["cum_pnl"].iloc[-1]) if not curve.empty else 0.0),
+        # the engine's own running pool (resulting_capital_pool) is authoritative when present
+        "capital": float(curve["capital"].iloc[-1]) if not curve.empty else BASELINE_CAPITAL_USD,
+        "unknown_pnl_settlements": int(curve["unknown"].sum()) if not curve.empty else 0,
         "settled_pnl": float(curve["cum_pnl"].iloc[-1]) if not curve.empty else 0.0,
         "has_settlements": not curve.empty,
         "volume_30d": rolling_volume(ledger, now),
@@ -445,6 +506,8 @@ def render(st, go, state: dict) -> None:
     c1, c2, c3, c4 = st.columns(4)
     cap_sub = (f"baseline $100,000 {state['settled_pnl']:+,.2f} settled" if state["has_settlements"]
                else "baseline $100,000 · no SETTLE events in ledger yet")
+    if state["unknown_pnl_settlements"]:
+        cap_sub += f" · ⚠ {state['unknown_pnl_settlements']} settlement(s) with unknown P&L"
     c1.markdown(kpi("Active Capital State", f"${state['capital']:,.2f}", cap_sub), unsafe_allow_html=True)
     c2.markdown(kpi("30-Day Filled Volume", f"${state['volume_30d']:,.2f}", "sum of filled contracts × price"),
                 unsafe_allow_html=True)
