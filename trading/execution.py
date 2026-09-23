@@ -12,6 +12,13 @@ PIPELINE (one call to `evaluate_market_edge`):
     5. Apply the HARD SAFETY CEILING: never more than $1,000 on one position,
        regardless of what Kelly says.
 
+GLOBAL EXPOSURE KILL-SWITCH (ExposureMonitor, bottom of this file)
+    Tracks every open, un-settled position. A NEW TAKER order is refused if it
+    would take total open exposure above $15,000 (15% of bankroll); once
+    exposure reaches $15,000 all new taker orders halt until positions settle.
+    It only gates taker orders: it never blocks cancelling resting (maker)
+    orders, because cancelling only ever reduces risk.
+
 KEY FORMULAS
     American -> decimal:  +150 -> 2.50      -150 -> 1.6667
     Multiplicative de-vig for a two-way market with decimal odds d1, d2:
@@ -40,6 +47,7 @@ BANKROLL_USD = 100_000.00        # static capital pool used for sizing
 KELLY_FRACTION = 0.25            # 1/4 Kelly
 MIN_EDGE = 0.025                 # act only when EV per $1 is STRICTLY above 2.5%
 MAX_STAKE_USD = 1_000.00         # ABSOLUTE ceiling per position (1% of bankroll)
+GLOBAL_EXPOSURE_LIMIT_USD = 15_000.00  # max total open (un-settled) exposure (15% of bankroll)
 SUSPICIOUS_EDGE = 0.20           # edges above this are usually bad data; flagged in the log
 _EDGE_EPSILON = 1e-9             # absorbs floating-point noise at the 2.5% boundary
 
@@ -126,6 +134,12 @@ def _floor_cents(x: float) -> float:
     return math.floor(x * 100 + 1e-9) / 100.0
 
 
+def _whole_contracts(stake: float, price: float) -> int:
+    """Whole contracts affordable with `stake`. (Plain `stake // price` gives 1000 // 0.40 = 2499.)"""
+    n = math.floor(stake / price + 1e-9)
+    return n - 1 if n * price > stake + 0.005 else n
+
+
 # --------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------
@@ -180,7 +194,89 @@ async def evaluate_market_edge(
         kelly_stake_usd=round(kelly_stake, 2),
         stake_usd=stake,
         capped=capped,
-        contracts=int(stake // price),
+        contracts=_whole_contracts(stake, price),
         suspicious=suspicious,
         **base,
     )
+
+
+# --------------------------------------------------------------------------
+# Global exposure kill-switch
+# --------------------------------------------------------------------------
+class ExposureLimitError(RuntimeError):
+    """Raised if code tries to record a position that would breach the global limit."""
+
+
+class ExposureMonitor:
+    """
+    Tracks open, un-settled positions and gates NEW TAKER orders.
+
+        ok, reason = monitor.check_taker(stake)   # ask before sending a taker order
+        monitor.record_open(position_id, stake)   # after it is placed (re-checks!)
+        monitor.settle(position_id)               # when the market settles -> exposure released
+
+    Maker-order cancellation is deliberately NOT gated: `allows_cancellation()`
+    is always True, even while the kill-switch is engaged.
+    """
+
+    def __init__(self, limit_usd: float = GLOBAL_EXPOSURE_LIMIT_USD) -> None:
+        self.limit = limit_usd
+        self._open: dict[str, float] = {}
+        self._was_halted = False
+
+    @property
+    def open_exposure(self) -> float:
+        return round(sum(self._open.values()), 2)
+
+    @property
+    def headroom(self) -> float:
+        return round(max(0.0, self.limit - self.open_exposure), 2)
+
+    @property
+    def taker_halted(self) -> bool:
+        return self.open_exposure >= self.limit - 1e-9
+
+    def open_positions(self) -> dict[str, float]:
+        return dict(self._open)
+
+    def check_taker(self, stake_usd: float) -> tuple[bool, str]:
+        """May a new taker order of this size be sent right now?"""
+        if not math.isfinite(stake_usd) or stake_usd <= 0:
+            return False, f"invalid stake {stake_usd!r}"
+        if self.taker_halted:
+            return False, (f"KILL_SWITCH engaged: open exposure ${self.open_exposure:,.2f} "
+                           f">= ${self.limit:,.2f}; new taker orders halted")
+        if self.open_exposure + stake_usd > self.limit + 1e-9:
+            return False, (f"KILL_SWITCH: ${stake_usd:,.2f} would lift exposure to "
+                           f"${self.open_exposure + stake_usd:,.2f} > ${self.limit:,.2f} (headroom ${self.headroom:,.2f})")
+        return True, "ok"
+
+    def record_open(self, position_id: str, stake_usd: float) -> None:
+        ok, reason = self.check_taker(stake_usd)
+        if not ok:
+            raise ExposureLimitError(reason)
+        if position_id in self._open:
+            raise ValueError(f"position {position_id} already open")
+        self._open[position_id] = stake_usd
+        self._log_transition()
+
+    def settle(self, position_id: str) -> float:
+        """Release a settled position's exposure. Returns the amount released (0 if unknown)."""
+        released = self._open.pop(position_id, 0.0)
+        self._log_transition()
+        return released
+
+    @staticmethod
+    def allows_cancellation() -> bool:
+        """Cancelling resting maker orders is always allowed: it can only reduce risk."""
+        return True
+
+    def _log_transition(self) -> None:
+        halted = self.taker_halted
+        if halted and not self._was_halted:
+            log.warning("KILL_SWITCH ENGAGED open exposure $%.2f >= $%.2f: new taker orders halted "
+                        "(maker cancellations still allowed)", self.open_exposure, self.limit)
+        elif self._was_halted and not halted:
+            log.warning("KILL_SWITCH RELEASED open exposure $%.2f < $%.2f: taker orders resume",
+                        self.open_exposure, self.limit)
+        self._was_halted = halted

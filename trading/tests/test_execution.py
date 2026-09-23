@@ -5,6 +5,7 @@ Every expected number below is derived by hand in the comments, so the test
 is an independent check of the formulas — not the code checking itself.
 """
 
+import logging
 import math
 
 import pytest
@@ -143,6 +144,14 @@ async def test_bad_inputs_never_raise(novig, sharp):
 
 
 # ---------------------------------------------------------------- the ceiling itself
+def test_whole_contracts_is_float_safe():
+    from execution import _whole_contracts
+    assert 1000 // 0.40 == 2499.0                       # the floating-point trap this guards against
+    assert _whole_contracts(1000.0, 0.40) == 2500
+    assert _whole_contracts(999.99, 0.40) == 2499
+    assert _whole_contracts(1000.0, 0.49) == 2040
+
+
 @pytest.mark.parametrize("raw,expected,capped", [
     (500.0, 500.0, False), (1000.0, 1000.0, False), (1000.01, 1000.0, True),
     (1e12, 1000.0, True), (float("inf"), 0.0, False), (float("nan"), 0.0, False), (-50.0, 0.0, False),
@@ -160,3 +169,69 @@ async def test_cap_holds_across_a_sweep_of_prices():
             worst = max(worst, d.stake_usd)
     assert worst == MAX_STAKE_USD
     assert execution.MAX_STAKE_USD == 0.01 * execution.BANKROLL_USD
+
+
+# ---------------------------------------------------------------- global exposure kill-switch
+from execution import GLOBAL_EXPOSURE_LIMIT_USD, ExposureLimitError, ExposureMonitor  # noqa: E402
+
+
+def test_exposure_limit_is_15_percent_of_bankroll():
+    assert GLOBAL_EXPOSURE_LIMIT_USD == 15_000.00 == 0.15 * execution.BANKROLL_USD
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def test_kill_switch_engages_at_15000_and_releases_on_settlement():
+    # Attach directly: the engine's 'trading' logger does not propagate to pytest's capture.
+    cap = _Capture()
+    logging.getLogger("trading.execution").addHandler(cap)
+    m = ExposureMonitor()
+    for i in range(15):                                   # 15 x $1,000 max-size positions
+        assert m.check_taker(1000.0) == (True, "ok")
+        m.record_open(f"p{i}", 1000.0)
+    assert m.open_exposure == 15_000.0 and m.taker_halted
+    ok, reason = m.check_taker(0.01)                      # even one cent is refused
+    assert not ok and "KILL_SWITCH engaged" in reason
+    assert m.allows_cancellation() is True                # maker cancels never blocked
+    assert m.settle("p0") == 1000.0
+    assert not m.taker_halted and m.check_taker(1000.0)[0]
+    logging.getLogger("trading.execution").removeHandler(cap)
+    msgs = cap.messages
+    assert any("KILL_SWITCH ENGAGED" in x for x in msgs) and any("KILL_SWITCH RELEASED" in x for x in msgs)
+
+
+def test_order_that_would_breach_is_refused_without_halting():
+    m = ExposureMonitor()
+    for i in range(14):
+        m.record_open(f"p{i}", 1000.0)
+    m.record_open("p14", 600.0)                           # $14,600 open, $400 headroom
+    ok, reason = m.check_taker(1000.0)
+    assert not ok and "would lift exposure to $15,600.00" in reason
+    assert m.check_taker(400.0) == (True, "ok")           # exactly to the limit is allowed
+    assert not m.taker_halted
+
+
+def test_record_open_rechecks_limit_as_last_line_of_defence():
+    m = ExposureMonitor(limit_usd=1500)
+    m.record_open("a", 1000)
+    with pytest.raises(ExposureLimitError):
+        m.record_open("b", 1000)                          # caller "forgot" check_taker
+    assert m.open_exposure == 1000
+    with pytest.raises(ValueError):
+        m.record_open("a", 100)                           # duplicate id
+
+
+@pytest.mark.parametrize("bad", [0, -5, float("nan"), float("inf")])
+def test_kill_switch_rejects_invalid_stakes(bad):
+    assert ExposureMonitor().check_taker(bad)[0] is False
+
+
+def test_settling_unknown_position_is_harmless():
+    assert ExposureMonitor().settle("nope") == 0.0

@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy to sharp_provider.json, fill in your provider's URL and field names, set SHARP_API_KEY in the environment. Paths are dotted (e.g. 'teams.home').",
+  "url": "https://YOUR-PROVIDER.example/v1/odds?leagues=NBA,NFL",
+  "headers": {"Authorization": "Bearer ${SHARP_API_KEY}"},
+  "list_path": "data",
+  "fields": {
+    "league": "league",
+    "home_team": "home_team",
+    "away_team": "away_team",
+    "market_type": "market",
+    "side": "selection",
+    "odds_for": "price",
+    "odds_against": "opposing_price",
+    "line": "points",
+    "updated_at": "last_updated"
+  },
+  "constants": {"source": "pinnacle"},
+  "odds_format": "american",
+  "timestamp_format": "iso",
+  "timeout_seconds": 5.0
+}

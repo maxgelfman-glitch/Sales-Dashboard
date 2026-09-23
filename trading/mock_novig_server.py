@@ -2,7 +2,7 @@
 mock_novig_server.py — A local fake of Novig's WebSocket tape, for tests and simulation.
 
 It lets us rehearse the ugly real-world cases safely:
-    * broadcast(msg)       push a price update to every connected client
+    * broadcast(msg)       push ticks to every connected client
     * drop_all_clients()   HARSH drop: kill the TCP connection with no close frame
     * silent = True        keep sockets open but stop sending (half-dead stream)
     * required_token       reject handshakes without the right bearer token (HTTP 401)
@@ -28,6 +28,7 @@ class MockNovigServer:
         self.clients: set[ServerConnection] = set()
         self.connection_count = 0
         self.auth_headers_seen: list[Optional[str]] = []
+        self.received: list[str] = []   # messages clients sent us (e.g. subscriptions)
         self.silent = False
         self._server: Optional[Server] = None
 
@@ -58,7 +59,10 @@ class MockNovigServer:
         self.clients.add(ws)
         self.connection_count += 1
         try:
-            await ws.wait_closed()
+            async for msg in ws:
+                self.received.append(msg)
+        except Exception:  # noqa: BLE001 — aborted connections end here
+            pass
         finally:
             self.clients.discard(ws)
 
@@ -91,21 +95,23 @@ class MockNovigServer:
         await asyncio.wait_for(_poll(), timeout)
 
 
-def make_update(
-    event_id: str = "NBA-20260923-BOS-NYK",
-    league: str = "NBA",
-    market_type: str = "moneyline",
-    home_team: str = "New York Knicks",
-    away_team: str = "Boston Celtics",
-    outcome: str = "New York Knicks",
-    price: float = 0.50,
-    line: Optional[float] = None,
-) -> dict[str, Any]:
-    """Build one tape message in the (assumed) Novig schema."""
-    msg = {
-        "league": league, "market_type": market_type, "event_id": event_id,
-        "home_team": home_team, "away_team": away_team, "outcome": outcome, "price": price,
-    }
+# ---------------------------------------------------------------- message builders
+def make_tick(market_id: str = "M-NYK-ML", price_cents: float = 50, side: str = "sell",
+              volume: float = 5000, action: Optional[str] = None) -> dict[str, Any]:
+    """One tape tick. With action=None it is a level snapshot (sets the volume)."""
+    tick = {"market_id": market_id, "price_cents": price_cents, "side": side, "volume": volume}
+    if action is not None:
+        tick["action"] = action
+    return tick
+
+
+def make_market(market_id: str = "M-NYK-ML", event_id: str = "NBA-BOS-NYK", league: str = "NBA",
+                market_type: str = "moneyline", home_team: str = "New York Knicks",
+                away_team: str = "Boston Celtics", outcome: str = "New York Knicks",
+                line: Optional[float] = None) -> dict[str, Any]:
+    """Registry metadata for one market_id."""
+    m = dict(market_id=market_id, event_id=event_id, league=league, market_type=market_type,
+             home_team=home_team, away_team=away_team, outcome=outcome)
     if line is not None:
-        msg["line"] = line
-    return msg
+        m["line"] = line
+    return m
