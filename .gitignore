@@ -14,3 +14,5 @@ __pycache__/
 .pytest_cache/
 .env
 trading/config/sharp_provider.json
+*.pem
+*.key

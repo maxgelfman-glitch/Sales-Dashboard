@@ -3,5 +3,6 @@
 websockets>=13.0      # async WebSocket client/server (we use the modern websockets.asyncio API)
 aiohttp>=3.9          # async HTTP client for REST polls of sharp-book feeds
 pydantic>=2.0         # typed, validated data models for every payload
+cryptography>=42      # RSA-PSS request signing for Kalshi (older OS-bundled builds can crash on import)
 pytest>=8.0           # test runner
 pytest-asyncio>=0.23  # lets pytest run `async def` tests

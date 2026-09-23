@@ -1,48 +1,28 @@
 """
-novig_feed.py — Real-time market ingestion engine for the Novig exchange.
+novig_feed.py — Real-time Novig tape ingestion.
 
 WHAT THIS MODULE DOES
-    1. Opens a WebSocket connection to Novig's tape (QA/staging by default).
-    2. Authenticates with the bearer token in the NOVIG_BEARER_TOKEN env var.
-    3. Parses order-book ticks (market_id, price_cents, side, volume), keeps a
-       live order book per market, and reports the price WE could buy at
-       (the best ask) whenever it changes.
-    4. Survives any connection failure: logs the error, wipes all local books
-       and prices (so we never trade on stale data), waits a short cool-off
-       and reconnects — forever, without crashing the parent process.
+    1. Connects to Novig's tape (QA by default) with the NOVIG_BEARER_TOKEN.
+    2. Immediately sends the subscription payload {"event": "subscribe", "data": "tape"}.
+    3. Parses tape ticks keyed by outcomeId (outcomeId, price_cents, side, volume),
+       keeps a live order book per outcome, and reports the best ask (what we
+       can buy at) and best bid (what we can sell at) whenever either changes.
+    4. Reconnect / heartbeat / watchdog behaviour comes from ws_base.py.
 
-WHAT IS VERIFIED vs ASSUMED
-    Verified from docs.novig.com (via search; the docs site itself is not
-    reachable from the build sandbox):
-        * QA URL   wss://api-qa.novig.us/tape      (default here)
-        * PROD URL wss://api.novig.com/tape        (NOVIG_PROD_WS_URL; opt-in only)
-        * public order-book ticks are PLACE / CANCEL events
-        * the server pings every 15s and disconnects clients that miss a pong
-          (the websockets library answers pings automatically)
-    ASSUMED — confirm against the docs before trading real money:
-        * tick field names: market_id, price_cents, side ("buy"/"sell"), volume,
-          plus an optional action field (PLACE / CANCEL / FILL / TRADE)
-        * `volume` on PLACE/CANCEL/FILL is a change in contracts at that price;
-          a tick with no action is a snapshot that SETS the level's volume
-        * one market_id = one outcome contract paying $1 if it wins
-        * no subscription message is required (pass `subscribe_messages` if it is)
-        * ticks do not carry team/league info, so market metadata comes from
-          a MarketRegistry (loaded from Novig's REST markets endpoint or a file)
-    Every assumption lives in TapeTick / OrderBook.apply / parse_message below.
+NOVIG DATA MODEL (per the brief and docs.novig.com)
+    Event (a game) -> Markets -> exactly two mutually exclusive Outcomes (outcomeId).
+    Orders and ticks reference outcomeIds. The MarketRegistry below mirrors this:
+    every outcome knows its market and its SIBLING outcome (the other side).
+    The registry is filled at startup by the REST bootstrap (novig_rest.py).
 
-HEALTH CHECKS ("heartbeat")
-    * Protocol ping/pong in both directions (ours every PING_INTERVAL_SECONDS).
-    * Stale-stream watchdog: no message for STALE_STREAM_SECONDS => reconnect.
-    * Heartbeat log line with measured latency every PING_INTERVAL_SECONDS.
-
-RECOVERY GUARANTEE
-    The next handshake starts RECONNECT_DELAY_SECONDS (2.5s) after a drop, so a
-    healthy server is reconnected inside the 3-second budget (tests/test_feed.py).
-
-Run standalone (connects to QA, prints best-ask moves for registered markets):
-    export NOVIG_BEARER_TOKEN=...          # never commit this value
-    export NOVIG_MARKETS_FILE=markets.json # optional market metadata
-    python novig_feed.py
+VERIFIED vs ASSUMED
+    Verified (brief + docs search): URLs, subscription payload, outcomeId model,
+        tick fields outcomeId / price_cents / side / volume, 15s server pings.
+    ASSUMED (docs.novig.com is unreachable from the build sandbox):
+        * envelope shape {"event"|"type": ..., "data": tick | [ticks]}
+        * optional per-tick action PLACE / CANCEL / FILL / TRADE; `volume` is a
+          change in contracts for PLACE/CANCEL/FILL, a level snapshot when absent
+    All assumptions live in TapeTick, OrderBook.apply and parse_message.
 """
 
 from __future__ import annotations
@@ -54,56 +34,63 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Literal, Optional, Union
-from urllib.parse import urlparse
 
 from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
-from websockets.asyncio.client import connect
 
-# --------------------------------------------------------------------------
-# Configuration constants (change here, not deep in the code)
-# --------------------------------------------------------------------------
+from ws_base import (  # re-exported: tests and callers use novig_feed.RECONNECT_DELAY_SECONDS etc.
+    OPEN_TIMEOUT_SECONDS,
+    PING_INTERVAL_SECONDS,
+    PING_TIMEOUT_SECONDS,
+    RECONNECT_DELAY_SECONDS,
+    STALE_STREAM_SECONDS,
+    ResilientWebSocketFeed,
+    StaleStreamError,
+    StateCallback,
+    safe_call,
+)
+
+__all__ = ["RECONNECT_DELAY_SECONDS", "StaleStreamError", "NovigFeed", "MarketRegistry", "MarketInfo",
+           "MarketUpdate", "NovigMarketUpdate", "OrderBook", "TapeTick", "parse_message"]
+
 DEFAULT_NOVIG_WS_URL = "wss://api-qa.novig.us/tape"  # QA / staging — safe default
 NOVIG_PROD_WS_URL = "wss://api.novig.com/tape"       # production — use deliberately
 TOKEN_ENV_VAR = "NOVIG_BEARER_TOKEN"
-
-RECONNECT_DELAY_SECONDS = 2.5   # cool-off before a re-handshake (keeps recovery < 3s)
-PING_INTERVAL_SECONDS = 10.0    # our pings (Novig's server also pings us every 15s)
-PING_TIMEOUT_SECONDS = 10.0     # how long we wait for a pong before declaring death
-STALE_STREAM_SECONDS = 30.0     # no messages for this long => reconnect
-OPEN_TIMEOUT_SECONDS = 10.0     # max time allowed for the handshake itself
+SUBSCRIBE_PAYLOAD = {"event": "subscribe", "data": "tape"}
 
 TRACKED_LEAGUES = frozenset({"NFL", "NBA"})
-
-# Every spelling we accept for a market type, mapped to our three canonical names.
 MARKET_TYPE_ALIASES = {
-    "spread": "spread", "point_spread": "spread", "pointspread": "spread",
-    "handicap": "spread", "ats": "spread",
-    "moneyline": "moneyline", "money_line": "moneyline", "ml": "moneyline",
-    "h2h": "moneyline", "winner": "moneyline",
-    "total": "total", "totals": "total", "game_total": "total",
-    "over_under": "total", "ou": "total",
+    "spread": "spread", "point_spread": "spread", "pointspread": "spread", "handicap": "spread", "ats": "spread",
+    "moneyline": "moneyline", "money_line": "moneyline", "ml": "moneyline", "h2h": "moneyline",
+    "winner": "moneyline", "game_winner": "moneyline",
+    "total": "total", "totals": "total", "game_total": "total", "over_under": "total", "ou": "total",
 }
 
 ADD_ACTIONS = {"PLACE", "ADD", "NEW"}
 REMOVE_ACTIONS = {"CANCEL", "FILL", "REMOVE", "DELETE"}
-PRINT_ACTIONS = {"TRADE", "MATCH"}  # informational trade prints: do not change resting volume
+PRINT_ACTIONS = {"TRADE", "MATCH"}
+KNOWN_ACTIONS = ADD_ACTIONS | REMOVE_ACTIONS | PRINT_ACTIONS
 
 log = logging.getLogger("trading.feed")
+
+
+def canonical_market_type(v: str) -> str:
+    key = v.strip().lower().replace(" ", "_").replace("-", "_")
+    return MARKET_TYPE_ALIASES.get(key, key)
 
 
 # --------------------------------------------------------------------------
 # Data models
 # --------------------------------------------------------------------------
 class TapeTick(BaseModel):
-    """One order-book tick from the Novig tape (field names per the brief; see ASSUMED above)."""
+    """One tape tick for one outcome."""
 
-    market_id: str = Field(validation_alias=AliasChoices("market_id", "marketId"))
+    outcome_id: str = Field(validation_alias=AliasChoices("outcomeId", "outcome_id"))
     price_cents: float = Field(validation_alias=AliasChoices("price_cents", "priceCents"))
     side: Literal["buy", "sell"]
     volume: float = Field(ge=0)
-    action: Optional[str] = Field(default=None, validation_alias=AliasChoices("action", "type", "event"))
+    action: Optional[str] = Field(default=None, validation_alias=AliasChoices("action", "type"))
 
-    @field_validator("market_id", mode="before")
+    @field_validator("outcome_id", mode="before")
     @classmethod
     def _id_to_str(cls, v: Any) -> Any:
         return str(v) if isinstance(v, int) else v
@@ -127,18 +114,21 @@ class TapeTick(BaseModel):
 
 
 class MarketInfo(BaseModel):
-    """Metadata for one market_id (one outcome contract). Ticks do not carry this."""
+    """Metadata for one tradable outcome on one venue."""
 
-    market_id: str
+    venue: str = "novig"
+    outcome_id: str                           # Novig outcomeId / Kalshi market ticker
+    market_id: str = ""                       # Novig marketId (holds exactly two outcomes)
+    sibling_outcome_id: Optional[str] = None  # the other outcome of the same market
     league: str
     market_type: str
     event_id: str
     home_team: str
     away_team: str
-    outcome: str                   # team name, or "over"/"under"
-    line: Optional[float] = None   # spread/total points; None for moneylines
+    outcome: str                              # team name, or "over"/"under"
+    line: Optional[float] = None              # this outcome's spread, or the total
 
-    @field_validator("market_id", mode="before")
+    @field_validator("outcome_id", "market_id", "event_id", mode="before")
     @classmethod
     def _id_to_str(cls, v: Any) -> Any:
         return str(v) if isinstance(v, int) else v
@@ -151,17 +141,19 @@ class MarketInfo(BaseModel):
     @field_validator("market_type")
     @classmethod
     def _canonical_market(cls, v: str) -> str:
-        key = v.strip().lower().replace(" ", "_").replace("-", "_")
-        return MARKET_TYPE_ALIASES.get(key, key)
+        return canonical_market_type(v)
 
     def is_tracked(self) -> bool:
         return self.league in TRACKED_LEAGUES and self.market_type in {"spread", "moneyline", "total"}
 
 
-class NovigMarketUpdate(BaseModel):
-    """What the rest of the engine sees: the best price we could BUY this contract at."""
+class MarketUpdate(BaseModel):
+    """What the engine sees for one outcome on one venue: top of book."""
 
-    market_id: str
+    venue: str = "novig"
+    outcome_id: str
+    market_id: str = ""
+    sibling_outcome_id: Optional[str] = None
     league: str
     market_type: str
     event_id: str
@@ -169,20 +161,25 @@ class NovigMarketUpdate(BaseModel):
     away_team: str
     outcome: str
     line: Optional[float] = None
-    price: float = Field(gt=0, lt=1)      # best ask in dollars per $1 payout (= implied probability)
-    available_volume: float = 0.0         # contracts resting at that best ask
+    price: Optional[float] = Field(default=None, gt=0, lt=1)  # best ask ($ per $1 payout); None = nothing to buy
+    available_volume: float = 0.0                             # contracts at the best ask
+    best_bid: Optional[float] = Field(default=None, gt=0, lt=1)
+    bid_volume: float = 0.0
     received_at: float = Field(default_factory=time.time)
 
-    @property
-    def market_key(self) -> str:
-        return self.market_id
+    @classmethod
+    def from_info(cls, info: MarketInfo, **top_of_book: Any) -> "MarketUpdate":
+        return cls(**info.model_dump(), **top_of_book)
+
+
+NovigMarketUpdate = MarketUpdate  # backwards-compatible name
 
 
 class MarketRegistry:
-    """market_id -> MarketInfo. Only tracked NFL/NBA spreads, moneylines and totals are kept."""
+    """outcome_id -> MarketInfo. Only tracked NFL/NBA spreads, moneylines and totals are kept."""
 
     def __init__(self, markets: Iterable[Union[MarketInfo, dict]] = ()) -> None:
-        self._markets: dict[str, MarketInfo] = {}
+        self._outcomes: dict[str, MarketInfo] = {}
         for m in markets:
             self.register(m)
 
@@ -190,27 +187,40 @@ class MarketRegistry:
         try:
             info = market if isinstance(market, MarketInfo) else MarketInfo.model_validate(market)
         except ValidationError as exc:
-            log.warning("REGISTRY invalid market skipped (%d errors): %s", exc.error_count(), market)
+            log.warning("REGISTRY invalid outcome skipped (%d errors): %s", exc.error_count(), market)
             return False
         if not info.is_tracked():
             return False
-        self._markets[info.market_id] = info
+        self._outcomes[info.outcome_id] = info
         return True
 
-    def get(self, market_id: str) -> Optional[MarketInfo]:
-        return self._markets.get(market_id)
+    def replace_all(self, markets: Iterable[Union[MarketInfo, dict]]) -> int:
+        """Atomically swap in a fresh snapshot (used by the periodic REST bootstrap)."""
+        fresh = MarketRegistry(markets)
+        self._outcomes = fresh._outcomes
+        return len(self._outcomes)
+
+    def get(self, outcome_id: str) -> Optional[MarketInfo]:
+        return self._outcomes.get(outcome_id)
+
+    def sibling(self, outcome_id: str) -> Optional[MarketInfo]:
+        info = self.get(outcome_id)
+        return self.get(info.sibling_outcome_id) if info and info.sibling_outcome_id else None
+
+    def all(self) -> list[MarketInfo]:
+        return list(self._outcomes.values())
 
     def __len__(self) -> int:
-        return len(self._markets)
+        return len(self._outcomes)
 
     @classmethod
     def from_json_file(cls, path: Union[str, Path]) -> "MarketRegistry":
         data = json.loads(Path(path).read_text())
-        return cls(data if isinstance(data, list) else data.get("markets", []))
+        return cls(data if isinstance(data, list) else data.get("outcomes", []))
 
 
 class OrderBook:
-    """Resting volume by price (in cents) for one market. 'sell' orders are what we can buy from."""
+    """Resting volume by price (cents) for one outcome."""
 
     def __init__(self) -> None:
         self.bids: dict[float, float] = {}   # buy orders:  price_cents -> contracts
@@ -227,7 +237,7 @@ class OrderBook:
             new = current + tick.volume
         elif tick.action in REMOVE_ACTIONS:
             new = current - tick.volume
-        else:  # no/unknown action: treat as a snapshot of the level
+        else:
             new = tick.volume
         if new > 1e-9:
             levels[tick.price_cents] = new
@@ -235,7 +245,6 @@ class OrderBook:
             levels.pop(tick.price_cents, None)
 
     def best_ask(self) -> Optional[tuple[float, float]]:
-        """(price_cents, volume) of the cheapest resting sell order, or None."""
         if not self.asks:
             return None
         p = min(self.asks)
@@ -250,11 +259,10 @@ class OrderBook:
 
 def parse_message(raw: Union[str, bytes]) -> list[TapeTick]:
     """
-    Turn one raw WebSocket message into a list of TapeTicks.
-
-    Accepts a single tick, a list of ticks, or an envelope like
-    {"type": "PLACE", "data": [...]}; an envelope's type becomes the action of
-    ticks that do not carry their own. Never raises: bad input is logged and skipped.
+    Turn one raw message into TapeTicks. Accepts a tick, a list of ticks, or an
+    envelope {"event"|"type": ..., "data": tick | [ticks]}. An envelope value that
+    is a known action (PLACE/CANCEL/...) is applied to ticks without their own.
+    Control messages (e.g. subscription acks) yield nothing. Never raises.
     """
     try:
         payload = json.loads(raw)
@@ -264,7 +272,11 @@ def parse_message(raw: Union[str, bytes]) -> list[TapeTick]:
 
     envelope_action = None
     if isinstance(payload, dict) and isinstance(payload.get("data"), (list, dict)):
-        envelope_action = payload.get("type") or payload.get("action")
+        for key in ("action", "type", "event"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.upper() in KNOWN_ACTIONS:
+                envelope_action = value.upper()
+                break
         payload = payload["data"]
     items = payload if isinstance(payload, list) else [payload]
 
@@ -272,7 +284,7 @@ def parse_message(raw: Union[str, bytes]) -> list[TapeTick]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        if envelope_action and not any(k in item for k in ("action", "type", "event")):
+        if envelope_action and "action" not in item and "type" not in item:
             item = {**item, "action": envelope_action}
         try:
             ticks.append(TapeTick.model_validate(item))
@@ -281,32 +293,16 @@ def parse_message(raw: Union[str, bytes]) -> list[TapeTick]:
     return ticks
 
 
-# --------------------------------------------------------------------------
-# The feed client
-# --------------------------------------------------------------------------
-UpdateCallback = Callable[[NovigMarketUpdate, Optional[NovigMarketUpdate]], Union[None, Awaitable[None]]]
-StateCallback = Callable[[str, dict], Union[None, Awaitable[None]]]
+UpdateCallback = Callable[[MarketUpdate, Optional[MarketUpdate]], Union[None, Awaitable[None]]]
 
 
-class StaleStreamError(Exception):
-    """Raised when the socket is open but silent for too long."""
-
-
-class NovigFeed:
+class NovigFeed(ResilientWebSocketFeed):
     """
-    Long-running, self-healing WebSocket client.
-
-    Usage:
-        feed = NovigFeed(registry=MarketRegistry([...]), on_update=my_handler)
-        task = asyncio.create_task(feed.run())
-        ...
-        await feed.stop()
-
-    on_update(update, previous) fires whenever the best ask (price or volume)
-        of a registered market changes. `previous` is None the first time.
-    on_state_change(state, details) fires on CONNECTING / CONNECTED /
-        DISCONNECTED / STOPPED transitions.
+    on_update(update, previous) fires whenever the top of book (best ask or
+    best bid, price or volume) of a registered outcome changes.
     """
+
+    venue = "novig"
 
     def __init__(
         self,
@@ -315,220 +311,90 @@ class NovigFeed:
         registry: Optional[MarketRegistry] = None,
         on_update: Optional[UpdateCallback] = None,
         on_state_change: Optional[StateCallback] = None,
-        subscribe_messages: Iterable[dict] = (),
+        subscribe_messages: Optional[Iterable[dict]] = None,
         reconnect_delay: float = RECONNECT_DELAY_SECONDS,
         ping_interval: float = PING_INTERVAL_SECONDS,
         ping_timeout: float = PING_TIMEOUT_SECONDS,
         stale_after: float = STALE_STREAM_SECONDS,
         open_timeout: float = OPEN_TIMEOUT_SECONDS,
     ) -> None:
-        self.url = url or DEFAULT_NOVIG_WS_URL
+        super().__init__(url or DEFAULT_NOVIG_WS_URL, on_state_change, reconnect_delay, ping_interval,
+                         ping_timeout, stale_after, open_timeout, logger=log)
         self._token = token if token is not None else os.environ.get(TOKEN_ENV_VAR)
         self.registry = registry if registry is not None else MarketRegistry()
         self.on_update = on_update
-        self.on_state_change = on_state_change
-        self.subscribe_messages = list(subscribe_messages)
-        self.reconnect_delay = reconnect_delay
-        self.ping_interval = ping_interval
-        self.ping_timeout = ping_timeout
-        self.stale_after = stale_after
-        self.open_timeout = open_timeout
-
-        # Local memory. Both are wiped on every drop.
+        self.subscribe_messages = [SUBSCRIBE_PAYLOAD] if subscribe_messages is None else list(subscribe_messages)
         self.books: dict[str, OrderBook] = {}
-        self.latest: dict[str, NovigMarketUpdate] = {}   # last reported best ask per market_id
-
-        # Observability counters (read by tests and the supervisor).
-        self.connected = asyncio.Event()
-        self.connect_count = 0
-        self.disconnect_count = 0
-        self.messages_received = 0
-        self.last_recovery_seconds: Optional[float] = None
-
-        self._unknown_markets: set[str] = set()
-        self._stopping = False
-        self._ws = None
-        self._dropped_at: Optional[float] = None
-
-    # ---------------- public API ----------------
-    async def run(self) -> None:
-        """Connect, stream, and reconnect forever until stop() is called."""
+        self.latest: dict[str, MarketUpdate] = {}
+        self._unknown: set[str] = set()
         if not self._token:
             log.warning("CONN no %s set; connecting WITHOUT authentication (only valid for mocks)", TOKEN_ENV_VAR)
-        while not self._stopping:
-            try:
-                await self._session()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — by design: nothing may kill the loop
-                if self._stopping:
-                    break
-                self._handle_drop(exc)
-            else:
-                if self._stopping:
-                    break
-                self._handle_drop(ConnectionError("server closed the stream"))
-            if self._stopping:
-                break
-            log.info("CONN reconnecting in %.1fs", self.reconnect_delay)
-            await asyncio.sleep(self.reconnect_delay)
-        self.connected.clear()
-        await self._emit_state("STOPPED", {})
-        log.info("CONN feed stopped")
 
-    async def stop(self) -> None:
-        """Ask the feed to shut down cleanly."""
-        self._stopping = True
-        if self._ws is not None:
-            await self._ws.close()
+    def _headers(self) -> Optional[dict[str, str]]:
+        return {"Authorization": f"Bearer {self._token}"} if self._token else None
 
-    # ---------------- internals ----------------
-    def _connect_kwargs(self) -> dict[str, Any]:
-        headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
-        host = urlparse(self.url).hostname or ""
-        is_local = host in {"localhost", "127.0.0.1", "::1"}
-        return dict(
-            additional_headers=headers,
-            ping_interval=self.ping_interval,
-            ping_timeout=self.ping_timeout,
-            open_timeout=self.open_timeout,
-            # Never route local mock traffic through a corporate/sandbox proxy.
-            proxy=None if is_local else True,
-        )
+    async def _on_open(self, ws) -> None:
+        for msg in self.subscribe_messages:
+            await ws.send(json.dumps(msg))
+            log.info("CONN novig sent subscription %s", json.dumps(msg))
 
-    async def _session(self) -> None:
-        """One connection lifetime: handshake, subscribe, then read until something breaks."""
-        await self._emit_state("CONNECTING", {"url": self.url})
-        async with connect(self.url, **self._connect_kwargs()) as ws:
-            self._ws = ws
-            for msg in self.subscribe_messages:
-                await ws.send(json.dumps(msg))
-            self.connect_count += 1
-            self.connected.set()
-            details: dict[str, Any] = {"url": self.url, "connect_count": self.connect_count}
-            if self._dropped_at is not None:
-                self.last_recovery_seconds = time.monotonic() - self._dropped_at
-                details["recovery_seconds"] = round(self.last_recovery_seconds, 3)
-                self._dropped_at = None
-            log.info("CONN connected %s", json.dumps(details))
-            await self._emit_state("CONNECTED", details)
+    async def _handle_raw(self, raw) -> None:
+        for tick in parse_message(raw):
+            await self._process(tick)
 
-            heartbeat = asyncio.create_task(self._heartbeat_logger(ws))
-            try:
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=self.stale_after)
-                    except asyncio.TimeoutError:
-                        raise StaleStreamError(f"no data for {self.stale_after:.1f}s")
-                    self.messages_received += 1
-                    for tick in parse_message(raw):
-                        await self._process(tick)
-            finally:
-                heartbeat.cancel()
-                self._ws = None
+    def _clear_state(self) -> dict[str, int]:
+        counts = {"stale_price_frames": len(self.latest), "order_books": len(self.books)}
+        self.latest.clear()
+        self.books.clear()
+        return counts
 
-    async def _heartbeat_logger(self, ws) -> None:
-        """Log round-trip latency measured by the protocol ping/pong."""
-        while True:
-            await asyncio.sleep(self.ping_interval)
-            log.info("HEARTBEAT feed ping latency=%.1fms msgs=%d books=%d",
-                     ws.latency * 1000, self.messages_received, len(self.books))
-
-    def _handle_drop(self, exc: BaseException) -> None:
-        """Log the failure and wipe stale state. Must never raise."""
-        was_connected = self.connected.is_set()
-        self.connected.clear()
-        stale_frames = len(self.latest)
-        stale_books = len(self.books)
-        self.latest.clear()   # never trade on prices from a dead connection
-        self.books.clear()    # books must be rebuilt from fresh ticks after reconnect
-        if was_connected:
-            self.disconnect_count += 1
-            self._dropped_at = time.monotonic()
-        elif self._dropped_at is None:
-            self._dropped_at = time.monotonic()
-        log.warning(
-            "CONN dropped (%s: %s); cleared %d stale price frames and %d order books",
-            type(exc).__name__, exc, stale_frames, stale_books,
-        )
-        asyncio.get_running_loop().create_task(
-            self._emit_state("DISCONNECTED", {"error": f"{type(exc).__name__}: {exc}",
-                                              "cleared_frames": stale_frames, "cleared_books": stale_books})
-        )
+    def _heartbeat_extra(self) -> str:
+        return f" books={len(self.books)}"
 
     async def _process(self, tick: TapeTick) -> None:
-        book = self.books.setdefault(tick.market_id, OrderBook())
+        book = self.books.setdefault(tick.outcome_id, OrderBook())
         book.apply(tick)
 
-        info = self.registry.get(tick.market_id)
+        info = self.registry.get(tick.outcome_id)
         if info is None:
-            if tick.market_id not in self._unknown_markets:
-                self._unknown_markets.add(tick.market_id)
-                log.info("FEED_SKIP market %s not in registry (untracked or unknown); ignoring its ticks",
-                         tick.market_id)
+            if tick.outcome_id not in self._unknown:
+                self._unknown.add(tick.outcome_id)
+                log.info("FEED_SKIP outcome %s not in registry (untracked or unknown); ignoring its ticks",
+                         tick.outcome_id)
             return
 
-        ask = book.best_ask()
-        previous = self.latest.get(tick.market_id)
-        if ask is None:
-            if previous is not None:
-                log.info("FEED_NO_ASK %s: no resting sell orders, market not buyable", tick.market_id)
-                self.latest.pop(tick.market_id, None)
+        ask, bid = book.best_ask(), book.best_bid()
+        top = dict(price=None if ask is None else ask[0] / 100, available_volume=0.0 if ask is None else ask[1],
+                   best_bid=None if bid is None else bid[0] / 100, bid_volume=0.0 if bid is None else bid[1])
+        previous = self.latest.get(tick.outcome_id)
+        if previous is not None and all(getattr(previous, k) == v for k, v in top.items()):
             return
-
-        price_cents, volume = ask
-        if previous is not None and previous.price == price_cents / 100 and previous.available_volume == volume:
-            return  # best ask unchanged: nothing to report
-        update = NovigMarketUpdate(
-            market_id=info.market_id, league=info.league, market_type=info.market_type,
-            event_id=info.event_id, home_team=info.home_team, away_team=info.away_team,
-            outcome=info.outcome, line=info.line, price=price_cents / 100, available_volume=volume,
-        )
-        self.latest[tick.market_id] = update
+        if ask is None and bid is None:
+            self.latest.pop(tick.outcome_id, None)
+            log.info("FEED_EMPTY %s: book empty", tick.outcome_id)
+            return
+        update = MarketUpdate.from_info(info, **top)
+        self.latest[tick.outcome_id] = update
         if previous is None:
             log.debug("FEED_SNAPSHOT %s", update.model_dump_json())
         elif previous.price != update.price:
             log.info("LINE_SHIFT %s", json.dumps(format_shift(update, previous)))
-        await self._safe_call(self.on_update, update, previous)
-
-    async def _emit_state(self, state: str, details: dict) -> None:
-        await self._safe_call(self.on_state_change, state, details)
-
-    @staticmethod
-    async def _safe_call(fn, *args) -> None:
-        """Run a user callback; a bug in it must never take the feed down."""
-        if fn is None:
-            return
-        try:
-            result = fn(*args)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception:  # noqa: BLE001
-            log.exception("CALLBACK_ERROR in %s (feed continues)", getattr(fn, "__name__", fn))
+        await safe_call(self.on_update, update, previous, logger=log)
 
 
-def format_shift(update: NovigMarketUpdate, previous: NovigMarketUpdate) -> dict[str, Any]:
-    """Clean, human-readable summary of a best-ask move."""
+def format_shift(update: MarketUpdate, previous: MarketUpdate) -> dict[str, Any]:
     return {
-        "market_id": update.market_id,
-        "league": update.league,
-        "market": update.market_type,
-        "event": f"{update.away_team} @ {update.home_team}",
-        "outcome": update.outcome,
-        "line": update.line,
-        "best_ask": {"from": previous.price, "to": update.price},
-        "volume": update.available_volume,
+        "venue": update.venue, "outcome_id": update.outcome_id, "league": update.league,
+        "market": update.market_type, "event": f"{update.away_team} @ {update.home_team}",
+        "outcome": update.outcome, "line": update.line,
+        "best_ask": {"from": previous.price, "to": update.price}, "volume": update.available_volume,
     }
 
 
-# --------------------------------------------------------------------------
-# Standalone entry point
-# --------------------------------------------------------------------------
 async def _main() -> None:
     path = os.environ.get("NOVIG_MARKETS_FILE")
     registry = MarketRegistry.from_json_file(path) if path else MarketRegistry()
-    feed = NovigFeed(registry=registry, url=os.environ.get("NOVIG_WS_URL"))
-    await feed.run()
+    await NovigFeed(registry=registry, url=os.environ.get("NOVIG_WS_URL")).run()
 
 
 if __name__ == "__main__":

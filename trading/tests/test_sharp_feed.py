@@ -188,3 +188,137 @@ async def test_mock_source_jitter_stays_valid():
     for _ in range(50):
         [x] = await src()
         assert x["odds_for"] <= -100 and x["odds_against"] >= 100
+
+
+# ================================================================ per-outcome provider formats
+from sharp_feed import pair_fixture_outcomes  # noqa: E402
+
+NOW = 1_790_000_000.0
+
+
+def optic_fixture(ts=NOW):
+    return {
+        "id": "fx1", "league": {"id": "nba", "name": "NBA"},
+        "home_team_display": "New York Knicks", "away_team_display": "Boston Celtics",
+        "odds": [
+            {"sportsbook": "Pinnacle", "market": "Moneyline", "name": "New York Knicks", "price": -120,
+             "points": None, "timestamp": ts - 3, "is_main": True},
+            {"sportsbook": "Pinnacle", "market": "Moneyline", "name": "Boston Celtics", "price": 100,
+             "points": None, "timestamp": ts - 1, "is_main": True},
+            {"sportsbook": "Pinnacle", "market": "Point Spread", "name": "New York Knicks", "price": -110,
+             "points": -2.5, "timestamp": ts, "is_main": True},
+            {"sportsbook": "Pinnacle", "market": "Point Spread", "name": "Boston Celtics", "price": -110,
+             "points": 2.5, "timestamp": ts, "is_main": True},
+            {"sportsbook": "Pinnacle", "market": "Point Spread", "name": "New York Knicks", "price": +140,
+             "points": -6.5, "timestamp": ts, "is_main": False},                        # alt line: ignored
+            {"sportsbook": "Pinnacle", "market": "Total Points", "name": "Over 221.5", "price": -105,
+             "points": 221.5, "timestamp": ts, "is_main": True},
+            {"sportsbook": "Pinnacle", "market": "Total Points", "name": "Under 221.5", "price": -115,
+             "points": 221.5, "timestamp": ts, "is_main": True},
+            {"sportsbook": "DraftKings", "market": "Moneyline", "name": "New York Knicks", "price": -150,
+             "points": None, "timestamp": ts, "is_main": True},                         # not our book
+            {"sportsbook": "Pinnacle", "market": "Player Points", "name": "Jalen Brunson Over", "price": -110,
+             "points": 27.5, "timestamp": ts, "is_main": True},                         # unmapped market
+        ]}
+
+
+def load_cfg(name, monkeypatch):
+    monkeypatch.setenv("SHARP_API_KEY", "k")
+    return ProviderConfig.from_file(f"config/{name}")
+
+
+def test_opticodds_fixture_pairs_into_two_way_lines(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    lines, skipped = pair_fixture_outcomes(optic_fixture(), cfg)
+    by_market = {l["market_type"]: l for l in lines}
+    assert set(by_market) == {"moneyline", "spread", "total"} and skipped == 0
+    ml = by_market["moneyline"]
+    assert (ml["side"], ml["odds_for"], ml["odds_against"], ml["line"]) == ("New York Knicks", -120, 100, None)
+    assert ml["updated_at"] == NOW - 3                       # OLDER of the two sides
+    sp = by_market["spread"]
+    assert (sp["side"], sp["line"], sp["odds_for"], sp["odds_against"]) == ("New York Knicks", -2.5, -110, -110)
+    tot = by_market["total"]
+    assert (tot["side"], tot["line"], tot["odds_for"], tot["odds_against"]) == ("Over", 221.5, -105, -115)
+    assert ml["source"] == "opticodds-pinnacle"
+
+
+def test_paired_lines_load_into_book_with_freshness(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    lines, _ = pair_fixture_outcomes(optic_fixture(), cfg)
+    clock = FakeClock(NOW)
+    book = SharpBook(clock=clock)
+    assert book.ingest(lines) == (3, 0)
+    assert book.lookup("NBA", "New York Knicks", "Boston Celtics", "spread", "Boston Celtics").line == 2.5
+    clock.t = NOW - 3 + 30.001                               # moneyline's older side crosses 30s
+    assert book.lookup(*KEY) is None
+    assert book.lookup("NBA", "New York Knicks", "Boston Celtics", "total", "over") is not None
+
+
+def test_oddsjam_shaped_fixture(monkeypatch):
+    cfg = load_cfg("sharp_provider.oddsjam.example.json", monkeypatch)
+    fixture = {"league": "NFL", "home_team": "Kansas City Chiefs", "away_team": "Buffalo Bills", "odds": [
+        {"sports_book_name": "Pinnacle", "market_name": "Moneyline", "name": "Kansas City Chiefs", "price": -150,
+         "bet_points": None, "timestamp": NOW, "is_main": True},
+        {"sports_book_name": "Pinnacle", "market_name": "Moneyline", "name": "Buffalo Bills", "price": 130,
+         "bet_points": None, "timestamp": NOW, "is_main": True},
+        {"sports_book_name": "Pinnacle", "market_name": "Point Spread", "name": "Kansas City Chiefs", "price": -110,
+         "bet_points": -3.5, "timestamp": NOW, "is_main": True},
+        {"sports_book_name": "Pinnacle", "market_name": "Point Spread", "name": "Buffalo Bills", "price": -110,
+         "bet_points": 2.5, "timestamp": NOW, "is_main": True},       # NOT the mirror of -3.5: no pair
+    ]}
+    lines, skipped = pair_fixture_outcomes(fixture, cfg)
+    assert [(l["market_type"], l["odds_for"], l["odds_against"]) for l in lines] == [("moneyline", -150, 130)]
+    assert skipped == 0
+
+
+def test_bad_outcome_records_are_skipped_not_fatal(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+    fx = optic_fixture()
+    fx["odds"] += [{"sportsbook": "Pinnacle", "market": "Moneyline", "name": "Gotham Rogues", "price": 100,
+                    "timestamp": NOW}, {"sportsbook": "Pinnacle", "market": "Moneyline", "price": "abc"}]
+    lines, skipped = pair_fixture_outcomes(fx, cfg)
+    assert len(lines) == 3 and skipped == 2
+    assert pair_fixture_outcomes({"nothing": True}, cfg) == ([], 1)
+
+
+async def test_provider_outcomes_mode_over_http(monkeypatch):
+    cfg = load_cfg("sharp_provider.opticodds.example.json", monkeypatch)
+
+    async def handler(request):
+        assert request.headers["X-Api-Key"] == "k"
+        return web.json_response({"data": [optic_fixture(ts=9_999_999_999)]})
+
+    app = web.Application()
+    app.router.add_get("/odds", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    src = ProviderSharpSource(cfg.model_copy(update=dict(url=f"http://127.0.0.1:{port}/odds")))
+    try:
+        lines = await src()
+        assert len(lines) == 3
+    finally:
+        await src.close()
+        await runner.cleanup()
+
+
+# ================================================================ line-move hook (feeds the maker kill-switch)
+def test_on_move_fires_with_old_and_new_line():
+    moves = []
+    book = SharpBook(on_move=lambda key, old, new: moves.append((key, old.line, new.line)))
+    spread = dict(league="NBA", home_team="NY Knicks", away_team="Boston", market_type="spread",
+                  side="NY Knicks", line=-2.5, odds_for=-110, odds_against=-110)
+    book.ingest([spread])
+    book.ingest([spread])                                    # unchanged: silent
+    book.ingest([{**spread, "line": -3.5}])
+    assert moves == [(("NBA", "New York Knicks", "Boston Celtics", "spread", "New York Knicks"), -2.5, -3.5)]
+
+
+def test_on_move_listener_bug_does_not_break_ingest():
+    def boom(*_):
+        raise RuntimeError("listener bug")
+    book = SharpBook(on_move=boom)
+    book.ingest([KNICKS])
+    assert book.ingest([{**KNICKS, "odds_for": -130}]) == (1, 0)

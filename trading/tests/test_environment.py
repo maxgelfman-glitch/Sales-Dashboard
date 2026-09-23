@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-REQUIRED_PACKAGES = ["websockets", "aiohttp", "pydantic", "pytest", "pytest_asyncio"]
+REQUIRED_PACKAGES = ["websockets", "aiohttp", "pydantic", "pytest", "pytest_asyncio", "cryptography"]
 
 
 def test_python_version_is_3_11_or_newer():
@@ -38,3 +38,10 @@ async def test_event_loop_runs_coroutines():
 
     await asyncio.sleep(0)
     assert True
+
+
+def test_cryptography_rsa_backend_loads():
+    # The OS-bundled cryptography 41 panics on import under Python 3.11; requirements pin >= 42.
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    assert rsa.generate_private_key(public_exponent=65537, key_size=2048).key_size == 2048

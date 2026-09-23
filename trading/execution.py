@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Literal, Optional, Union
+import asyncio
+import time
+from typing import Any, Callable, Literal, Optional, Protocol, Union
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -89,6 +91,7 @@ class EdgeDecision(BaseModel):
     stake_usd: float = 0.0                     # what we would actually risk
     capped: bool = False                       # True if the $1,000 ceiling overrode Kelly
     contracts: int = 0                         # whole contracts purchasable with stake_usd
+    fee_usd: float = 0.0                       # venue transaction fee included in stake_usd (Kalshi)
     suspicious: bool = False                   # edge so large it is probably a data error
 
 
@@ -260,6 +263,16 @@ class ExposureMonitor:
         self._open[position_id] = stake_usd
         self._log_transition()
 
+    def record_fill(self, position_id: str, stake_usd: float) -> None:
+        """Record a MAKER fill. A fill has already happened, so it is recorded even if it breaches
+        the limit (logged loudly); MakerEngine sizes resting quotes to the headroom to prevent this."""
+        if position_id in self._open:
+            raise ValueError(f"position {position_id} already open")
+        if self.open_exposure + stake_usd > self.limit + 1e-9:
+            log.error("KILL_SWITCH maker fill %s ($%.2f) takes exposure over the limit", position_id, stake_usd)
+        self._open[position_id] = stake_usd
+        self._log_transition()
+
     def settle(self, position_id: str) -> float:
         """Release a settled position's exposure. Returns the amount released (0 if unknown)."""
         released = self._open.pop(position_id, 0.0)
@@ -280,3 +293,293 @@ class ExposureMonitor:
             log.warning("KILL_SWITCH RELEASED open exposure $%.2f < $%.2f: taker orders resume",
                         self.open_exposure, self.limit)
         self._was_halted = halted
+
+
+# ==========================================================================
+# Cross-venue price translation (Kalshi cents <-> probability <-> American)
+# ==========================================================================
+def cents_to_probability(price_cents: float) -> float:
+    """A contract paying 100c costing 53c implies a 53% probability."""
+    if not 0 < price_cents < 100:
+        raise ValueError(f"price must be strictly between 0 and 100 cents, got {price_cents}")
+    return price_cents / 100.0
+
+
+def probability_to_american(p: float) -> float:
+    """0.53 -> -112.77 (~-113); 0.40 -> +150. Rounded to 2 decimals."""
+    if not 0 < p < 1:
+        raise ValueError(f"probability must be strictly between 0 and 1, got {p}")
+    return round(-100.0 * p / (1 - p), 2) if p >= 0.5 else round(100.0 * (1 - p) / p, 2)
+
+
+def cents_to_american(price_cents: float) -> float:
+    return probability_to_american(cents_to_probability(price_cents))
+
+
+# ==========================================================================
+# Kalshi taker fee
+#   Fees = 0.07 * Contracts * P * (1 - P), P = price_cents / 100,
+#   rounded UP to the next cent per order (Kalshi's published fee schedule
+#   rounds up; rounding up is also the conservative direction for us).
+# ==========================================================================
+KALSHI_TAKER_FEE_RATE = 0.07
+
+
+def kalshi_taker_fee(contracts: int, price_cents: float) -> float:
+    p = price_cents / 100.0
+    raw = KALSHI_TAKER_FEE_RATE * contracts * p * (1.0 - p)
+    return math.ceil(raw * 100 - 1e-9) / 100.0
+
+
+def kalshi_fee_per_contract(price_cents: float) -> float:
+    p = price_cents / 100.0
+    return KALSHI_TAKER_FEE_RATE * p * (1.0 - p)
+
+
+async def evaluate_kalshi_edge(price_cents: float, sharp_data: Union[SharpQuote, dict[str, Any]],
+                               line: Optional[float] = None, label: str = "") -> EdgeDecision:
+    """
+    Edge on a Kalshi YES contract AFTER the taker fee.
+      1. Size with the fee folded into the price (cost per contract = P + fee/contract).
+      2. Recompute the exact, rounded-up fee for that many contracts and shrink the
+         order until total cash out (contracts x P + fee) fits the $1,000 ceiling.
+      3. Net edge = (contracts x fair - total cost) / total cost. BET only if > 2.5%.
+    """
+    try:
+        fee_pc = kalshi_fee_per_contract(price_cents)
+        base = await evaluate_market_edge(
+            NovigQuote(price=cents_to_probability(price_cents), fee_per_contract=fee_pc, line=line, label=label),
+            sharp_data)
+    except ValueError as exc:
+        return EdgeDecision(action="PASS", reason=f"invalid input: {exc}")
+    if base.action != "BET":
+        return base.model_copy(update=dict(reason=f"after Kalshi fee: {base.reason}"))
+
+    p = price_cents / 100.0
+    contracts = base.contracts
+    while contracts > 0 and contracts * p + kalshi_taker_fee(contracts, price_cents) > MAX_STAKE_USD + 1e-9:
+        contracts -= 1
+    if contracts <= 0:
+        return base.model_copy(update=dict(action="PASS", reason="no whole contract fits after fees",
+                                           stake_usd=0.0, contracts=0))
+    fee = kalshi_taker_fee(contracts, price_cents)
+    cost = round(contracts * p + fee, 2)
+    net_edge = (contracts * base.fair_prob - cost) / cost
+    if net_edge <= MIN_EDGE + _EDGE_EPSILON:
+        return base.model_copy(update=dict(action="PASS", edge=net_edge, stake_usd=0.0, contracts=0, fee_usd=fee,
+                                           reason=f"net edge {net_edge:+.4%} after ${fee:.2f} Kalshi fee not above "
+                                                  f"{MIN_EDGE:.1%}"))
+    log.info("CALC kalshi %s %d contracts @ %.1fc fee=$%.2f cost=$%.2f net_edge=%+.4f%%",
+             label or "-", contracts, price_cents, fee, cost, net_edge * 100)
+    return base.model_copy(update=dict(edge=net_edge, stake_usd=cost, contracts=contracts, fee_usd=fee))
+
+
+# ==========================================================================
+# Maker (passive) engine
+# ==========================================================================
+MAKER_REFRESH_SECONDS = 2.0      # how often quotes are re-evaluated
+MAKER_QUIET_SECONDS = 5.0        # only quote if no taker order fired in this window
+MAKER_LINE_MOVE_POINTS = 0.5     # sharp spread/total move GREATER than this => cancel ALL quotes
+MAKER_ML_FAIR_MOVE = 0.02        # sharp moneyline fair-prob move greater than 2c => cancel ALL quotes
+MAKER_CANCEL_BUDGET_MS = 200.0   # bulk cancel must complete inside this budget
+
+
+def maker_quote_prices(fair_prob: float, min_edge: float = MIN_EDGE) -> tuple[Optional[int], Optional[int]]:
+    """
+    Two-sided quote just outside fair value, in whole cents, so that EVERY fill
+    carries an edge strictly above `min_edge`:
+      bid b: buying at b has edge fair/b - 1 > min_edge            -> b < fair / (1 + min_edge)
+      ask a: selling at a == buying the other side at 1-a;
+             edge (1-fair)/(1-a) - 1 > min_edge                    -> a > 1 - (1-fair)/(1 + min_edge)
+    Example: fair 0.50 -> bid 48c / ask 52c.
+    """
+    bid_limit = 100 * fair_prob / (1 + min_edge)
+    # The 1e-9 guards absorb float noise: 100*(1 - 0.82/1.025) evaluates to 19.999999999999996,
+    # which without them would quote 20c = EXACTLY 2.5% edge instead of strictly more.
+    bid = math.ceil(bid_limit - 1e-9) - 1            # strictly below the limit
+    ask_limit = 100 * (1 - (1 - fair_prob) / (1 + min_edge))
+    ask = math.floor(ask_limit + 1e-9) + 1           # strictly above the limit
+    return (bid if 1 <= bid <= 99 else None), (ask if 1 <= ask <= 99 else None)
+
+
+def maker_quote_contracts(fair_prob: float, price_cents: int, side: str) -> int:
+    """1/4 Kelly size for one quote, capped at the $1,000 ceiling (cost = collateral at risk)."""
+    c = price_cents / 100.0
+    if side == "buy":
+        p, cost = fair_prob, c                       # buy this outcome at c
+    else:
+        p, cost = 1.0 - fair_prob, 1.0 - c           # selling at c == buying the other side at 1-c
+    f = kelly_fraction_for_contract(p, cost)
+    stake, _ = apply_safety_ceiling(KELLY_FRACTION * f * BANKROLL_USD)
+    return _whole_contracts(stake, cost) if stake > 0 else 0
+
+
+class MakerTarget(BaseModel):
+    outcome_id: str
+    market_key: tuple
+    fair_prob: float
+    label: str = ""
+
+
+class RestingQuote(BaseModel):
+    order_id: str
+    outcome_id: str
+    market_key: tuple
+    side: Literal["buy", "sell"]
+    price_cents: int
+    contracts: int
+    fair_prob: float
+    placed_at: float
+
+    @property
+    def worst_case_cost(self) -> float:
+        """Collateral at risk if this quote is completely filled."""
+        c = self.price_cents / 100.0
+        return self.contracts * (c if self.side == "buy" else 1.0 - c)
+
+
+class QuoteGateway(Protocol):
+    async def place_limit(self, outcome_id: str, side: str, price_cents: float, contracts: int,
+                          client_id: str) -> str: ...
+
+    async def cancel_orders(self, order_ids: list[str]) -> None: ...
+
+
+class MakerEngine:
+    """
+    Keeps two-sided LIMIT quotes resting on eligible outcomes while the taker side is quiet.
+
+    Safety:
+      * cancel_all() — ONE bulk cancel call for every resting quote; timed against
+        the 200ms budget and retried once. Triggered by the supervisor on a
+        WebSocket drop or a sharp line move beyond the thresholds above.
+      * Never posts while the exposure kill-switch is engaged (and pulls all quotes then).
+      * Worst-case cost of all resting quotes never exceeds the exposure headroom.
+    """
+
+    def __init__(self, gateway: QuoteGateway, exposure: "ExposureMonitor",
+                 targets: Callable[[], list[MakerTarget]], refresh_interval: float = MAKER_REFRESH_SECONDS,
+                 quiet_seconds: float = MAKER_QUIET_SECONDS, clock: Callable[[], float] = time.monotonic) -> None:
+        self.gateway = gateway
+        self.exposure = exposure
+        self.targets = targets
+        self.refresh_interval = refresh_interval
+        self.quiet_seconds = quiet_seconds
+        self.clock = clock
+        self.quotes: dict[str, RestingQuote] = {}
+        self.last_taker_at = -math.inf
+        self.kill_count = 0
+        self.last_cancel_ms: Optional[float] = None
+        self._client_ids = 0
+        self._lock = asyncio.Lock()
+
+    # ---------------- state ----------------
+    def note_taker_activity(self) -> None:
+        self.last_taker_at = self.clock()
+
+    def is_quiet(self) -> bool:
+        return self.clock() - self.last_taker_at >= self.quiet_seconds
+
+    def resting_worst_case(self) -> float:
+        return round(sum(q.worst_case_cost for q in self.quotes.values()), 2)
+
+    def quotes_for(self, outcome_id: str) -> list[RestingQuote]:
+        return [q for q in self.quotes.values() if q.outcome_id == outcome_id]
+
+    # ---------------- cancellation (never gated by anything) ----------------
+    async def _cancel(self, order_ids: list[str], reason: str, kill: bool) -> float:
+        if not order_ids:
+            return 0.0
+        started = time.perf_counter()
+        for attempt in (1, 2):
+            try:
+                await self.gateway.cancel_orders(order_ids)
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.error("MAKER_CANCEL attempt %d failed (%s: %s)", attempt, type(exc).__name__, exc)
+                if attempt == 2:
+                    log.critical("MAKER_CANCEL FAILED for %d quote(s) — they may still be resting; will retry",
+                                 len(order_ids))
+                    return (time.perf_counter() - started) * 1000
+        for oid in order_ids:
+            self.quotes.pop(oid, None)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if kill:
+            self.kill_count += 1
+            self.last_cancel_ms = elapsed_ms
+            level = logging.WARNING if elapsed_ms <= MAKER_CANCEL_BUDGET_MS else logging.ERROR
+            log.log(level, "MAKER_KILL bulk-cancelled %d quote(s) in %.1fms (budget %.0fms): %s",
+                    len(order_ids), elapsed_ms, MAKER_CANCEL_BUDGET_MS, reason)
+        else:
+            log.info("MAKER_CANCEL %d quote(s) in %.1fms: %s", len(order_ids), elapsed_ms, reason)
+        return elapsed_ms
+
+    async def cancel_all(self, reason: str) -> float:
+        """Maker kill-switch: pull every resting quote in one bulk call. Returns elapsed ms."""
+        return await self._cancel(list(self.quotes), reason, kill=True)
+
+    async def cancel_market(self, market_key: tuple, reason: str) -> float:
+        ids = [oid for oid, q in self.quotes.items() if q.market_key == market_key]
+        return await self._cancel(ids, reason, kill=False)
+
+    def on_fill(self, order_id: str) -> Optional[RestingQuote]:
+        """Remove a filled quote from the book and return it (the supervisor books the position)."""
+        return self.quotes.pop(order_id, None)
+
+    # ---------------- quoting ----------------
+    def _desired(self, t: MakerTarget) -> list[tuple[str, int, int]]:
+        bid, ask = maker_quote_prices(t.fair_prob)
+        out = []
+        for side, price in (("buy", bid), ("sell", ask)):
+            if price is None:
+                continue
+            n = maker_quote_contracts(t.fair_prob, price, side)
+            if n > 0:
+                out.append((side, price, n))
+        return out
+
+    async def refresh(self) -> None:
+        async with self._lock:
+            if self.exposure.taker_halted:
+                if self.quotes:
+                    await self._cancel(list(self.quotes), "exposure kill-switch engaged", kill=True)
+                return
+            if not self.is_quiet():
+                return
+            targets = {t.outcome_id: t for t in self.targets()}
+            gone = [oid for oid, q in self.quotes.items() if q.outcome_id not in targets]
+            await self._cancel(gone, "outcome no longer eligible (position, stale sharp or delisted)", kill=False)
+
+            for t in targets.values():
+                desired = self._desired(t)
+                current = self.quotes_for(t.outcome_id)
+                if sorted((q.side, q.price_cents, q.contracts) for q in current) == sorted(desired):
+                    continue
+                await self._cancel([q.order_id for q in current], f"requote {t.outcome_id}", kill=False)
+                for side, price, n in desired:
+                    cost = n * (price / 100 if side == "buy" else 1 - price / 100)
+                    if self.resting_worst_case() + cost > self.exposure.headroom + 1e-9:
+                        log.info("MAKER_SKIP %s %s %dc: worst case $%.2f exceeds exposure headroom $%.2f",
+                                 t.outcome_id, side, price, self.resting_worst_case() + cost, self.exposure.headroom)
+                        continue
+                    self._client_ids += 1
+                    try:
+                        oid = await self.gateway.place_limit(t.outcome_id, side, price, n, f"mk-{self._client_ids}")
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("MAKER_POST failed %s %s %dc: %s", t.outcome_id, side, price, exc)
+                        continue
+                    self.quotes[oid] = RestingQuote(order_id=oid, outcome_id=t.outcome_id, market_key=t.market_key,
+                                                    side=side, price_cents=price, contracts=n,
+                                                    fair_prob=t.fair_prob, placed_at=time.time())
+                    log.info("MAKER_POST LIMIT %s %s %d @ %dc (fair %.2fc) id=%s %s", t.outcome_id, side, n, price,
+                             t.fair_prob * 100, oid, t.label)
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("MAKER_ERROR refresh failed (loop continues)")
+            await asyncio.sleep(self.refresh_interval)

@@ -235,3 +235,199 @@ def test_kill_switch_rejects_invalid_stakes(bad):
 
 def test_settling_unknown_position_is_harmless():
     assert ExposureMonitor().settle("nope") == 0.0
+
+
+# ================================================================ Kalshi fee + net edge
+from execution import (  # noqa: E402
+    MAKER_CANCEL_BUDGET_MS,
+    MakerEngine,
+    MakerTarget,
+    evaluate_kalshi_edge,
+    kalshi_taker_fee,
+    maker_quote_contracts,
+    maker_quote_prices,
+)
+
+EVEN = {"odds_for": -110, "odds_against": -110}   # de-vigs to fair 0.50
+
+
+@pytest.mark.parametrize("contracts,cents,expected", [
+    (100, 53, 1.75),     # 0.07*100*0.53*0.47 = 1.7437 -> rounded UP to 1.75
+    (1, 50, 0.02),       # 0.0175 -> 0.02
+    (2139, 45, 37.06),   # 37.0582 -> 37.06
+    (1000, 1, 0.70),     # 0.693 -> 0.70
+])
+def test_kalshi_taker_fee_formula(contracts, cents, expected):
+    assert kalshi_taker_fee(contracts, cents) == expected
+
+
+async def test_kalshi_edge_is_net_of_fee_and_capped():
+    """
+    45c vs fair 0.50. Gross edge 11.1%. Fee/contract 0.07*0.45*0.55 = 0.017325 -> effective 0.467325.
+    1/4 Kelly caps at $1,000 -> 2139 contracts: 2139*0.45 = $962.55 + fee $37.06 = $999.61 cash out.
+    Net edge = (2139*0.50 - 999.61) / 999.61 = +6.99%.
+    """
+    d = await evaluate_kalshi_edge(45, EVEN)
+    assert d.action == "BET" and d.contracts == 2139
+    assert d.fee_usd == 37.06 and d.stake_usd == 999.61 and d.stake_usd <= 1000
+    assert d.edge == pytest.approx((2139 * 0.5 - 999.61) / 999.61) == pytest.approx(0.0699, abs=1e-4)
+
+
+async def test_kalshi_fee_can_kill_an_edge():
+    # 48c vs fair 0.50: gross +4.17% (would BET on Novig) but fee 0.017472/contract -> net +0.51% -> PASS
+    novig = await evaluate_market_edge({"price": 0.48}, EVEN)
+    kalshi = await evaluate_kalshi_edge(48, EVEN)
+    assert novig.action == "BET" and kalshi.action == "PASS"
+    assert kalshi.edge == pytest.approx(0.5 / (0.48 + 0.07 * 0.48 * 0.52) - 1)
+    assert "after Kalshi fee" in kalshi.reason
+
+
+async def test_kalshi_small_edge_sizing_uses_exact_rounded_fee():
+    # 46c vs fair 0.50: net edge ~5.0% -> Kelly small enough to stay under the cap
+    d = await evaluate_kalshi_edge(46, EVEN)
+    assert d.action == "BET"
+    assert d.fee_usd == kalshi_taker_fee(d.contracts, 46)
+    assert d.stake_usd == round(d.contracts * 0.46 + d.fee_usd, 2)
+
+
+async def test_kalshi_bad_price_passes():
+    assert (await evaluate_kalshi_edge(0, EVEN)).action == "PASS"
+
+
+# ================================================================ maker quote maths
+def test_maker_quotes_around_even_money():
+    assert maker_quote_prices(0.50) == (48, 52)
+
+
+@pytest.mark.parametrize("fair", [i / 200 for i in range(6, 195)])
+def test_every_maker_fill_beats_the_2_5_percent_threshold(fair):
+    bid, ask = maker_quote_prices(fair)
+    if bid is not None:
+        assert fair / (bid / 100) - 1 > 0.025
+        assert bid + 1 > 100 * fair / 1.025 - 1e-9          # and it is the tightest such bid
+    if ask is not None:
+        assert (1 - fair) / (1 - ask / 100) - 1 > 0.025
+        assert ask - 1 < 100 * (1 - (1 - fair) / 1.025) + 1e-9
+
+
+@pytest.mark.parametrize("fair,expected_ask", [(0.18, 21), (0.59, 61)])
+def test_maker_ask_is_strict_despite_float_noise(fair, expected_ask):
+    # 100*(1-(1-fair)/1.025) is exactly 20 / 60 in real maths but lands a hair BELOW in floating point
+    assert maker_quote_prices(fair)[1] == expected_ask
+
+
+def test_maker_bid_is_strict_at_exact_boundary():
+    # fair 0.5125 -> 0.5125/1.025 = exactly 50c, which would be EXACTLY 2.5%: must quote 49c
+    assert maker_quote_prices(0.5125)[0] == 49
+
+
+def test_maker_quote_size_is_capped():
+    n = maker_quote_contracts(0.50, 48, "buy")               # 1/4 Kelly = $961.54
+    assert n * 0.48 <= 1000
+    assert maker_quote_contracts(0.90, 40, "buy") * 0.40 <= 1000    # huge edge still capped
+
+
+# ================================================================ maker engine
+from novig_rest import PaperOrderGateway  # noqa: E402
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def make_engine(fair=0.50, limit=None, gateway=None):
+    targets = [MakerTarget(outcome_id="O-NYK", market_key=("NBA", "H", "A", "moneyline"), fair_prob=fair)]
+    clock = Clock()
+    eng = MakerEngine(gateway or PaperOrderGateway(), ExposureMonitor(limit) if limit else ExposureMonitor(),
+                      lambda: targets, clock=clock, quiet_seconds=5)
+    return eng, targets, clock
+
+
+async def test_maker_posts_two_sided_limit_quotes_once():
+    eng, _, _ = make_engine()
+    await eng.refresh()
+    placed = eng.gateway.placed
+    assert [(o["side"], o["price_cents"], o["order_type"]) for o in placed] == [("buy", 48, "LIMIT"), ("sell", 52, "LIMIT")]
+    await eng.refresh()                                       # nothing changed: no churn
+    assert len(eng.gateway.placed) == 2 and len(eng.quotes) == 2
+
+
+async def test_maker_requotes_when_fair_moves():
+    eng, targets, _ = make_engine()
+    await eng.refresh()
+    targets[0] = targets[0].model_copy(update=dict(fair_prob=0.56))
+    await eng.refresh()
+    assert sorted(q.price_cents for q in eng.quotes.values()) == [54, 58]
+    assert eng.gateway.cancel_calls and len(eng.gateway.cancel_calls[-1]) == 2
+
+
+async def test_maker_bulk_cancel_is_one_call_under_200ms():
+    eng, _, _ = make_engine()
+    await eng.refresh()
+    ids = set(eng.quotes)
+    ms = await eng.cancel_all("test: websocket drop")
+    assert eng.quotes == {} and eng.gateway.cancel_calls[-1] and set(eng.gateway.cancel_calls[-1]) == ids
+    assert ms < MAKER_CANCEL_BUDGET_MS and eng.kill_count == 1
+
+
+async def test_maker_waits_for_taker_quiet_period():
+    eng, _, clock = make_engine()
+    eng.note_taker_activity()
+    await eng.refresh()
+    assert eng.quotes == {}
+    clock.t += 5.0
+    await eng.refresh()
+    assert len(eng.quotes) == 2
+
+
+async def test_maker_pulls_everything_when_exposure_kill_switch_engages():
+    eng, _, _ = make_engine()
+    await eng.refresh()
+    for i in range(15):
+        eng.exposure.record_open(f"p{i}", 1000)
+    await eng.refresh()
+    assert eng.quotes == {} and eng.kill_count == 1
+    await eng.refresh()
+    assert eng.quotes == {}                                   # and posts nothing new while halted
+
+
+async def test_maker_respects_exposure_headroom():
+    eng, _, _ = make_engine(limit=1500)                       # each full-size quote risks ~$960-$1,000
+    await eng.refresh()
+    assert len(eng.quotes) == 1 and eng.resting_worst_case() <= 1500
+
+
+async def test_maker_drops_quotes_for_ineligible_outcomes():
+    eng, targets, _ = make_engine()
+    await eng.refresh()
+    targets.clear()
+    await eng.refresh()
+    assert eng.quotes == {}
+
+
+async def test_maker_cancel_retries_and_keeps_quotes_if_exchange_fails():
+    class Flaky(PaperOrderGateway):
+        fails = 2
+
+        async def cancel_orders(self, ids):
+            if self.fails:
+                self.fails -= 1
+                raise ConnectionError("exchange down")
+            await super().cancel_orders(ids)
+
+    eng, _, _ = make_engine(gateway=Flaky())
+    await eng.refresh()
+    await eng.cancel_all("drop")
+    assert len(eng.quotes) == 2                               # both attempts failed: still tracked
+    await eng.cancel_all("drop again")
+    assert eng.quotes == {}
+
+
+def test_record_fill_never_refuses():
+    m = ExposureMonitor(limit_usd=100)
+    m.record_fill("f1", 150)                                  # a fill already happened: record it
+    assert m.open_exposure == 150 and m.taker_halted

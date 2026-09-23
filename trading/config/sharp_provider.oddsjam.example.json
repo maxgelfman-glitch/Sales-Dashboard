@@ -1,0 +1,25 @@
+{
+  "_comment": "OddsJam game-odds style feed (one game per record, per-side prices in `odds`). Field names reflect OddsJam's public v2 schema as best known; VERIFY against your OddsJam API docs before going live. Copy to sharp_provider.json and export SHARP_API_KEY.",
+  "url": "https://api-external.oddsjam.com/api/v2/game-odds?key=${SHARP_API_KEY}&sportsbook=Pinnacle&market_name=Moneyline&market_name=Point%20Spread&market_name=Total%20Points",
+  "headers": {},
+  "mode": "outcomes",
+  "list_path": "data",
+  "fixture_fields": {"league": "league", "home_team": "home_team", "away_team": "away_team"},
+  "outcomes_path": "odds",
+  "outcome_fields": {
+    "sportsbook": "sports_book_name",
+    "market": "market_name",
+    "selection": "name",
+    "price": "price",
+    "points": "bet_points",
+    "timestamp": "timestamp",
+    "is_main": "is_main"
+  },
+  "market_map": {"moneyline": "moneyline", "point spread": "spread", "total points": "total"},
+  "sportsbooks": ["Pinnacle"],
+  "main_only": true,
+  "constants": {"source": "oddsjam-pinnacle"},
+  "odds_format": "american",
+  "timestamp_format": "epoch",
+  "timeout_seconds": 5.0
+}

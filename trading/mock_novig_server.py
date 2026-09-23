@@ -96,22 +96,35 @@ class MockNovigServer:
 
 
 # ---------------------------------------------------------------- message builders
-def make_tick(market_id: str = "M-NYK-ML", price_cents: float = 50, side: str = "sell",
-              volume: float = 5000, action: Optional[str] = None) -> dict[str, Any]:
-    """One tape tick. With action=None it is a level snapshot (sets the volume)."""
-    tick = {"market_id": market_id, "price_cents": price_cents, "side": side, "volume": volume}
+def make_tick(outcome_id: str = "O-NYK", price_cents: float = 50, side: str = "sell",
+              volume: float = 5000, action: Optional[str] = None, envelope: bool = True) -> dict[str, Any]:
+    """One Novig tape tick (optionally wrapped in the {"event": "tape", "data": ...} envelope)."""
+    tick: dict[str, Any] = {"outcomeId": outcome_id, "price_cents": price_cents, "side": side, "volume": volume}
     if action is not None:
         tick["action"] = action
-    return tick
+    return {"event": "tape", "data": tick} if envelope else tick
 
 
-def make_market(market_id: str = "M-NYK-ML", event_id: str = "NBA-BOS-NYK", league: str = "NBA",
-                market_type: str = "moneyline", home_team: str = "New York Knicks",
-                away_team: str = "Boston Celtics", outcome: str = "New York Knicks",
-                line: Optional[float] = None) -> dict[str, Any]:
-    """Registry metadata for one market_id."""
-    m = dict(market_id=market_id, event_id=event_id, league=league, market_type=market_type,
-             home_team=home_team, away_team=away_team, outcome=outcome)
-    if line is not None:
-        m["line"] = line
-    return m
+def make_outcome(outcome_id: str = "O-NYK", sibling: Optional[str] = "O-BOS", market_id: str = "MK-NYK-ML",
+                 event_id: str = "NBA-BOS-NYK", league: str = "NBA", market_type: str = "moneyline",
+                 home_team: str = "New York Knicks", away_team: str = "Boston Celtics",
+                 outcome: str = "New York Knicks", line: Optional[float] = None,
+                 venue: str = "novig") -> dict[str, Any]:
+    """Registry metadata for one outcome."""
+    return dict(venue=venue, outcome_id=outcome_id, sibling_outcome_id=sibling, market_id=market_id,
+                event_id=event_id, league=league, market_type=market_type, home_team=home_team,
+                away_team=away_team, outcome=outcome, line=line)
+
+
+def kalshi_snapshot(ticker: str, yes: list, no: list, seq: int = 0, sid: int = 1) -> dict[str, Any]:
+    """Kalshi orderbook_snapshot; `yes`/`no` are [(dollars, qty)] lists (sent as strings, as Kalshi does)."""
+    return {"type": "orderbook_snapshot", "sid": sid, "seq": seq,
+            "msg": {"market_ticker": ticker,
+                    "yes_dollars_fp": [[f"{p:.4f}", f"{q:.2f}"] for p, q in yes],
+                    "no_dollars_fp": [[f"{p:.4f}", f"{q:.2f}"] for p, q in no]}}
+
+
+def kalshi_delta(ticker: str, side: str, price_dollars: float, delta: float, seq: int, sid: int = 1) -> dict[str, Any]:
+    return {"type": "orderbook_delta", "sid": sid, "seq": seq,
+            "msg": {"market_ticker": ticker, "side": side, "price_dollars": f"{price_dollars:.4f}",
+                    "delta_fp": f"{delta:.2f}"}}

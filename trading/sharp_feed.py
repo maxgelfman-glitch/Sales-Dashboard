@@ -92,9 +92,11 @@ class SharpBook:
     """In-memory cache of the latest sharp lines, keyed by CANONICAL names."""
 
     def __init__(self, max_age_seconds: float = SHARP_MAX_AGE_SECONDS,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 on_move: Optional[Callable[[BookKey, SharpLine, SharpLine], None]] = None) -> None:
         self.max_age = max_age_seconds
         self.clock = clock
+        self.on_move = on_move    # called with (key, old, new) whenever a stored line/price changes
         self._lines: dict[BookKey, tuple[SharpLine, float]] = {}   # value: (line, observed_at epoch)
         self._seen: set[tuple[str, str]] = set()
 
@@ -144,9 +146,18 @@ class SharpBook:
                 rejected += 1
                 continue
             canon = line.model_copy(update=dict(league=league, home_team=home, away_team=away, side=side))
+            key = (league, home, away, canon.market_type, canon.side)
+            old = self._lines.get(key)
             for item in (canon, canon.mirrored()):
                 self._lines[(league, home, away, item.market_type, item.side)] = (item, observed_at)
             stored += 1
+            if old is not None and self.on_move is not None and (
+                    old[0].line != canon.line or old[0].odds_for != canon.odds_for
+                    or old[0].odds_against != canon.odds_against):
+                try:
+                    self.on_move(key, old[0], canon)
+                except Exception:  # noqa: BLE001 — a listener bug must not break ingestion
+                    sharp_log.exception("SHARP_MOVE listener failed")
         if stale:
             sharp_log.warning("SHARP_POLL rejected %d line(s) already older than %.0fs at the source",
                               stale, self.max_age)
@@ -234,11 +245,24 @@ class ProviderConfig(BaseModel):
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
     list_path: str = ""
+    # "flat": one record = one two-way line (fields below).
+    # "outcomes": one record = one fixture holding an array of per-side prices
+    #             (OpticOdds / OddsJam style); sides are paired into two-way lines.
+    mode: Literal["flat", "outcomes"] = "flat"
     fields: dict[str, str] = Field(default_factory=dict)       # our field -> provider path
     constants: dict[str, Any] = Field(default_factory=dict)    # fixed values, e.g. {"source": "pinnacle"}
     odds_format: Literal["american", "decimal"] = "american"
     timestamp_format: Literal["epoch", "epoch_ms", "iso"] = "epoch"
     timeout_seconds: float = 5.0
+    # ---- "outcomes" mode only ----
+    fixture_fields: dict[str, str] = Field(default_factory=dict)   # league / home_team / away_team -> path
+    outcomes_path: str = "odds"                                     # path to the per-side array in a fixture
+    outcome_fields: dict[str, str] = Field(default_factory=dict)   # market/selection/price/points/timestamp/...
+    market_map: dict[str, str] = Field(default_factory=lambda: {
+        "moneyline": "moneyline", "point spread": "spread", "spread": "spread",
+        "total points": "total", "total": "total", "totals": "total"})
+    sportsbooks: list[str] = Field(default_factory=list)            # e.g. ["Pinnacle"]; empty = any
+    main_only: bool = True                                          # ignore alternate lines
 
     @classmethod
     def from_file(cls, path: str | Path) -> "ProviderConfig":
@@ -270,6 +294,90 @@ def map_provider_record(record: Any, cfg: ProviderConfig) -> dict[str, Any]:
     return out
 
 
+def _outcome_value(rec: dict, cfg: ProviderConfig, field: str) -> Any:
+    return _dig(rec, cfg.outcome_fields.get(field, field))
+
+
+def pair_fixture_outcomes(fixture: Any, cfg: ProviderConfig) -> tuple[list[dict[str, Any]], int]:
+    """
+    Turn one fixture's per-side price array into two-way SharpLine dicts.
+      moneyline: the home-team entry paired with the away-team entry
+      spread:    home at -x paired with away at +x (same book)
+      total:     Over x paired with Under x (same book)
+    The pair's timestamp is the OLDER of its two sides (conservative freshness).
+    Returns (lines, records_skipped).
+    """
+    f = cfg.fixture_fields
+    league = _dig(fixture, f.get("league", "league"))
+    if isinstance(league, dict):
+        league = league.get("name") or league.get("id")
+    home = _dig(fixture, f.get("home_team", "home_team"))
+    away = _dig(fixture, f.get("away_team", "away_team"))
+    records = _dig(fixture, cfg.outcomes_path)
+    if not (isinstance(league, str) and isinstance(home, str) and isinstance(away, str)
+            and isinstance(records, list)):
+        return [], 1
+    league = league.upper()
+    home_c, away_c = normalize_team_name(home, league), normalize_team_name(away, league)
+    wanted_books = {b.lower() for b in cfg.sportsbooks}
+
+    # group: (book, market) -> list of (role, points, american_odds, ts)
+    groups: dict[tuple[str, str], list[tuple[str, Optional[float], float, Optional[float]]]] = {}
+    skipped = 0
+    for rec in records:
+        try:
+            book = str(_outcome_value(rec, cfg, "sportsbook") or "")
+            if wanted_books and book.lower() not in wanted_books:
+                continue
+            if cfg.main_only and _outcome_value(rec, cfg, "is_main") is False:
+                continue
+            market = cfg.market_map.get(str(_outcome_value(rec, cfg, "market") or "").strip().lower())
+            if market is None:
+                continue
+            selection = _outcome_value(rec, cfg, "selection")
+            price = float(_outcome_value(rec, cfg, "price"))
+            if cfg.odds_format == "decimal":
+                price = decimal_to_american(price)
+            points = _outcome_value(rec, cfg, "points")
+            points = None if points in (None, "") else float(points)
+            ts = parse_timestamp(_outcome_value(rec, cfg, "timestamp"), cfg.timestamp_format)
+            if market == "total":
+                role = normalize_outcome(selection, league)
+                if role not in {"over", "under"}:
+                    raise ValueError(f"total selection {selection!r}")
+            else:
+                team = normalize_team_name(selection, league)
+                role = "home" if team is not None and team == home_c else "away" if team is not None and team == away_c else None
+                if role is None:
+                    raise ValueError(f"selection {selection!r} is neither {home!r} nor {away!r}")
+            groups.setdefault((book, market), []).append((role, points, price, ts))
+        except (ValueError, TypeError) as exc:
+            skipped += 1
+            sharp_log.debug("SHARP_POLL outcome skipped: %s", exc)
+
+    lines: list[dict[str, Any]] = []
+    for (book, market), sides in groups.items():
+        first_role, second_role = ("over", "under") if market == "total" else ("home", "away")
+        for role, pts, price, ts in sides:
+            if role != first_role:
+                continue
+            for role2, pts2, price2, ts2 in sides:
+                if role2 != second_role:
+                    continue
+                if market == "spread" and (pts is None or pts2 is None or abs(pts + pts2) > 1e-9):
+                    continue
+                if market == "total" and (pts is None or pts != pts2):
+                    continue
+                stamps = [t for t in (ts, ts2) if t is not None]
+                lines.append(dict(
+                    league=league, home_team=home, away_team=away, market_type=market,
+                    side="Over" if market == "total" else home, odds_for=price, odds_against=price2,
+                    line=pts if market != "moneyline" else None, source=cfg.constants.get("source", book or "sharp"),
+                    updated_at=min(stamps) if stamps else None))
+                break
+    return lines, skipped
+
+
 class ProviderSharpSource:
     """Polls the configured provider over one persistent HTTP session (low latency)."""
 
@@ -287,6 +395,15 @@ class ProviderSharpSource:
         records = _dig(payload, self.config.list_path)
         if not isinstance(records, list):
             raise ValueError(f"provider response has no list at {self.config.list_path!r}")
+        if self.config.mode == "outcomes":
+            mapped, bad = [], 0
+            for fixture in records:
+                lines, skipped = pair_fixture_outcomes(fixture, self.config)
+                mapped.extend(lines)
+                bad += skipped
+            if bad:
+                sharp_log.warning("SHARP_POLL %d provider outcome record(s) could not be used", bad)
+            return mapped
         mapped, bad = [], 0
         for rec in records:
             try:
