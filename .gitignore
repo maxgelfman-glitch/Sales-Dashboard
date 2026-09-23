@@ -16,3 +16,5 @@ __pycache__/
 trading/config/sharp_provider.json
 *.pem
 *.key
+.coverage
+htmlcov/
