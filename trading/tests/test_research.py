@@ -659,3 +659,40 @@ async def test_hedge_worst_case_fits_the_cap(tmp_path):
     hedge = sup.orders[1]
     assert hedge.contracts * 0.60 <= 1000.0 + 1e-9 or hedge.price == 0.40
     assert hedge.contracts <= first.contracts
+
+
+# ---------------------------------------------------------------------------
+# One limit order sweeps cheaper levels at THEIR prices; if Novig proves otherwise, stop multi-level orders
+# ---------------------------------------------------------------------------
+async def test_price_improvement_confirmed_keeps_multi_level(tmp_path):
+    ledger = tmp_path / "live_ledger.jsonl"
+    sup = live_sup(ledger_path=ledger)
+    await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400)]), None)
+    await sup.on_fill_slip(slip("ex-1", "PARTIAL", 300, 49))                   # cheaper level at its own price
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 700, 50))
+    assert sup.multi_level_live
+    rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+    order = next(r for r in rows if r["event"] == "ORDER")
+    done = next(r for r in rows if r["event"] == "DONE")
+    assert order["expected_levels"] == [[0.49, 300], [0.5, 400]]
+    assert order["expected_avg_price"] == pytest.approx((300 * 0.49 + 400 * 0.50) / 700, abs=1e-6)
+    assert done["avg_fill_price"] == pytest.approx(done["expected_avg_price"], abs=1e-6)
+
+
+async def test_fill_all_at_limit_switches_multi_level_off(tmp_path):
+    ledger = tmp_path / "live_ledger.jsonl"
+    sup = live_sup(ledger_path=ledger)
+    await sup.on_market_update(book_upd("O-NYK", [(0.45, 300), (0.49, 400)]), None)
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 700, 49))                    # everything at the limit
+    assert not sup.multi_level_live and '"PRICE_IMPROVEMENT_MISSING"' in ledger.read_text()
+    sup.positions.clear()
+    await sup.on_market_update(book_upd("O-NYK", [(0.45, 300), (0.49, 400)]), None)
+    assert sup.order_gateway.placed[-1]["contracts"] == 300                     # best level only from now on
+    assert sup.order_gateway.placed[-1]["price_cents"] == 45.0
+
+
+async def test_single_level_orders_never_trip_the_check(tmp_path):
+    sup = live_sup()
+    await sup.on_market_update(upd("O-NYK", 0.49), None)
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 2040, 49))
+    assert sup.multi_level_live

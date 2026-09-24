@@ -79,7 +79,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from execution import (
     MAKER_CANCEL_BUDGET_MS,
@@ -232,6 +232,7 @@ class LiveOrder(BaseModel):
     maker_side: Optional[Literal["buy", "sell"]] = None
     fair_prob: Optional[float] = None
     leg_id: Optional[int] = None            # PaperOrder.order_id of the position leg
+    expected_levels: list[tuple[float, int]] = Field(default_factory=list)   # book we expected to sweep
     filled: float = 0.0
     fill_cost: float = 0.0
     done: bool = False
@@ -278,6 +279,19 @@ def order_cost(venue: str, contracts: int, price: float) -> tuple[float, float]:
     """(total cash out incl. fees, fee) for buying `contracts` at `price` on `venue`."""
     fee = kalshi_taker_fee(contracts, price * 100) if venue == "kalshi" else 0.0
     return round(contracts * price + fee, 2), fee
+
+
+def _sweep_avg(levels: list, contracts: float) -> float:
+    """Average price of buying `contracts` from `levels` (cheapest first) at each level's own price."""
+    left, cost = contracts, 0.0
+    for price, n in levels:
+        take = min(n, left)
+        cost += take * price
+        left -= take
+        if left <= 0:
+            break
+    done = contracts - max(left, 0)
+    return round(cost / done, 6) if done else 0.0
 
 
 def arbitrage_scenarios(first: PaperOrder, hedge_venue: str, contracts: int, hedge_cost: float,
@@ -400,6 +414,10 @@ class Supervisor:
         self.gaps = GapTracker(research) if research is not None else None
         self.depth_sample_s = depth_sample_s
         self.last_price_change: dict[tuple[str, str], float] = {}   # (venue, outcome_id) -> ts of last ask change
+        # Multi-level live orders rely on the exchange filling cheaper levels first (standard price-time
+        # matching, unconfirmed for Novig). Switched off for the session if a fill proves otherwise.
+        self.multi_level_live = True
+        self._last_hedge_levels: list[tuple[float, int]] = []
         self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
         mk.setdefault("max_stake", self.max_stake)
@@ -673,7 +691,7 @@ class Supervisor:
             return
         if self.live:
             await self._send_live_taker("DIRECTIONAL", update, key, side, contracts, reserve, decision.edge,
-                                        decision.capped, limit_price=limit_price)
+                                        decision.capped, limit_price=limit_price, levels=used)
             return
         self._record("DIRECTIONAL", update, side, contracts, stake, fee, decision.edge, decision.capped,
                      price=avg_price)
@@ -730,6 +748,8 @@ class Supervisor:
         for i, (price, size) in enumerate(self._ask_levels(update)):
             if i == 0:
                 n = min(decision.contracts, int(size))
+            elif self.live and not self.multi_level_live:
+                break
             else:
                 level = await self._evaluate(update.venue, price, sharp_q, update.line, label)
                 if level.action != "BET":
@@ -792,7 +812,7 @@ class Supervisor:
         if self.live:
             held.hedged = True        # blocks further hedges while this one fills
             await self._send_live_taker("ARB_HEDGE", update, key, side, contracts, reserve, None, False, held=held,
-                                        limit_price=limit_price)
+                                        limit_price=limit_price, levels=self._last_hedge_levels)
             return
         self._record("ARB_HEDGE", update, side, contracts, cost, fee, None, False, price=avg_price)
         held.legs.append(self.orders[-1])
@@ -829,7 +849,9 @@ class Supervisor:
                                         for v in (first.venue, update.venue)))
         used: list[tuple[float, int]] = []
         spent = 0.0
-        for price, size in self._ask_levels(update):
+        for i, (price, size) in enumerate(self._ask_levels(update)):
+            if i > 0 and self.live and not self.multi_level_live:
+                break
             unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
             if worst_payout - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
                 break
@@ -851,6 +873,7 @@ class Supervisor:
             need = round(ARB_MIN_PROFIT_PER_CONTRACT * contracts, 2)
             if min(scenarios.values()) >= need - 1e-9:
                 avg = round(sum(p * n for p, n in used) / contracts, 6)
+                self._last_hedge_levels = list(used)
                 return True, "ok", contracts, cost, fee, scenarios, avg, used[-1][0]
             used.pop()                                     # fee rounding ate the margin: drop the worst level
         best = update.price + (kalshi_fee_per_contract(update.price * 100) if update.venue == "kalshi" else 0.0)
@@ -892,7 +915,8 @@ class Supervisor:
     # ---------------- live execution ----------------
     async def _send_live_taker(self, kind: str, update: MarketUpdate, key: GameKey, side: str, contracts: int,
                                stake: float, edge: Optional[float], capped: bool,
-                               held: Optional[MarketPosition] = None, limit_price: Optional[float] = None) -> None:
+                               held: Optional[MarketPosition] = None, limit_price: Optional[float] = None,
+                               levels: Optional[list[tuple[float, int]]] = None) -> None:
         """
         Reserve exposure + lock the game, then send a marketable LIMIT order. The limit is the WORST ask level
         we are willing to pay (default: the best ask); the exchange fills cheaper levels first and the real
@@ -930,12 +954,14 @@ class Supervisor:
             return
         leg.exchange_order_id = oid
         self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id, key=key,
-                                          requested=contracts, limit_price=price, leg_id=leg.order_id)
+                                          requested=contracts, limit_price=price, leg_id=leg.order_id,
+                                          expected_levels=levels or [])
         self.stats["live_orders"] += 1
         order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f reserved=$%.2f", kind, oid, update.outcome_id, side,
                        contracts, price, stake)
         self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side, reserved_usd=stake,
-                     payload=payload)
+                     payload=payload, expected_levels=levels or [[price, contracts]],
+                     expected_avg_price=_sweep_avg(levels, contracts) if levels else price)
         self._spawn(self._taker_timeout(oid))
         await self._after_taker(key)
 
@@ -1001,7 +1027,30 @@ class Supervisor:
         if self.research is not None:
             self._research_entry(leg, lo.key)
         self._ledger("DONE", exchange_order_id=lo.exchange_order_id, filled=lo.filled, cost_usd=round(lo.fill_cost, 2),
-                     reason=reason)
+                     reason=reason, avg_fill_price=round(lo.fill_cost / lo.filled, 6),
+                     expected_avg_price=_sweep_avg(lo.expected_levels, lo.filled) if lo.expected_levels else None)
+        self._check_price_improvement(lo)
+
+    def _check_price_improvement(self, lo: LiveOrder) -> None:
+        """
+        A multi-level order should fill the cheaper levels at THEIR prices. If everything came back at the
+        limit while cheaper levels were showing, either Novig fills takers at their limit or the cheap levels
+        vanished first. Either way: stop multi-level orders for the session (best level only) and flag it.
+        """
+        if len(lo.expected_levels) < 2 or lo.filled <= 0 or not self.multi_level_live:
+            return
+        actual = lo.fill_cost / lo.filled
+        expected = _sweep_avg(lo.expected_levels, lo.filled)
+        if actual >= lo.limit_price - 1e-6 and expected < lo.limit_price - 0.004:
+            self.multi_level_live = False
+            self.stats["price_improvement_missing"] += 1
+            log.critical("PRICE_IMPROVEMENT_MISSING order %s filled %g all at the limit %.4f although cheaper levels "
+                         "(expected avg %.4f) were showing: multi-level orders OFF for this session (best level "
+                         "only). Check Novig's matching rules before re-enabling.", lo.exchange_order_id, lo.filled,
+                         lo.limit_price, expected)
+            self._ledger("PRICE_IMPROVEMENT_MISSING", exchange_order_id=lo.exchange_order_id,
+                         avg_fill_price=round(actual, 6), expected_avg_price=round(expected, 6),
+                         limit_price=lo.limit_price, action="multi-level orders disabled for this session")
 
     def _register_quote(self, q) -> None:
         """MakerEngine hook: remember every live quote so its fills can be booked."""

@@ -61,7 +61,13 @@ Every game gets its scheduled start time from the Novig events data (Kalshi: `oc
 ## Size: buying through the book, partial hedges
 * Takers buy through several ask levels while **each** level still clears the 2.5% edge, capped by the
   1/4-Kelly stake of the worst level used, $1,000 per position and the live canary. Live sends one limit
-  order at the worst level (the reservation is sized at that price); the exchange fills cheaper levels first.
+  order at the worst level (the reservation is sized at that price). On a standard price-time exchange that
+  order fills the cheaper levels first, each at its own price; the limit is only a ceiling. This is
+  **unconfirmed for Novig**: every ORDER row records the levels it expected to sweep and every DONE row the
+  real average. If a fill comes back entirely at the limit while cheaper levels were showing, the engine logs
+  `PRICE_IMPROVEMENT_MISSING` and uses the best level only for the rest of the session.
+* Worst case is always inside the caps: sizes are trimmed so that even if every contract fills at the limit,
+  the Kelly stake, the canary stake and $1,000 per position still hold.
 * Hedges do the same while every level still locks at least 1c per contract in every outcome. A hedge
   may be partial (at least 10 contracts); the rest of the first leg stays a directional position and can be
   hedged later.
@@ -126,6 +132,8 @@ Regenerate config schemas with `python config/generate_schemas.py` (a test fails
 
 ## Still to confirm before real money
 * Novig `orders` channel slip shape and order body keys (first canary order proves or disproves them).
+* Novig matching: a buy limit above the best ask fills cheaper levels at their own prices (see
+  `PRICE_IMPROVEMENT_MISSING`).
 * Novig positions endpoint: path, status filter values, field names, pagination (`settlement.py`).
 * Novig REST host `api.novig.us` for `/v1/orders`; whether events embed markets; pagination beyond
   `limit=100` (the bootstrap logs a warning for both).
