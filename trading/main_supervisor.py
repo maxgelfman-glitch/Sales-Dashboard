@@ -76,7 +76,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Awaitable, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
@@ -134,6 +134,8 @@ from sharp_feed import (
     SharpPoller,
 )
 from alerts import AlertHandler
+from kalshi_trading import session_tag
+from novig_private import FillSlip
 from research import DEPTH_SAMPLE_SECONDS, MARKOUT_DELAYS, GapTracker, ResearchRecorder
 from settlement import (
     BASELINE_CAPITAL_USD,
@@ -249,6 +251,10 @@ class LiveOrder(BaseModel):
     fair_prob: Optional[float] = None
     leg_id: Optional[int] = None            # PaperOrder.order_id of the position leg
     expected_levels: list[tuple[float, int]] = Field(default_factory=list)   # book we expected to sweep
+    venue: str = "novig"
+    fill_mode: str = "cumulative"           # Kalshi fills arrive as increments
+    exchange_confirmed_zero: bool = False    # the exchange's own order record says nothing filled
+    fees: float = 0.0                        # Kalshi taker fees included in fill_cost
     filled: float = 0.0
     fill_cost: float = 0.0
     done: bool = False
@@ -381,6 +387,8 @@ class Supervisor:
         sharp_weights: Optional[dict[str, float]] = None,
         taker_require_sharp_moved_last: bool = False,
         taker_max_sharp_move_age_s: Optional[float] = None,
+        kalshi_gateway=None,
+        kalshi_positions_client=None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -410,6 +418,14 @@ class Supervisor:
                                      registry=self.kalshi_registry, on_update=self.on_market_update,
                                      on_state_change=self.on_feed_state, **(kalshi_kwargs or {}))
         self.novig_rest, self.kalshi_rest = novig_rest, kalshi_rest
+        # ---- live Kalshi execution (off unless a Kalshi gateway is given in live mode) ----
+        self.kalshi_gateway = kalshi_gateway
+        self.kalshi_live = bool(live and kalshi_gateway is not None)
+        self.kalshi_positions_client = kalshi_positions_client
+        self.kalshi_fills_confirmed = False            # set by the first Kalshi fill message of the session
+        self.session_tag = session_tag()
+        if self.kalshi_live and self.kalshi is not None:
+            self.kalshi.on_fill = self.on_fill_slip
         self.poller = SharpPoller(sharp_fetch, self.book, sharp_poll_interval)
         self.exposure = exposure or ExposureMonitor()
         self.heartbeat_interval = heartbeat_interval
@@ -428,7 +444,7 @@ class Supervisor:
         self.settlement_interval = settlement_interval
         self.sync_retries, self.sync_retry_delay = sync_retries, sync_retry_delay
         self.processed_settlements, self.cumulative_pnl = load_ledger_settlements(self.ledger_path)
-        self.synced = positions_client is None          # nothing to sync without a positions client
+        self.synced = positions_client is None and kalshi_positions_client is None   # nothing to sync without one
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         # ---- pregame cutoff (never trade or quote into a live game) ----
         self.taker_cutoff_s = taker_cutoff_s
@@ -483,7 +499,7 @@ class Supervisor:
             self._task_factories["maker"] = self.maker.run
         if novig_rest is not None or kalshi_rest is not None:
             self._task_factories["bootstrap"] = self._bootstrap_loop
-        if positions_client is not None:
+        if positions_client is not None or kalshi_positions_client is not None:
             self._task_factories["settlement"] = self._settlement_loop
         self._task_factories["cutoff"] = self._cutoff_loop
         if research is not None:
@@ -579,9 +595,18 @@ class Supervisor:
             log.critical("LIVE novig socket down (prices AND executions): new orders halted; fills during the "
                          "outage may be missed — reconcile with the Novig order history if this persists")
 
-    def _live_ready(self) -> bool:
-        """Live orders only while the single Novig socket (prices + executions) is connected."""
+    def _live_ready(self, venue: str = "novig") -> bool:
+        """Live orders only while that venue's socket (prices + our executions) is connected."""
+        if venue == "kalshi":
+            return (self.kalshi_live and self.synced and self.kalshi is not None
+                    and self.kalshi.connected.is_set())
         return self.live and self.synced and self.feed.connected.is_set()
+
+    def live_venues(self) -> set[str]:
+        return {"novig", "kalshi"} if self.kalshi_live else {"novig"}
+
+    def _gateway(self, venue: str):
+        return self.kalshi_gateway if venue == "kalshi" else self.order_gateway
 
     def record_live_plan(self) -> None:
         """Written at LAUNCH (not by --check-config): which limits this live session runs under and who approved."""
@@ -740,7 +765,7 @@ class Supervisor:
                  decision.kelly_stake_usd, decision.stake_usd, decision.capped,
                  " SUSPICIOUS-EDGE" if decision.suspicious else "")
 
-        if self.live and update.venue != "novig":
+        if self.live and update.venue not in self.live_venues():
             self.stats["kalshi_exec_disabled"] += 1
             log.info("EV_TRIGGER not executed: %s is data-only in live mode", update.venue)
             return
@@ -881,7 +906,8 @@ class Supervisor:
     # ---------------- arbitrage ----------------
     async def _try_arbitrage(self, update: MarketUpdate, key: GameKey, side: str, held: MarketPosition) -> None:
         first = held.primary
-        if self.live and (update.venue != "novig" or first.pending or first.venue != "novig"):
+        venues = self.live_venues()
+        if self.live and (update.venue not in venues or first.pending or first.venue not in venues):
             self.stats["lock_blocked"] += 1
             log.info("POSITION_LOCK live: no hedge on %s (%s)", key,
                      "first leg still filling" if first.pending else "Kalshi is data-only in live mode")
@@ -1027,15 +1053,17 @@ class Supervisor:
         The reservation (`stake`) covers the worst case, so it is never low.
         """
         price = update.price if limit_price is None else limit_price
-        if not self._live_ready():
+        venue = update.venue
+        gateway = self._gateway(venue)
+        if not self._live_ready(venue):
             self.stats["live_not_ready"] += 1
-            log.warning("LIVE order not sent on %s: novig socket is down", update.outcome_id)
+            log.warning("LIVE order not sent on %s: %s socket is down", update.outcome_id, venue)
             if held is not None:
                 held.hedged = False
             return
         staggered = self.multi_level_mode == "staggered" and levels is not None and len(levels) > 1
         tranches = [(p, n) for p, n in levels] if staggered else [(price, contracts)]
-        leg = PaperOrder(order_id=len(self.orders) + 1, kind=kind, venue="novig", outcome_id=update.outcome_id,
+        leg = PaperOrder(order_id=len(self.orders) + 1, kind=kind, venue=venue, outcome_id=update.outcome_id,
                          event_id=update.event_id, league=update.league, market_type=update.market_type, side=side,
                          line=update.line, price=price, contracts=0, stake_usd=0.0, edge=edge, capped=capped,
                          placed_at=time.time(), live=True, pending=True, requested_contracts=contracts)
@@ -1045,12 +1073,16 @@ class Supervisor:
             self.positions[key] = MarketPosition(legs=[leg])
         else:
             held.legs.append(leg)
-        cids = [f"tk-{leg.order_id}" if len(tranches) == 1 else f"tk-{leg.order_id}-{i + 1}"
+        prefix = f"tk-{self.session_tag}-" if venue == "kalshi" else "tk-"     # Kalshi ids must never repeat
+        cids = [f"{prefix}{leg.order_id}" if len(tranches) == 1 else f"{prefix}{leg.order_id}-{i + 1}"
                 for i in range(len(tranches))]
-        payloads = [order_body(update.outcome_id, "buy", round(p * 100, 4), n, cid)
-                    for (p, n), cid in zip(tranches, cids)]
-        results = await asyncio.gather(*(self.order_gateway.place_limit(update.outcome_id, "buy", round(p * 100, 4),
-                                                                        n, cid)
+        if venue == "kalshi":
+            payloads = [gateway.order_body(update.outcome_id, round(p * 100, 4), n, cid, gateway.time_in_force)
+                        for (p, n), cid in zip(tranches, cids)]
+        else:
+            payloads = [order_body(update.outcome_id, "buy", round(p * 100, 4), n, cid)
+                        for (p, n), cid in zip(tranches, cids)]
+        results = await asyncio.gather(*(gateway.place_limit(update.outcome_id, "buy", round(p * 100, 4), n, cid)
                                          for (p, n), cid in zip(tranches, cids)), return_exceptions=True)
         placed = []
         for (p, n), payload, res in zip(tranches, payloads, results):
@@ -1073,11 +1105,12 @@ class Supervisor:
         for oid, p, n, payload in placed:
             self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id,
                                               key=key, requested=n, limit_price=p, leg_id=leg.order_id,
-                                              expected_levels=[] if staggered else (levels or []))
+                                              expected_levels=[] if staggered else (levels or []), venue=venue,
+                                              fill_mode="incremental" if venue == "kalshi" else self.fill_volume_mode)
             self.stats["live_orders"] += 1
             order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f%s", kind, oid, update.outcome_id, side, n, p,
                            f" (tranche of leg #{leg.order_id})" if len(tranches) > 1 else f" reserved=${stake:.2f}")
-            self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side,
+            self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side, venue=venue,
                          reserved_usd=round(p * n, 2) if len(tranches) > 1 else stake, payload=payload,
                          leg=leg.order_id, tranches=len(tranches),
                          expected_levels=[[p, n]] if staggered else (levels or [[p, n]]),
@@ -1101,8 +1134,9 @@ class Supervisor:
         lo = self.live_orders.get(oid)
         if lo is None or lo.done:
             return
+        gateway = self._gateway(lo.venue)
         try:
-            await self.order_gateway.cancel_orders([oid])
+            await gateway.cancel_orders([oid])
             reason = "unfilled remainder cancelled"
             self._ledger("CANCEL", exchange_order_ids=[oid], reason=f"taker timeout {self.taker_fill_timeout}s",
                          source="taker", filled_so_far=lo.filled)
@@ -1110,7 +1144,28 @@ class Supervisor:
             log.critical("LIVE_ORDER could not cancel remainder of %s (%s); reservation KEPT", oid, exc)
             self._ledger("CANCEL_FAILED", exchange_order_ids=[oid], error=str(exc))
             return
-        self._finalize(lo, reason)
+        if lo.venue == "kalshi" and hasattr(gateway, "get_order"):
+            await self._reconcile_kalshi_order(lo, gateway)
+        if not lo.done:
+            self._finalize(lo, reason)
+
+    async def _reconcile_kalshi_order(self, lo: LiveOrder, gateway) -> None:
+        """Kalshi keeps an order record: use it to confirm a zero fill, or book fills the socket missed."""
+        try:
+            order = await gateway.get_order(lo.exchange_order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("KALSHI order %s status check failed: %s", lo.exchange_order_id, exc)
+            return
+        filled = gateway.filled_count(order) if order else None
+        if filled is None:
+            return
+        if filled > lo.filled + 1e-9:
+            missed = filled - lo.filled
+            log.critical("KALSHI order %s: exchange reports %g filled, fill channel showed %g — booking %g at the "
+                         "limit %.4f", lo.exchange_order_id, filled, lo.filled, missed, lo.limit_price)
+            await self.on_fill_slip(FillSlip(order_id=lo.exchange_order_id, status="PARTIAL", filled_volume=missed,
+                                             price_cents=lo.limit_price * 100, venue="kalshi"))
+        lo.exchange_confirmed_zero = filled <= 1e-9
 
     def _leg(self, leg_id: Optional[int]) -> Optional[PaperOrder]:
         return self.orders[leg_id - 1] if leg_id and 0 < leg_id <= len(self.orders) else None
@@ -1137,18 +1192,20 @@ class Supervisor:
                 self.exposure.adjust(leg.position_id, self._leg_exposure(kids))
                 return
             lo = lo.model_copy(update=dict(          # the whole leg, seen as one order from here on
+                exchange_confirmed_zero=all(k.exchange_confirmed_zero for k in kids),
                 exchange_order_id=",".join(k.exchange_order_id for k in kids),
                 requested=sum(k.requested for k in kids), filled=sum(k.filled for k in kids),
                 fill_cost=sum(k.fill_cost for k in kids), limit_price=max(k.limit_price for k in kids),
                 expected_levels=[]))
         leg.pending = False
         pos = self.positions.get(lo.key)
-        if lo.filled <= 0 and not self.orders_channel_confirmed:
+        channel_ok = self.orders_channel_confirmed if lo.venue == "novig" else self.kalshi_fills_confirmed
+        if lo.filled <= 0 and not (channel_ok or lo.exchange_confirmed_zero):
             self.stats["unconfirmed_zero_fill"] += 1
             log.critical("LIVE_UNCONFIRMED %s %s ended with no observed fill, but no execution slip has been seen "
                          "this session: it may have filled unseen. Lock and $%.2f reservation KEPT — check the "
-                         "Novig order history", lo.kind, lo.exchange_order_id,
-                         sum(k.requested * k.limit_price for k in kids))
+                         "%s order history", lo.kind, lo.exchange_order_id,
+                         sum(k.requested * k.limit_price for k in kids), lo.venue.capitalize())
             self.exposure.adjust(leg.position_id, round(sum(k.requested * k.limit_price for k in kids), 2))
             self._ledger("UNCONFIRMED", exchange_order_id=lo.exchange_order_id, reason=reason)
             self.unconfirmed_legs[leg.order_id] = time.time()   # the settlement sweep reconciles it
@@ -1209,7 +1266,11 @@ class Supervisor:
 
     async def on_fill_slip(self, slip) -> None:
         """Execution slips: book real fills into positions and the exposure count."""
-        if not self.orders_channel_confirmed:
+        if getattr(slip, "venue", "novig") == "kalshi":
+            if not self.kalshi_fills_confirmed:
+                self.kalshi_fills_confirmed = True
+                log.info("LIVE Kalshi fill channel confirmed by first fill")
+        elif not self.orders_channel_confirmed:
             self.orders_channel_confirmed = True
             log.info("LIVE orders channel confirmed by first execution slip")
         self._ledger("SLIP", **slip.model_dump())
@@ -1219,7 +1280,7 @@ class Supervisor:
             log.critical("FILL_UNKNOWN slip for order %s we did not place this session: %s — reconcile manually",
                          slip.order_id, slip.model_dump_json())
             return
-        if self.fill_volume_mode == "cumulative":
+        if lo.fill_mode == "cumulative":
             delta = slip.filled_volume - lo.filled
         else:
             delta = slip.filled_volume
@@ -1230,6 +1291,10 @@ class Supervisor:
                 price = lo.limit_price
             lo.filled += delta
             lo.fill_cost += delta * price
+            if lo.venue == "kalshi":                   # taker fee per fill, rounded up: never understated
+                fee = kalshi_taker_fee(int(math.ceil(delta - 1e-9)), price * 100)
+                lo.fees += fee
+                lo.fill_cost += fee
             self.stats["fills"] += 1
             if lo.kind == "MAKER":
                 await self._book_maker_fill(lo, delta, price)
@@ -1566,15 +1631,19 @@ class Supervisor:
         return [(key, leg) for key, pos in self.positions.items() for leg in pos.legs
                 if leg.live and leg.outcome_id == outcome_id]
 
-    def _restore(self, pos, source: str) -> PaperOrder:
+    def _position_clients(self) -> list[tuple[str, Any]]:
+        return [(v, c) for v, c in (("novig", self.positions_client), ("kalshi", self.kalshi_positions_client))
+                if c is not None]
+
+    def _restore(self, pos, source: str, venue: str = "novig") -> PaperOrder:
         """Book an exchange position the engine did not know about as a real liability."""
-        info = self.registry.get(pos.outcome_id)
+        info = (self.kalshi_registry if venue == "kalshi" else self.registry).get(pos.outcome_id)
         canon = self._canonical(MarketUpdate.from_info(info)) if info is not None else None
         key, side = canon if canon else (("UNMAPPED", pos.outcome_id, "", ""), pos.outcome_id)
         # exposure = what the position cost; unknown cost -> contracts x $1 (the most it can lose is its cost <= $1)
         stake = round(pos.cost_usd if pos.cost_usd is not None else pos.contracts * 1.0, 2)
         price = (pos.cost_usd / pos.contracts) if pos.cost_usd and pos.contracts else 0.5
-        leg = PaperOrder(order_id=len(self.orders) + 1, kind="RESTORED", venue="novig", outcome_id=pos.outcome_id,
+        leg = PaperOrder(order_id=len(self.orders) + 1, kind="RESTORED", venue=venue, outcome_id=pos.outcome_id,
                          event_id=(info.event_id if info else pos.event_id) or "", league=info.league if info else "",
                          market_type=info.market_type if info else "", side=side, line=info.line if info else None,
                          price=min(max(price, 0.0001), 0.9999), contracts=int(round(pos.contracts)), stake_usd=stake,
@@ -1582,7 +1651,7 @@ class Supervisor:
         self.exposure.record_fill(leg.position_id, stake)
         self.orders.append(leg)
         self.positions.setdefault(key, MarketPosition(legs=[])).legs.append(leg)
-        self._ledger("RESTORE", source=source, restore_id=leg.position_id, outcome_id=pos.outcome_id,
+        self._ledger("RESTORE", source=source, venue=venue, restore_id=leg.position_id, outcome_id=pos.outcome_id,
                      game_id=leg.event_id, market_type=leg.market_type, side=side, contracts=leg.contracts,
                      exposure_usd=stake, mapped=canon is not None, open_exposure_usd=self.exposure.open_exposure)
         if canon is None:
@@ -1591,21 +1660,24 @@ class Supervisor:
         return leg
 
     async def startup_sync(self) -> bool:
-        """Live: load every OPEN exchange position before trading. Returns False if it could not be done."""
-        if self.positions_client is None:
-            return True
-        for attempt in range(1, self.sync_retries + 1):
-            try:
-                open_positions = await self.positions_client.open_positions()
-                break
-            except Exception as exc:  # noqa: BLE001
-                log.error("SYNC attempt %d/%d failed (%s: %s)", attempt, self.sync_retries, type(exc).__name__, exc)
-                if attempt == self.sync_retries:
-                    log.critical("SYNC could not load open positions from Novig: live trading will NOT start")
-                    self._ledger("SYNC_FAILED", attempts=attempt, error=f"{type(exc).__name__}: {exc}")
-                    return False
-                await asyncio.sleep(self.sync_retry_delay)
-        restored = [self._restore(p, "startup") for p in open_positions if not p.is_settled]
+        """Live: load every OPEN exchange position (every venue we trade) before trading. False = could not."""
+        restored = []
+        for venue, client in self._position_clients():
+            for attempt in range(1, self.sync_retries + 1):
+                try:
+                    open_positions = await client.open_positions()
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    log.error("SYNC %s attempt %d/%d failed (%s: %s)", venue, attempt, self.sync_retries,
+                              type(exc).__name__, exc)
+                    if attempt == self.sync_retries:
+                        log.critical("SYNC could not load open positions from %s: live trading will NOT start",
+                                     venue.capitalize())
+                        self._ledger("SYNC_FAILED", venue=venue, attempts=attempt,
+                                     error=f"{type(exc).__name__}: {exc}")
+                        return False
+                    await asyncio.sleep(self.sync_retry_delay)
+            restored += [self._restore(p, "startup", venue) for p in open_positions if not p.is_settled]
         self.synced = True
         total = round(sum(l.stake_usd for l in restored), 2)
         log.warning("SYNC restored %d open exchange position(s) worth $%.2f; open exposure $%.2f of $%.2f%s",
@@ -1654,10 +1726,20 @@ class Supervisor:
         return row
 
     async def settlement_sweep(self) -> list[dict]:
-        """Settle what the exchange says settled; restore untracked open positions; resolve UNCONFIRMED orders."""
-        client = self.positions_client
-        if client is None:
-            return []
+        """Every venue: settle what it says settled; restore untracked open positions; resolve UNCONFIRMED orders."""
+        rows = []
+        for venue, client in self._position_clients():
+            try:
+                rows += await self._sweep_venue(venue, client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — one venue failing must not stop the other's sweep
+                log.error("SETTLEMENT %s sweep failed (%s: %s)", venue, type(exc).__name__, exc)
+                if len(self._position_clients()) == 1:
+                    raise
+        return rows
+
+    async def _sweep_venue(self, venue: str, client) -> list[dict]:
         settled = await client.settled_positions()
         open_positions = await client.open_positions()
         rows = []
@@ -1674,6 +1756,8 @@ class Supervisor:
             leg = self._leg(leg_id)
             if leg is None:
                 self.unconfirmed_legs.pop(leg_id, None)
+                continue
+            if leg.venue != venue:
                 continue
             key = next((k for k, pos in self.positions.items() if leg in pos.legs), None)
             if leg.outcome_id in open_by_outcome:
@@ -1699,7 +1783,7 @@ class Supervisor:
                 continue          # the exchange's open list can lag its settlements: never resurrect a settled one
             tracked = self._legs_for_outcome(outcome)
             if not tracked:
-                rows.append({"restored": self._restore(exch, "sweep").position_id})
+                rows.append({"restored": self._restore(exch, "sweep", venue).position_id})
             else:
                 ours = sum(l.contracts for _, l in tracked)
                 if abs(ours - exch.contracts) > 1e-6 and not any(l.pending for _, l in tracked):
@@ -1815,7 +1899,7 @@ class Supervisor:
                         "are unknown to this engine — cancel them in the Novig UI first.",
                         self.order_gateway.api_base if hasattr(self.order_gateway, "api_base") else "the gateway")
         await self.bootstrap()
-        if self.live and self.positions_client is not None and not await self.startup_sync():
+        if self.live and self._position_clients() and not await self.startup_sync():
             log.critical("SUPERVISOR stopping: startup position sync failed, refusing to trade blind")
             await self.shutdown({})
             return
@@ -1851,7 +1935,8 @@ class Supervisor:
             if isinstance(result, Exception):
                 log.error("SUPERVISOR task %s raised during shutdown: %r", name, result)
         closeables = {id(c): c for c in (self.poller.fetch, self.novig_rest, self.kalshi_rest, self.maker_gateway,
-                                         self.order_gateway, self.positions_client) if c is not None}
+                                         self.order_gateway, self.positions_client, self.kalshi_gateway,
+                                         self.kalshi_positions_client) if c is not None}
         for closeable in closeables.values():
             closer = getattr(closeable, "close", None)
             if closer is not None:
@@ -2179,6 +2264,21 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         kw = dict(kalshi_url=env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
                   kalshi_auth=(key_id, pk),
                   kalshi_rest=KalshiRestClient(rest_base, key_id, pk, series_from_env(env.get("KALSHI_SERIES"))))
+        if (env.get("KALSHI_LIVE_TRADING") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            if not live:
+                raise ConfigError("KALSHI_LIVE_TRADING=1 only applies with TRADING_MODE=live (paper already "
+                                  "simulates Kalshi trades)")
+            if not (key_id and pk is not None):
+                raise ConfigError("KALSHI_LIVE_TRADING=1 needs KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH")
+            from kalshi_trading import KalshiOrderGateway, KalshiPositionsClient
+            tif = (env.get("KALSHI_TIME_IN_FORCE") or "immediate_or_cancel").strip()
+            kw.update(kalshi_gateway=KalshiOrderGateway(rest_base, key_id, pk,
+                                                        time_in_force=None if tif.lower() == "none" else tif),
+                      kalshi_positions_client=KalshiPositionsClient(rest_base, key_id, pk))
+            log.critical("LIVE Kalshi execution ENABLED (%s): same canary stake/exposure limits as Novig, "
+                         "immediate-or-cancel orders", "PROD" if prod else "DEMO")
+    elif (env.get("KALSHI_LIVE_TRADING") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+        raise ConfigError("KALSHI_LIVE_TRADING=1 needs KALSHI_ENABLED=1 (the Kalshi feed carries our fills)")
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
@@ -2217,7 +2317,9 @@ def describe_state(sup: Supervisor) -> dict:
         "ping_interval_s": sup.feed.ping_interval,
         "ping_timeout_s": sup.feed.ping_timeout,
         "stale_stream_s": sup.feed.stale_after,
-        "kalshi": "off" if sup.kalshi is None else ("data-only" if sup.live else "paper execution"),
+        "kalshi": "off" if sup.kalshi is None else (
+            ("LIVE execution (IOC orders, fill channel, positions sync)" if sup.kalshi_live else "data-only")
+            if sup.live else "paper execution"),
         "kalshi_socket": None if sup.kalshi is None else sup.kalshi.url,
         "kalshi_rest": None if sup.kalshi_rest is None else sup.kalshi_rest.base_url,
         "dead_heat_venues": sorted(DEAD_HEAT_VENUES),

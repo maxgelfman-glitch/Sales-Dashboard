@@ -40,7 +40,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union
 
 import aiohttp
 
@@ -206,6 +206,7 @@ class KalshiFeed(ResilientWebSocketFeed):
         ping_timeout: float = PING_TIMEOUT_SECONDS,
         stale_after: float = STALE_STREAM_SECONDS,
         open_timeout: float = OPEN_TIMEOUT_SECONDS,
+        on_fill: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> None:
         super().__init__(url or DEFAULT_KALSHI_WS_URL, on_state_change, reconnect_delay, ping_interval,
                          ping_timeout, stale_after, open_timeout, logger=log)
@@ -213,6 +214,8 @@ class KalshiFeed(ResilientWebSocketFeed):
         self.private_key = private_key
         self.registry = registry if registry is not None else MarketRegistry()
         self.on_update = on_update
+        self.on_fill = on_fill            # live Kalshi trading: our own fills (authenticated "fill" channel)
+        self.fills_received = 0
         self.books: dict[str, KalshiBook] = {}
         self.latest: dict[str, MarketUpdate] = {}
         self._seq: dict[Any, int] = {}
@@ -232,6 +235,9 @@ class KalshiFeed(ResilientWebSocketFeed):
                                                         "market_tickers": self.tickers()}}
         await ws.send(json.dumps(cmd))
         log.info("CONN kalshi subscribed orderbook_delta for %d tickers", len(cmd["params"]["market_tickers"]))
+        if self.on_fill is not None:
+            await ws.send(json.dumps({"id": 2, "cmd": "subscribe", "params": {"channels": ["fill"]}}))
+            log.info("CONN kalshi subscribed fill (our executions)")
 
     def _clear_state(self) -> dict[str, int]:
         counts = {"stale_price_frames": len(self.latest), "order_books": len(self.books)}
@@ -255,6 +261,15 @@ class KalshiFeed(ResilientWebSocketFeed):
         msg = payload.get("msg") if isinstance(payload.get("msg"), dict) else {}
         if kind == "error":
             log.error("KALSHI server error: %s", msg or payload)
+            return
+        if kind == "fill":
+            if self.on_fill is not None:
+                from kalshi_trading import parse_kalshi_fill      # local: kalshi_trading imports this module
+                slip = parse_kalshi_fill(payload)
+                if slip is not None:
+                    self.fills_received += 1
+                    log.info("KALSHI_FILL %s", slip.model_dump_json())
+                    await safe_call(self.on_fill, slip, logger=log)
             return
         if kind not in {"orderbook_snapshot", "orderbook_delta"}:
             return  # subscription acks, heartbeats, other channels

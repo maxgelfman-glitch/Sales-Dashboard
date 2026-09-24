@@ -5,7 +5,8 @@ to de-vigged sharp odds, and takes +EV positions (1/4 Kelly, $1,000 cap, Kalshi
 edges net of taker fee). It also runs a two-sided maker loop on Novig and enforces
 a cross-venue one-position-per-game lock with a scenario-checked arbitrage
 exception and a $15,000 global exposure kill-switch.
-**Paper trading by default.** Live Novig execution exists behind an explicit gate (below); Kalshi is data-only in live mode.
+**Paper trading by default.** Live Novig execution exists behind an explicit gate (below). Live Kalshi execution
+exists behind a second gate (`KALSHI_LIVE_TRADING=1`); without it Kalshi is data-only in live mode.
 Runs 24/7 on a small server: see `docs/deploy.md`. Open questions for the venues: `docs/venue_questions.md`.
 
 | File | Role |
@@ -173,6 +174,18 @@ positions (e.g. manual trades). Endpoint settings: `NOVIG_POSITIONS_PATH` (defau
 3. Only then set `LIVE_SCALE_APPROVED_BY` and raise limits / enable `MAKER_MODE` step by step.
 
 Regenerate config schemas with `python config/generate_schemas.py` (a test fails if they drift).
+
+## Live Kalshi execution (`KALSHI_LIVE_TRADING=1`, second gate)
+Needs `TRADING_MODE=live`, `KALSHI_ENABLED=1`, `KALSHI_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH` (`KALSHI_ENV=demo` first).
+* Orders: `POST /portfolio/orders`, buy YES on the outcome's ticker, **immediate-or-cancel**, so nothing rests.
+  Client ids carry a per-session tag, so they never repeat across restarts.
+* Fills: the authenticated `fill` channel on the same Kalshi socket (incremental counts). The taker fee is
+  added to each fill's cost, rounded up. If no fill arrives, Kalshi's order record (`GET /portfolio/orders/{id}`)
+  confirms a zero fill before the reservation is released, and books any fill the socket missed.
+* Positions: `/portfolio/positions` at startup and `/portfolio/settlements` in the 15-minute sweep (payout =
+  revenue), so Kalshi exposure is released like Novig's.
+* Same canary stake/exposure limits, per-game cap, cutoffs and live-game stop as Novig. Cross-venue hedges
+  (Novig ↔ Kalshi) are allowed in live mode once this gate is on.
 
 ## Still to confirm before real money
 * Novig `orders` channel slip shape and order body keys (first canary order proves or disproves them).
