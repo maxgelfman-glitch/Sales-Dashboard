@@ -135,6 +135,7 @@ class MarketInfo(BaseModel):
     away_team: str
     outcome: str                              # team name, or "over"/"under"
     line: Optional[float] = None              # this outcome's spread, or the total
+    start_time: Optional[float] = None        # scheduled game start (epoch seconds, UTC); drives the pregame cutoff
 
     @field_validator("outcome_id", "market_id", "event_id", mode="before")
     @classmethod
@@ -173,6 +174,7 @@ class MarketUpdate(BaseModel):
     available_volume: float = 0.0                             # contracts at the best ask
     best_bid: Optional[float] = Field(default=None, gt=0, lt=1)
     bid_volume: float = 0.0
+    start_time: Optional[float] = None                        # scheduled game start (epoch seconds, UTC)
     received_at: float = Field(default_factory=time.time)
 
     @classmethod

@@ -46,6 +46,7 @@ import aiohttp
 
 from execution import cents_to_american, cents_to_probability
 from novig_feed import MarketInfo, MarketRegistry, MarketUpdate, UpdateCallback
+from novig_rest import parse_start_time
 from team_normalizer import normalize_team_name
 from ws_base import (
     OPEN_TIMEOUT_SECONDS,
@@ -332,9 +333,13 @@ def parse_kalshi_markets(payload: Any, league: str) -> list[MarketInfo]:
             if team not in {home, away}:
                 continue
             sibling = next((t for t in tickers if t != m["ticker"]), None) if len(tickers) == 2 else None
+            # ASSUMED field: Kalshi's scheduled occurrence time. Novig's start time for the same game is used when
+            # this is missing (the supervisor keys the cutoff on the canonical game, across venues).
+            start = parse_start_time(m.get("occurrence_datetime") or m.get("expected_start_time"))
             rows.append(MarketInfo(venue="kalshi", outcome_id=m["ticker"], market_id=event_ticker,
                                    sibling_outcome_id=sibling, league=league, market_type="moneyline",
-                                   event_id=event_ticker, home_team=home, away_team=away, outcome=team))
+                                   event_id=event_ticker, home_team=home, away_team=away, outcome=team,
+                                   start_time=start))
     return rows
 
 

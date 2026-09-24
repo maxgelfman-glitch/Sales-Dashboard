@@ -19,6 +19,8 @@ exception and a $15,000 global exposure kill-switch.
 | `team_normalizer.py` | Cross-feed team-name mapping |
 | `main_supervisor.py` | Orchestrator: bootstrap, lock, arbitrage scenarios (incl. NFL ties), maker wiring, logging |
 | `settlement.py` | Exchange positions: parsing, settlement P&L (WIN/LOSS/TIE 50¢/VOID), positions REST client |
+| `research.py` | Measurement rows (`research/research-YYYYMMDD.jsonl`): decisions, entries, closing lines, markouts, depth, cross-venue gaps |
+| `research_report.py` | Summarises the research rows: CLV, markouts, liquidity by time to start, gap frequency/profit, near misses |
 | `dashboard.py` | Read-only Streamlit cockpit (separate process; tails `live_ledger.jsonl` + `trading_engine.log`) |
 | `mock_novig_server.py` | Local fake exchange used by tests and `--simulate` |
 
@@ -40,6 +42,26 @@ export SHARP_PROVIDER_CONFIG=config/sharp_provider.json
 export KALSHI_ENABLED=1 KALSHI_ENV=demo KALSHI_KEY_ID=... KALSHI_PRIVATE_KEY_PATH=/secure/kalshi.pem
 python main_supervisor.py
 ```
+
+## Pregame cutoff (never trade into a live game)
+Every game gets its scheduled start time from the Novig events data (Kalshi: `occurrence_datetime`).
+From `PREGAME_CUTOFF_MINUTES` (default 10) before the start, the engine places **no new orders on that game,
+arbitrage hedges included**. A 1-second loop pulls every resting maker quote on it and writes a `CUTOFF`
+row to the ledger. **In live mode a game with no known start time is never traded.** The start-time field
+name is assumed (`novig_rest.START_TIME_KEYS`); if Novig uses another name, live mode simply trades nothing,
+which is the safe failure.
+
+## Measuring the edge (research data)
+On by default (`RESEARCH_ENABLED=1`, folder `RESEARCH_DIR=research`), in paper and live mode:
+```bash
+python main_supervisor.py --simulate 60      # demo data -> logs/research/
+python research_report.py --dir logs/research
+python research_report.py --since 2026-10-01 # real runs: ./research
+```
+The report answers: did our entries beat the closing line (CLV), are maker fills picked off (markouts),
+how much size sits at the best price by time to start, and how often, how long and how deep cross-venue
+locked-profit gaps are (Novig free, Kalshi taker fee, ProphetX 2% of winnings, NFL ties at 50c).
+Two to four weeks of paper data are enough to decide whether the strategy is worth scaling.
 
 ## Dashboard (read-only cockpit)
 ```bash

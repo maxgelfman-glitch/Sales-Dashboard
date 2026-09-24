@@ -29,6 +29,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional, Protocol
 from urllib.parse import parse_qs, urlparse
 
@@ -74,6 +75,27 @@ def _name(v: Any) -> Optional[str]:
     return None
 
 
+# Event start-time spellings accepted (ASSUMED: Novig's docs describe a "scheduled start time" per event).
+START_TIME_KEYS = ("startTime", "start_time", "scheduledStart", "scheduled_start", "scheduledStartTime",
+                   "startsAt", "starts_at", "commence_time", "commenceTime", "eventStartTime", "start")
+
+
+def parse_start_time(value: Any) -> Optional[float]:
+    """ISO-8601 string or epoch seconds / milliseconds -> epoch seconds (UTC). None if unparseable."""
+    if value is None or value == "":
+        return None
+    try:
+        v = float(value)
+        return v / 1000.0 if v > 1e11 else v
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
 def parse_event_hierarchy(payload: Any) -> list[MarketInfo]:
     """Flatten events -> markets -> outcomes into MarketInfo rows. Never raises; bad nodes are skipped."""
     events = payload if isinstance(payload, list) else (_first(payload, "events", "data", "results") or [])
@@ -86,6 +108,7 @@ def parse_event_hierarchy(payload: Any) -> list[MarketInfo]:
         if status in CLOSED_STATUSES:
             continue
         event_id = _first(ev, "eventId", "event_id", "id")
+        start = parse_start_time(_first(ev, *START_TIME_KEYS))
         league = _name(_first(ev, "league", "leagueName", "league_name", "competition"))
         home = _name(_first(ev, "homeTeam", "home_team", "home"))
         away = _name(_first(ev, "awayTeam", "away_team", "away"))
@@ -120,7 +143,8 @@ def parse_event_hierarchy(payload: Any) -> list[MarketInfo]:
                     rows.append(MarketInfo(venue="novig", outcome_id=str(oid), market_id=str(market_id),
                                            sibling_outcome_id=str(sib), league=league, market_type=mtype,
                                            event_id=str(event_id), home_team=home, away_team=away,
-                                           outcome=name or "", line=None if line is None else float(line)))
+                                           outcome=name or "", line=None if line is None else float(line),
+                                           start_time=start))
                 except Exception:  # noqa: BLE001 — one bad node never breaks the bootstrap
                     skipped += 1
     if skipped:

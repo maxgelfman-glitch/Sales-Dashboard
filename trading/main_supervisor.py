@@ -128,6 +128,7 @@ from sharp_feed import (
     SharpLine,
     SharpPoller,
 )
+from research import DEPTH_SAMPLE_SECONDS, MARKOUT_DELAYS, GapTracker, ResearchRecorder
 from settlement import (
     BASELINE_CAPITAL_USD,
     DEFAULT_POSITIONS_PATH,
@@ -151,6 +152,7 @@ DEAD_HEAT_VENUES = frozenset({"novig", "kalshi"})
 DEAD_HEAT_PAYOUT = 0.50
 BOOTSTRAP_REFRESH_SECONDS = 300.0
 TAKER_FILL_TIMEOUT_SECONDS = 2.0       # live: cancel any unfilled taker remainder after this
+PREGAME_CUTOFF_SECONDS = 600.0         # stop trading/quoting a game this long before its scheduled start
 
 log = logging.getLogger("trading.supervisor")
 bridge_log = logging.getLogger("trading.bridge")
@@ -316,6 +318,11 @@ class Supervisor:
         settlement_interval: float = SETTLEMENT_SWEEP_SECONDS,
         sync_retries: int = 5,
         sync_retry_delay: float = 10.0,
+        # --- pregame cutoff & research ---
+        pregame_cutoff_s: float = PREGAME_CUTOFF_SECONDS,
+        require_start_time: Optional[bool] = None,
+        research: Optional[ResearchRecorder] = None,
+        depth_sample_s: float = DEPTH_SAMPLE_SECONDS,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -355,6 +362,17 @@ class Supervisor:
         self.processed_settlements, self.cumulative_pnl = load_ledger_settlements(self.ledger_path)
         self.synced = positions_client is None          # nothing to sync without a positions client
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
+        # ---- pregame cutoff (never trade or quote into a live game) ----
+        self.pregame_cutoff_s = pregame_cutoff_s
+        self.require_start_time = live if require_start_time is None else require_start_time
+        self.game_start: dict[tuple, float] = {}          # (league, home, away) -> scheduled start (epoch)
+        self.cutoff_done: set[tuple] = set()
+        self._cutoff_noted: set[tuple] = set()
+        # ---- research / measurement ----
+        self.research = research
+        self.gaps = GapTracker(research) if research is not None else None
+        self.depth_sample_s = depth_sample_s
+        self.last_price_change: dict[tuple[str, str], float] = {}   # (venue, outcome_id) -> ts of last ask change
         self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
         mk.setdefault("max_stake", self.max_stake)
@@ -380,6 +398,10 @@ class Supervisor:
             self._task_factories["bootstrap"] = self._bootstrap_loop
         if positions_client is not None:
             self._task_factories["settlement"] = self._settlement_loop
+        self._task_factories["cutoff"] = self._cutoff_loop
+        if research is not None:
+            self._task_factories["research_depth"] = self._depth_loop
+        self._index_start_times()
 
     # backwards-compatible alias used by older callers/tests
     @property
@@ -397,6 +419,7 @@ class Supervisor:
             try:
                 n = self.registry.replace_all(await self.novig_rest.fetch_open_markets())
                 log.info("BOOTSTRAP novig registry now holds %d outcomes", n)
+                self._index_start_times()
             except Exception as exc:  # noqa: BLE001 — retried by the refresh loop
                 log.error("BOOTSTRAP novig failed (%s: %s); keeping previous registry", type(exc).__name__, exc)
         if self.kalshi_rest is not None and self.kalshi is not None:
@@ -404,6 +427,7 @@ class Supervisor:
                 before = set(self.kalshi.tickers())
                 n = self.kalshi_registry.replace_all(await self.kalshi_rest.fetch_open_markets())
                 log.info("BOOTSTRAP kalshi registry now holds %d outcomes", n)
+                self._index_start_times()
                 if set(self.kalshi.tickers()) != before and self.kalshi._ws is not None:
                     log.info("BOOTSTRAP kalshi ticker set changed: reconnecting to resubscribe")
                     await self.kalshi._ws.close()
@@ -420,6 +444,8 @@ class Supervisor:
         venue = details.get("venue", "novig")
         self.stats[f"conn_{venue}_{state.lower()}"] += 1
         log.info("CONN_STATE %s %s %s", venue, state, json.dumps(details, default=str))
+        if state == "DISCONNECTED" and self.gaps is not None:
+            self.gaps.drop_venue(venue)                 # stale prices must not count as cross-venue gaps
         if state == "DISCONNECTED" and venue == "novig" and self.maker is not None and self.maker.quotes:
             await self.maker.cancel_all("novig websocket drop")
         if state == "DISCONNECTED" and venue == "novig" and self.live:
@@ -492,10 +518,24 @@ class Supervisor:
                                update.outcome_id, update.home_team, update.away_team, update.outcome)
             return
         key, side = canon
+        gid = key[:3]
+        if update.start_time:
+            self._note_start(gid, update.start_time)
+        if previous is None or previous.price != update.price:
+            self.last_price_change[(update.venue, update.outcome_id)] = time.time()
+        if self.gaps is not None:
+            self._research_gap(update, key, side)
 
         if not self.live and update.venue == "novig" and self.maker is not None and self.maker.quotes:
             await self._simulate_maker_fills(update, key)
 
+        blocked = self._trade_blocked(gid)
+        if blocked:
+            self.stats["cutoff_blocked"] += 1
+            if (gid, blocked) not in self._cutoff_noted:
+                self._cutoff_noted.add((gid, blocked))
+                log.info("CUTOFF no trading on %s: %s", gid, blocked)
+            return
         if update.price is None:
             return
         held = self.positions.get(key)
@@ -526,6 +566,8 @@ class Supervisor:
             decision = await evaluate_market_edge(NovigQuote(price=update.price, line=update.line, label=label),
                                                   sharp_q)
         self.stats[f"decision_{decision.action.lower()}"] += 1
+        if self.research is not None:
+            self._research_decision(update, key, side, decision)
         log.info("DECISION %s %s %s %s edge=%s stake=$%.2f fee=$%.2f reason=%s", decision.action, update.venue,
                  key, side, "n/a" if decision.edge is None else f"{decision.edge:+.4%}", decision.stake_usd,
                  decision.fee_usd, decision.reason)
@@ -653,6 +695,9 @@ class Supervisor:
         self.orders.append(order)
         self.stats["paper_orders"] += 1
         order_log.info("ORDER PAPER %s", order.model_dump_json())
+        if self.research is not None and (not self.live or kind == "MAKER_FILL"):
+            canon = self._canonical(update)
+            self._research_entry(order, canon[0] if canon else None)
         return order
 
     # ---------------- live execution ----------------
@@ -756,6 +801,8 @@ class Supervisor:
                         lo.exchange_order_id, lo.filled, pos.primary.contracts, pos.primary.contracts - lo.filled)
         log.info("LIVE_DONE %s %s filled %g/%d cost=$%.2f (%s)", lo.kind, lo.exchange_order_id, lo.filled,
                  lo.requested, lo.fill_cost, reason)
+        if self.research is not None:
+            self._research_entry(leg, lo.key)
         self._ledger("DONE", exchange_order_id=lo.exchange_order_id, filled=lo.filled, cost_usd=round(lo.fill_cost, 2),
                      reason=reason)
 
@@ -835,6 +882,7 @@ class Supervisor:
             leg.live = True
             leg.exchange_order_id = lo.exchange_order_id
             lo.leg_id = leg.order_id
+            self._schedule_markouts(key, side, info.line, price, int(round(delta)))
             if key in self.positions:
                 self.positions[key].legs.append(leg)
             else:
@@ -846,6 +894,153 @@ class Supervisor:
         if self.maker is not None:
             self.maker.on_fill(lo.exchange_order_id)
             await self.maker.cancel_market(lo.key, "maker fill: position lock")
+
+    # ---------------- pregame cutoff ----------------
+    def _note_start(self, gid: tuple, start: float) -> None:
+        prev = self.game_start.get(gid)
+        self.game_start[gid] = start if prev is None else min(prev, start)
+
+    def _index_start_times(self) -> None:
+        """Learn scheduled start times from every registry (any venue) for every canonical game."""
+        for reg in (self.registry, self.kalshi_registry):
+            for info in reg.all():
+                if info.start_time:
+                    canon = self._canonical(MarketUpdate.from_info(info))
+                    if canon is not None:
+                        self._note_start(canon[0][:3], info.start_time)
+
+    def minutes_to_start(self, gid: tuple) -> Optional[float]:
+        start = self.game_start.get(gid)
+        return None if start is None else round((start - time.time()) / 60.0, 2)
+
+    def _trade_blocked(self, gid: tuple) -> Optional[str]:
+        """Why this game may not be traded or quoted right now (None = allowed)."""
+        start = self.game_start.get(gid)
+        if start is None:
+            return "no scheduled start time (required in live mode)" if self.require_start_time else None
+        if time.time() >= start - self.pregame_cutoff_s:
+            return f"pregame cutoff ({self.pregame_cutoff_s / 60:.0f} min before start)"
+        return None
+
+    async def _cutoff_loop(self) -> None:
+        """Every second: games entering the cutoff window get every quote pulled and their closing line recorded."""
+        while True:
+            try:
+                await self.run_cutoffs()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("CUTOFF loop error (continuing)")
+            await asyncio.sleep(1.0)
+
+    async def run_cutoffs(self) -> list[tuple]:
+        now = time.time()
+        newly = [gid for gid, start in self.game_start.items()
+                 if gid not in self.cutoff_done and now >= start - self.pregame_cutoff_s]
+        for gid in newly:
+            self.cutoff_done.add(gid)
+            pulled = 0
+            if self.maker is not None:
+                for mk in {q.market_key for q in self.maker.quotes.values() if tuple(q.market_key)[:3] == gid}:
+                    before = len(self.maker.quotes)
+                    await self.maker.cancel_market(mk, "pregame cutoff")
+                    pulled += before - len(self.maker.quotes)
+            log.warning("CUTOFF %s reached (%.1f min to start): %d quote(s) pulled, no new orders",
+                        gid, (self.game_start[gid] - now) / 60, pulled)
+            self._ledger("CUTOFF", game=list(gid), quotes_pulled=pulled, minutes_to_start=self.minutes_to_start(gid))
+            if self.research is not None:
+                self._research_close(gid)
+        return newly
+
+    # ---------------- research hooks ----------------
+    def _sides(self, key: tuple) -> tuple[str, str]:
+        return ("over", "under") if key[3] == "total" else (key[1], key[2])
+
+    def _latest_updates(self):
+        yield from self.feed.latest.values()
+        if self.kalshi is not None:
+            yield from self.kalshi.latest.values()
+
+    def _research_gap(self, update: MarketUpdate, key: tuple, side: str) -> None:
+        tie = DEAD_HEAT_PAYOUT if key[0] == "NFL" and key[3] == "moneyline" else None
+        self.gaps.update(key, update.venue, side, update.price, update.available_volume, update.line, tie,
+                         self._sides(key), self.minutes_to_start(key[:3]))
+
+    def _research_decision(self, update: MarketUpdate, key: tuple, side: str, decision) -> None:
+        age = self.book.age_of(key[0], key[1], key[2], key[3], side)
+        venue_change = self.last_price_change.get((update.venue, update.outcome_id))
+        sharp_at = None if age is None else time.time() - age
+        self.research.write(
+            "DECISION", venue=update.venue, outcome_id=update.outcome_id, game=list(key), side=side,
+            line=update.line, price=update.price, depth=update.available_volume, fair_prob=decision.fair_prob,
+            edge=decision.edge, action=decision.action, reason=decision.reason, fee_usd=decision.fee_usd,
+            sharp_age_s=None if age is None else round(age, 3),
+            moved_last=None if venue_change is None or sharp_at is None else (
+                update.venue if venue_change > sharp_at else "sharp"),
+            minutes_to_start=self.minutes_to_start(key[:3]))
+
+    def _research_entry(self, leg: PaperOrder, canon_key: Optional[tuple]) -> None:
+        self.research.write("ENTRY", order_id=leg.order_id, order_kind=leg.kind, venue=leg.venue, live=leg.live,
+                            outcome_id=leg.outcome_id, game=list(canon_key) if canon_key else None, side=leg.side,
+                            line=leg.line, price=leg.price, contracts=leg.contracts, stake_usd=leg.stake_usd,
+                            edge=leg.edge, minutes_to_start=self.minutes_to_start(canon_key[:3]) if canon_key else None)
+
+    def _research_close(self, gid: tuple) -> None:
+        """Closing snapshot at the cutoff: sharp fair value and venue prices for every side of every market."""
+        for upd in list(self._latest_updates()):
+            canon = self._canonical(upd)
+            if canon is None or canon[0][:3] != gid:
+                continue
+            key, side = canon
+            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=upd.line)
+            fair = self._fair(sharp) if sharp is not None and (
+                upd.line is None or sharp.line is None or math.isclose(upd.line, sharp.line)) else None
+            self.research.write("CLOSE", game=list(key), side=side, line=upd.line, venue=upd.venue,
+                                outcome_id=upd.outcome_id, close_fair_prob=fair, ask=upd.price, bid=upd.best_bid,
+                                depth=upd.available_volume, minutes_to_start=self.minutes_to_start(gid))
+
+    def _schedule_markouts(self, key: tuple, side: str, line: Optional[float], price: float, contracts: int) -> None:
+        if self.research is None:
+            return
+
+        async def markouts() -> None:
+            start = time.time()
+            for delay in MARKOUT_DELAYS:
+                await asyncio.sleep(max(0.0, start + delay - time.time()))
+                sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=line)
+                fair = self._fair(sharp) if sharp is not None else None
+                self.research.write("MARKOUT", game=list(key), side=side, line=line, fill_price=price,
+                                    contracts=contracts, delay_s=delay, fair_prob=fair,
+                                    markout_per_contract=None if fair is None else round(fair - price, 5))
+        self._spawn(markouts())
+
+    async def _depth_loop(self) -> None:
+        """Once a minute: top of book for every outcome (the liquidity curve) + cheapest cross-venue combination."""
+        while True:
+            await asyncio.sleep(self.depth_sample_s)
+            try:
+                self.sample_depth()
+            except Exception:  # noqa: BLE001
+                log.exception("RESEARCH depth sample failed (continuing)")
+
+    def sample_depth(self) -> int:
+        n = 0
+        for upd in list(self._latest_updates()):
+            canon = self._canonical(upd)
+            key = canon[0] if canon else None
+            self.research.write("DEPTH", venue=upd.venue, outcome_id=upd.outcome_id, game=list(key) if key else None,
+                                side=canon[1] if canon else upd.outcome, line=upd.line, ask=upd.price,
+                                ask_size=upd.available_volume, bid=upd.best_bid, bid_size=upd.bid_volume,
+                                minutes_to_start=self.minutes_to_start(key[:3]) if key else None)
+            n += 1
+        if self.gaps is not None:
+            for mk in list(self.gaps.books):
+                tie = DEAD_HEAT_PAYOUT if mk[0] == "NFL" and mk[3] == "moneyline" else None
+                best = self.gaps.best_combo(mk, tie, self._sides(mk))
+                if best is not None:
+                    self.research.write("BEST_COMBO", game=list(mk), minutes_to_start=self.minutes_to_start(mk[:3]),
+                                        **best)
+        return n
 
     # ---------------- settlement & reconciliation ----------------
     @property
@@ -1033,7 +1228,7 @@ class Supervisor:
             if canon is None:
                 continue
             key, side = canon
-            if key in self.positions:
+            if key in self.positions or self._trade_blocked(key[:3]):
                 continue
             sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
             if sharp is None or (info.line is not None and sharp.line is not None
@@ -1070,6 +1265,7 @@ class Supervisor:
             self.stats["maker_fills"] += 1
             order = self._record("MAKER_FILL", update, side, q.contracts, stake, 0.0, edge, False, price=price,
                                  force=True)
+            self._schedule_markouts(key, side, update.line, price, q.contracts)
             if key not in self.positions:
                 self.positions[key] = MarketPosition(legs=[order])
             else:
@@ -1220,6 +1416,27 @@ def resolve_live_plan(env: dict) -> LivePlan:
                     approved_by=approver if scaled else None)
 
 
+def pregame_cutoff_from_env(env: dict) -> float:
+    """PREGAME_CUTOFF_MINUTES (default 10). At least 1 minute: quotes must never rest into a live game."""
+    raw = env.get("PREGAME_CUTOFF_MINUTES")
+    if not raw:
+        return PREGAME_CUTOFF_SECONDS
+    try:
+        minutes = float(raw)
+    except ValueError:
+        raise ConfigError(f"PREGAME_CUTOFF_MINUTES={raw!r} is not a number") from None
+    if not 1 <= minutes <= 24 * 60:
+        raise ConfigError("PREGAME_CUTOFF_MINUTES must be between 1 and 1440")
+    return minutes * 60
+
+
+def research_from_env(env: dict) -> Optional[ResearchRecorder]:
+    """RESEARCH_ENABLED (default on) writes measurement rows to RESEARCH_DIR (default ./research)."""
+    if env.get("RESEARCH_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    return ResearchRecorder(env.get("RESEARCH_DIR", "research"))
+
+
 def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None) -> Supervisor:
     """
     Build the production supervisor from environment variables.
@@ -1228,7 +1445,8 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     Live (TRADING_MODE=live) additionally REQUIRES LIVE_TRADING_ACKNOWLEDGED=yes and the token.
     Live limits: canary $10 / $100 / maker off unless LIVE_SCALE_APPROVED_BY is set (see resolve_live_plan).
     Optional: NOVIG_WS_URL, NOVIG_API_BASE, NOVIG_EVENTS_URL, NOVIG_SUBSCRIBE_MESSAGES (JSON list),
-              NOVIG_FILL_VOLUME_MODE (default cumulative, per Novig), TRADING_LOG_DIR.
+              NOVIG_FILL_VOLUME_MODE (default cumulative, per Novig), TRADING_LOG_DIR,
+              PREGAME_CUTOFF_MINUTES (default 10), RESEARCH_ENABLED (default 1), RESEARCH_DIR (default research).
     """
     env = os.environ if env is None else env
     live = env.get("TRADING_MODE", "paper").lower() == "live"
@@ -1303,6 +1521,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         kw = dict(kalshi_url=env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
                   kalshi_auth=(key_id, pk),
                   kalshi_rest=KalshiRestClient(rest_base, key_id, pk, series_from_env(env.get("KALSHI_SERIES"))))
+    kw.update(pregame_cutoff_s=pregame_cutoff_from_env(env), research=research_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"])),
@@ -1350,6 +1569,9 @@ def describe_state(sup: Supervisor) -> dict:
         "sharp_http_timeout_s": cfg.timeout_seconds if cfg else None,
         "sharp_poll_s": sup.poller.interval,
         "sharp_max_age_s": sup.book.max_age,
+        "pregame_cutoff_min": sup.pregame_cutoff_s / 60,
+        "require_start_time": sup.require_start_time,
+        "research_dir": str(sup.research.dir) if sup.research is not None else None,
     }
 
 
@@ -1374,6 +1596,9 @@ def format_state_report(sup: Supervisor) -> str:
         ("Minimum edge", f"> {st['min_edge']:.1%}"),
         ("Maker", st["maker"]),
         ("Dead-heat venues (NFL ML ties = 50c)", ", ".join(st["dead_heat_venues"])),
+        ("Pregame cutoff", f"stop trading + pull quotes {st['pregame_cutoff_min']:.0f} min before start"),
+        ("Games with no start time", "NEVER traded" if st["require_start_time"] else "traded (paper only)"),
+        ("Research data", st["research_dir"] or "off"),
         ("Ledger", st["ledger"] or "(paper: none)"),
         ("TIMEOUTS", None),
         ("Reconnect delay", f"{st['reconnect_delay_s']}s"),
@@ -1403,6 +1628,7 @@ def format_state_report(sup: Supervisor) -> str:
                  "Novig 'orders' channel slip shape (confirmed only once the first slip arrives)",
                  "Novig REST host api.novig.us for /v1/orders; whether events embed markets; pagination",
                  "Novig positions endpoint path, status values and field names (settlement.py)",
+                 "Novig event start-time field name (novig_rest.START_TIME_KEYS; no start = no live trading)",
                  "OpticOdds record paths in the sharp provider config"):
         lines.append(f"  - {item}")
     lines.append("=" * 78)
@@ -1424,9 +1650,13 @@ DEMO_SHARP_LINES = [
 ]
 
 
+# Demo games start 24h after the process starts, so the pregame cutoff never interferes with a demo run.
+DEMO_START = time.time() + 24 * 3600
+
+
 def _pair(market_id, event_id, league, mtype, home, away, a, b, line_a=None, line_b=None):
     base = dict(venue="novig", market_id=market_id, event_id=event_id, league=league, market_type=mtype,
-                home_team=home, away_team=away)
+                home_team=home, away_team=away, start_time=DEMO_START)
     return [dict(base, outcome_id=a[0], sibling_outcome_id=b[0], outcome=a[1], line=line_a),
             dict(base, outcome_id=b[0], sibling_outcome_id=a[0], outcome=b[1], line=line_b)]
 
@@ -1444,10 +1674,12 @@ DEMO_MARKETS = (
 DEMO_KALSHI_MARKETS = [
     dict(venue="kalshi", outcome_id="KXNBAGAME-BOSNYK-NYK", market_id="KXNBAGAME-BOSNYK",
          sibling_outcome_id="KXNBAGAME-BOSNYK-BOS", event_id="KXNBAGAME-BOSNYK", league="NBA",
-         market_type="moneyline", home_team="New York Knicks", away_team="Boston Celtics", outcome="New York Knicks"),
+         market_type="moneyline", home_team="New York Knicks", away_team="Boston Celtics", outcome="New York Knicks",
+         start_time=DEMO_START),
     dict(venue="kalshi", outcome_id="KXNBAGAME-BOSNYK-BOS", market_id="KXNBAGAME-BOSNYK",
          sibling_outcome_id="KXNBAGAME-BOSNYK-NYK", event_id="KXNBAGAME-BOSNYK", league="NBA",
-         market_type="moneyline", home_team="New York Knicks", away_team="Boston Celtics", outcome="Boston Celtics"),
+         market_type="moneyline", home_team="New York Knicks", away_team="Boston Celtics", outcome="Boston Celtics",
+         start_time=DEMO_START),
 ]
 DEMO_FAIR = {"O-NYK": 0.522, "O-BOS": 0.478, "O-GSW": 0.50, "O-LAL": 0.50, "O-OVER": 0.489, "O-UNDER": 0.511,
              "O-NYG": 0.387, "O-NYJ": 0.613}
@@ -1478,7 +1710,7 @@ async def _simulated_exchanges(novig, kalshi, duration: float, tick: float = 0.2
         await asyncio.sleep(tick)
 
 
-async def run_simulation(duration: float = 20.0) -> Supervisor:
+async def run_simulation(duration: float = 20.0, research_dir: Optional[str] = None) -> Supervisor:
     from mock_novig_server import MockNovigServer  # the mock is a generic WebSocket server
 
     novig, kalshi = await MockNovigServer().start(), await MockNovigServer().start()
@@ -1486,7 +1718,8 @@ async def run_simulation(duration: float = 20.0) -> Supervisor:
                      kalshi_url=kalshi.url, kalshi_registry=MarketRegistry(DEMO_KALSHI_MARKETS),
                      sharp_fetch=MockSharpSource(DEMO_SHARP_LINES, jitter_cents=3, latency=0.02),
                      sharp_poll_interval=1.0, heartbeat_interval=2.0,
-                     maker_kwargs=dict(refresh_interval=0.5, quiet_seconds=1.0))
+                     maker_kwargs=dict(refresh_interval=0.5, quiet_seconds=1.0),
+                     research=ResearchRecorder(research_dir) if research_dir else None, depth_sample_s=2.0)
     sim = asyncio.create_task(_simulated_exchanges(novig, kalshi, duration))
     try:
         await sup.run(duration=duration + 1.0)
@@ -1511,7 +1744,7 @@ def main() -> None:
     log.info("SUPERVISOR logging to %s", path.resolve())
     try:
         if args.simulate:
-            sup = asyncio.run(run_simulation(args.simulate))
+            sup = asyncio.run(run_simulation(args.simulate, research_dir=str(Path(args.log_dir) / "research")))
             print(f"\nSimulation finished. stats={dict(sup.stats)}  open exposure=${sup.total_exposure():,.2f}")
             return
         try:
