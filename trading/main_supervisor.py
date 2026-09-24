@@ -2043,6 +2043,30 @@ def research_from_env(env: dict) -> Optional[ResearchRecorder]:
     return ResearchRecorder(env.get("RESEARCH_DIR", "research"))
 
 
+def sharp_source_from_env(env: dict):
+    """
+    SHARP_PROVIDER=therundown  -> TheRundown v2 (THERUNDOWN_API_KEY; THERUNDOWN_AFFILIATE_IDS default 3 =
+                                  Pinnacle; THERUNDOWN_WEBSOCKET=1 default, needs the Ultra plan or above)
+    SHARP_PROVIDER_CONFIG=path -> generic JSON-mapped provider (OpticOdds / OddsJam examples in config/)
+    neither                    -> None: measurement mode
+    """
+    if (env.get("SHARP_PROVIDER") or "").strip().lower() == "therundown":
+        from therundown_feed import TheRundownSource
+        raw_ids = env.get("THERUNDOWN_AFFILIATE_IDS") or "3"
+        try:
+            affiliates = tuple(int(x) for x in raw_ids.split(",") if x.strip())
+        except ValueError:
+            raise ConfigError(f"THERUNDOWN_AFFILIATE_IDS={raw_ids!r} must be comma-separated numbers (3 = Pinnacle)") \
+                from None
+        if not env.get("THERUNDOWN_API_KEY"):
+            raise ConfigError("SHARP_PROVIDER=therundown needs THERUNDOWN_API_KEY")
+        return TheRundownSource(env["THERUNDOWN_API_KEY"], affiliate_ids=affiliates,
+                                use_websocket=(env.get("THERUNDOWN_WEBSOCKET") or "1").strip() not in {"0", "false"})
+    if env.get("SHARP_PROVIDER_CONFIG"):
+        return ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"]))
+    return None
+
+
 def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None) -> Supervisor:
     """
     Build the production supervisor from environment variables.
@@ -2058,7 +2082,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     """
     env = os.environ if env is None else env
     live = env.get("TRADING_MODE", "paper").lower() == "live"
-    if not env.get("SHARP_PROVIDER_CONFIG"):
+    if not env.get("SHARP_PROVIDER_CONFIG") and (env.get("SHARP_PROVIDER") or "").lower() != "therundown":
         log.warning("SUPERVISOR no SHARP_PROVIDER_CONFIG: MEASUREMENT mode — venue prices, cross-venue gaps and "
                     "liquidity are recorded; nothing that needs a fair value (directional takers, maker quotes) runs")
     token = env.get("NOVIG_BEARER_TOKEN")
@@ -2137,8 +2161,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
               **risk_controls_from_env(env), **fair_value_from_env(env), **taker_filters_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
-                      sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"]))
-                      if env.get("SHARP_PROVIDER_CONFIG") else None,
+                      sharp_fetch=sharp_source_from_env(env),
                       maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,
                       **kw, **live_kw)
 
