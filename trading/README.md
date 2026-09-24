@@ -43,13 +43,28 @@ export KALSHI_ENABLED=1 KALSHI_ENV=demo KALSHI_KEY_ID=... KALSHI_PRIVATE_KEY_PAT
 python main_supervisor.py
 ```
 
-## Pregame cutoff (never trade into a live game)
+## Pregame cutoffs and the live-game stop (never trade into a live game)
 Every game gets its scheduled start time from the Novig events data (Kalshi: `occurrence_datetime`).
-From `PREGAME_CUTOFF_MINUTES` (default 10) before the start, the engine places **no new orders on that game,
-arbitrage hedges included**. A 1-second loop pulls every resting maker quote on it and writes a `CUTOFF`
-row to the ledger. **In live mode a game with no known start time is never traded.** The start-time field
-name is assumed (`novig_rest.START_TIME_KEYS`); if Novig uses another name, live mode simply trades nothing,
-which is the safe failure.
+* **Maker cutoff** `MAKER_CUTOFF_MINUTES` (default 3): every resting quote on the game is pulled. Quotes go
+  first because late news (lineups, injuries) picks off a stale resting quote.
+* **Taker cutoff** `TAKER_CUTOFF_MINUTES` (default 1): no new orders on the game, hedges included. Taker
+  orders fill or are cancelled within 2s, so nothing is left resting when the game starts.
+* Per league: `CUTOFF_OVERRIDES=NBA=1/3,NFL=1/3` (taker/maker minutes).
+* **Live-game stop**, whatever the clock says: the sharp feed marks the game in play (`is_live` / status field;
+  that line is never used as a fair price), or the game drops out of Novig's pregame list within an hour of its
+  start (the list is re-read every 30s while a game is within 15 minutes of starting).
+* **In live mode a game with no known start time is never traded.** The start-time field name is assumed
+  (`novig_rest.START_TIME_KEYS`); if Novig uses another name, live mode trades nothing, which is the safe failure.
+* Paper mode keeps evaluating between the taker cutoff and the start and records what it *would* have done
+  (`blocked` decisions), so the report shows whether a later cutoff would pay.
+
+## Size: buying through the book, partial hedges
+* Takers buy through several ask levels while **each** level still clears the 2.5% edge, capped by the
+  1/4-Kelly stake of the worst level used, $1,000 per position and the live canary. Live sends one limit
+  order at the worst level (the reservation is sized at that price); the exchange fills cheaper levels first.
+* Hedges do the same while every level still locks at least 1c per contract in every outcome. A hedge
+  may be partial (at least 10 contracts); the rest of the first leg stays a directional position and can be
+  hedged later.
 
 ## Measuring the edge (research data)
 On by default (`RESEARCH_ENABLED=1`, folder `RESEARCH_DIR=research`), in paper and live mode:
@@ -58,7 +73,8 @@ python main_supervisor.py --simulate 60      # demo data -> logs/research/
 python research_report.py --dir logs/research
 python research_report.py --since 2026-10-01 # real runs: ./research
 ```
-The report answers: did our entries beat the closing line (CLV), are maker fills picked off (markouts),
+The report answers: did our entries beat the closing line (CLV), how that CLV changes with time to start
+(including trades the cutoff blocked), are maker fills picked off (markouts, also by time to start),
 how much size sits at the best price by time to start, and how often, how long and how deep cross-venue
 locked-profit gaps are (Novig free, Kalshi taker fee, ProphetX 2% of winnings, NFL ties at 50c).
 Two to four weeks of paper data are enough to decide whether the strategy is worth scaling.

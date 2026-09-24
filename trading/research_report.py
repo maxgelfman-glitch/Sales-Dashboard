@@ -9,6 +9,8 @@ WHAT EACH SECTION ANSWERS
     DECISIONS      how often a price beat the sharp line by > 2.5%, and who moved last
     CLOSING LINE   did our entries beat the closing line? (CLV > 0 on average = real edge;
                    this is the fastest honest signal, long before P&L means anything)
+    BY TIME        CLV of every BET decision by minutes before the start, INCLUDING the ones the
+                   cutoff blocked (paper mode) -> tells you where to set TAKER_CUTOFF_MINUTES
     MARKOUTS       after a maker fill, did fair value move against us? (negative = picked off)
     LIQUIDITY      how much size sits at the best price, by minutes before the game starts
     GAPS           how often a both-sides combination locked a profit after fees, for how
@@ -30,7 +32,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 TIME_BUCKETS = ((24 * 60, "> 24h"), (6 * 60, "6-24h"), (60, "1-6h"), (30, "30-60m"), (10, "10-30m"),
-                (float("-inf"), "< 10m"))
+                (3, "3-10m"), (1, "1-3m"), (float("-inf"), "< 1m"))
 BUCKET_ORDER = [label for _, label in TIME_BUCKETS] + ["unknown"]
 
 
@@ -91,15 +93,35 @@ def decisions_summary(rows: list[dict]) -> dict:
     }
 
 
+def _closes(rows: list[dict]) -> dict[tuple, float]:
+    """Latest pregame closing fair value per (game, side, line): the scheduled-start snapshot beats the cutoff one."""
+    closes: dict[tuple, float] = {}
+    for r in rows:                                    # rows are time-ordered: later snapshots overwrite
+        if r["kind"] == "CLOSE" and r.get("close_fair_prob") is not None:
+            closes[_key(r)] = r["close_fair_prob"]
+    return closes
+
+
+def clv_by_time(rows: list[dict]) -> dict:
+    """CLV (cents per contract) of every BET decision, by time to start; `blocked` = stopped by the cutoff."""
+    closes = _closes(rows)
+    cells = defaultdict(list)
+    for r in rows:
+        if r["kind"] != "DECISION" or r.get("action") != "BET" or r.get("price") is None:
+            continue
+        fair = closes.get(_key(r))
+        if fair is not None:
+            cells[(bucket(r.get("minutes_to_start")), bool(r.get("blocked")))].append(100 * (fair - r["price"]))
+    return {k: {"decisions": len(v), "mean_clv_cents": _mean(v), "beat_close": sum(x > 0 for x in v) / len(v)}
+            for k, v in cells.items()}
+
+
 def clv_summary(rows: list[dict]) -> dict:
     """
     Closing-line value per entry = closing fair probability - entry price (per contract, in $).
     The closing fair value is the sharp's de-vigged probability at our pregame cutoff.
     """
-    closes: dict[tuple, float] = {}
-    for r in rows:
-        if r["kind"] == "CLOSE" and r.get("close_fair_prob") is not None:
-            closes[_key(r)] = r["close_fair_prob"]
+    closes = _closes(rows)
     per_entry = []
     for r in rows:
         if r["kind"] != "ENTRY":
@@ -131,6 +153,15 @@ def markout_summary(rows: list[dict]) -> dict:
             by_delay[r["delay_s"]].append(r["markout_per_contract"])
     return {delay: {"fills": len(v), "mean_cents": 100 * _mean(v), "adverse_share": sum(x < 0 for x in v) / len(v)}
             for delay, v in sorted(by_delay.items())}
+
+
+def markout_by_time(rows: list[dict], delay: float = 60.0) -> dict:
+    """Mean markout (cents) at `delay` by time to start: where resting quotes get picked off -> MAKER_CUTOFF."""
+    cells = defaultdict(list)
+    for r in rows:
+        if r["kind"] == "MARKOUT" and r.get("delay_s") == delay and r.get("markout_per_contract") is not None:
+            cells[bucket(r.get("minutes_to_start"))].append(100 * r["markout_per_contract"])
+    return {b: {"fills": len(v), "mean_cents": _mean(v)} for b, v in cells.items()}
 
 
 def depth_summary(rows: list[dict]) -> dict:
@@ -212,10 +243,28 @@ def build_report(rows: list[dict]) -> str:
             f"return on stake {_fmt(c['clv_return_on_stake'] and c['clv_return_on_stake'] * 100)}%",
             "  (positive over a few hundred entries = genuine edge; ~0 or negative = the edge is not real)"]
 
+    t = clv_by_time(rows)
+    out += ["", "[CLV BY TIME TO START]  (every BET decision; 'blocked' = the cutoff stopped it, paper only)"]
+    if t:
+        for b in BUCKET_ORDER:
+            for blocked in (False, True):
+                v = t.get((b, blocked))
+                if v:
+                    out.append(f"  {b:>7} {'blocked' if blocked else 'traded ':<8} decisions {v['decisions']:>5}   "
+                               f"mean CLV {v['mean_clv_cents']:+.2f}c   beat close {v['beat_close']:.0%}")
+        out.append("  (tighten the taker cutoff only if the late buckets still show positive CLV)")
+    else:
+        out.append("  no BET decisions with a closing line yet")
+
     m = markout_summary(rows)
     out += ["", "[MAKER MARKOUTS]  (fair value after each maker fill minus our fill price)"]
     out += [f"  +{delay:>5.0f}s  fills {v['fills']:>5}   mean {v['mean_cents']:+.2f}c   "
             f"moved against us {v['adverse_share']:.0%}" for delay, v in m.items()] or ["  no maker fills yet"]
+    mt = markout_by_time(rows)
+    if mt:
+        out.append("  +60s by time to start: " + "   ".join(
+            f"{b} {mt[b]['mean_cents']:+.2f}c ({mt[b]['fills']})" for b in BUCKET_ORDER if b in mt))
+        out.append("  (strongly negative late buckets = quotes picked off by late news: raise MAKER_CUTOFF_MINUTES)")
 
     dep = depth_summary(rows)
     out += ["", "[LIQUIDITY]  median $ at the best ask, by time before the game starts"]

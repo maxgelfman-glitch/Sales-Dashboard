@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Optional
 
 import aiohttp
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from team_normalizer import normalize_outcome, normalize_team_name
 
@@ -74,6 +74,19 @@ class SharpLine(BaseModel):
     source: str = "sharp"
     updated_at: Optional[float] = None # provider timestamp, epoch seconds (UTC)
     is_main: bool = True               # False = alternate line (stored by its exact number only)
+    is_live: bool = False              # True = in-play price: never used as fair value; the game stops trading
+
+    @field_validator("is_live", mode="before")
+    @classmethod
+    def _live_flag(cls, v: Any) -> bool:
+        """Accept booleans and common status words ("live", "in_progress", "started", ...)."""
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        return str(v).strip().lower().replace("-", "_").replace(" ", "_") in LIVE_WORDS
 
     def mirrored(self) -> "SharpLine":
         """The same market seen from the other side (assumes names are already canonical)."""
@@ -89,15 +102,23 @@ class SharpLine(BaseModel):
 BookKey = tuple[str, str, str, str, str]  # (league, home, away, market_type, side)
 
 
+LIVE_WORDS = {"1", "true", "yes", "live", "in_play", "inplay", "in_progress", "inprogress", "started",
+              "running", "halftime", "half_time", "1h", "2h", "q1", "q2", "q3", "q4", "ot",
+              # no longer pregame either way: also stop trading
+              "final", "completed", "complete", "finished", "ended", "closed", "suspended", "delayed_in_play"}
+
+
 class SharpBook:
     """In-memory cache of the latest sharp lines, keyed by CANONICAL names."""
 
     def __init__(self, max_age_seconds: float = SHARP_MAX_AGE_SECONDS,
                  clock: Callable[[], float] = time.time,
-                 on_move: Optional[Callable[[BookKey, SharpLine, SharpLine], None]] = None) -> None:
+                 on_move: Optional[Callable[[BookKey, SharpLine, SharpLine], None]] = None,
+                 on_live: Optional[Callable[[str, str, str], None]] = None) -> None:
         self.max_age = max_age_seconds
         self.clock = clock
         self.on_move = on_move    # called with (key, old, new) whenever a stored line/price changes
+        self.on_live = on_live    # called with (league, home, away) when the provider marks a game in-play
         self._lines: dict[BookKey, tuple[SharpLine, float]] = {}   # MAIN line per side: (line, observed_at)
         self._by_line: dict[tuple[BookKey, Optional[float]], tuple[SharpLine, float]] = {}  # every line incl. alts
         self._seen: set[tuple[str, str]] = set()
@@ -148,6 +169,20 @@ class SharpBook:
                 rejected += 1
                 continue
             canon = line.model_copy(update=dict(league=league, home_team=home, away_team=away, side=side))
+            if canon.is_live:
+                # An in-play price must never be compared with a pregame venue price. Drop every stored
+                # line for the game and tell the supervisor, which stops trading it.
+                rejected += 1
+                for k in [k for k in self._lines if k[:3] == (league, home, away)]:
+                    del self._lines[k]
+                for k in [k for k in self._by_line if k[0][:3] == (league, home, away)]:
+                    del self._by_line[k]
+                if self.on_live is not None:
+                    try:
+                        self.on_live(league, home, away)
+                    except Exception:  # noqa: BLE001
+                        sharp_log.exception("SHARP_LIVE listener failed")
+                continue
             key = (league, home, away, canon.market_type, canon.side)
             old = self._lines.get(key) if canon.is_main else None
             for item in (canon, canon.mirrored()):
@@ -311,7 +346,7 @@ class ProviderConfig(BaseModel):
 
 
 OUR_FIELDS = ("league", "home_team", "away_team", "market_type", "side",
-              "odds_for", "odds_against", "line", "source", "updated_at")
+              "odds_for", "odds_against", "line", "source", "updated_at", "is_live")
 
 
 ENTRY_POINTS_KEYS = ("points", "line", "total", "handicap")
@@ -437,6 +472,7 @@ def pair_fixture_outcomes(fixture: Any, cfg: ProviderConfig) -> tuple[list[dict[
         league = league.get("name") or league.get("id")
     home = _dig(fixture, f.get("home_team", "home_team"))
     away = _dig(fixture, f.get("away_team", "away_team"))
+    is_live = _dig(fixture, f.get("is_live", "is_live"))           # optional: in-play flag / fixture status
     records = _dig(fixture, cfg.outcomes_path)
     if not (isinstance(league, str) and isinstance(home, str) and isinstance(away, str)
             and isinstance(records, list)):
@@ -497,7 +533,7 @@ def pair_fixture_outcomes(fixture: Any, cfg: ProviderConfig) -> tuple[list[dict[
                     league=league, home_team=home, away_team=away, market_type=market,
                     side="Over" if market == "total" else home, odds_for=price, odds_against=price2,
                     line=pts if market != "moneyline" else None, source=cfg.constants.get("source", book or "sharp"),
-                    updated_at=min(stamps) if stamps else None))
+                    updated_at=min(stamps) if stamps else None, is_live=is_live))
                 break
     return lines, skipped
 

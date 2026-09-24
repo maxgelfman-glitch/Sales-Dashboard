@@ -97,6 +97,7 @@ from execution import (
     devig_multiplicative,
     evaluate_kalshi_edge,
     evaluate_market_edge,
+    kalshi_fee_per_contract,
     kalshi_taker_fee,
 )
 from kalshi_feed import (
@@ -152,7 +153,12 @@ DEAD_HEAT_VENUES = frozenset({"novig", "kalshi"})
 DEAD_HEAT_PAYOUT = 0.50
 BOOTSTRAP_REFRESH_SECONDS = 300.0
 TAKER_FILL_TIMEOUT_SECONDS = 2.0       # live: cancel any unfilled taker remainder after this
-PREGAME_CUTOFF_SECONDS = 600.0         # stop trading/quoting a game this long before its scheduled start
+TAKER_CUTOFF_SECONDS = 60.0            # no new orders/hedges on a game this long before its scheduled start
+MAKER_CUTOFF_SECONDS = 180.0           # resting quotes are pulled earlier: late news picks off stale quotes
+NEAR_START_REFRESH_SECONDS = 30.0      # re-read Novig's pregame list this often while a game is close to start
+NEAR_START_WINDOW_SECONDS = 15 * 60    # ... "close" = within this long of its scheduled start
+VANISHED_FLAG_WINDOW_SECONDS = 60 * 60 # a game gone from Novig's pregame list within 1h of start = treat as live
+MIN_PARTIAL_HEDGE_CONTRACTS = 10       # smaller partial hedges are not worth an order
 
 log = logging.getLogger("trading.supervisor")
 bridge_log = logging.getLogger("trading.bridge")
@@ -233,11 +239,18 @@ class LiveOrder(BaseModel):
 
 class MarketPosition(BaseModel):
     legs: list[PaperOrder]
-    hedged: bool = False
+    hedged: bool = False      # True = no further hedge wanted (fully hedged, or a hedge order is in flight)
 
     @property
     def primary(self) -> PaperOrder:
         return self.legs[0]
+
+    def hedged_contracts(self) -> float:
+        """Contracts of the opposite side already bought (or being bought) against the first leg."""
+        return sum(leg.requested_contracts if leg.pending else leg.contracts for leg in self.legs[1:])
+
+    def unhedged(self) -> float:
+        return self.primary.contracts - self.hedged_contracts()
 
 
 GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — venue independent
@@ -269,8 +282,14 @@ def order_cost(venue: str, contracts: int, price: float) -> tuple[float, float]:
 
 def arbitrage_scenarios(first: PaperOrder, hedge_venue: str, contracts: int, hedge_cost: float,
                         league: str, market_type: str) -> dict[str, float]:
-    """Net P&L of holding both legs under every way the game can settle."""
-    total_cost = first.stake_usd + hedge_cost
+    """
+    Net P&L of the hedged slice under every way the game can settle: `contracts` of the first leg
+    (its cost pro-rated) plus the hedge. With a partial hedge the rest of the first leg stays a plain
+    directional position, which was already a +EV bet on its own.
+    """
+    held = getattr(first, "contracts", 0) or 0
+    first_cost = first.stake_usd * contracts / held if held > contracts else first.stake_usd
+    total_cost = first_cost + hedge_cost
     out = {"first_side_wins": contracts * 1.0 - total_cost,
            "other_side_wins": contracts * 1.0 - total_cost}
     if league == "NFL" and market_type == "moneyline":
@@ -319,7 +338,9 @@ class Supervisor:
         sync_retries: int = 5,
         sync_retry_delay: float = 10.0,
         # --- pregame cutoff & research ---
-        pregame_cutoff_s: float = PREGAME_CUTOFF_SECONDS,
+        taker_cutoff_s: float = TAKER_CUTOFF_SECONDS,
+        maker_cutoff_s: float = MAKER_CUTOFF_SECONDS,
+        cutoff_overrides: Optional[dict[str, tuple[float, float]]] = None,
         require_start_time: Optional[bool] = None,
         research: Optional[ResearchRecorder] = None,
         depth_sample_s: float = DEPTH_SAMPLE_SECONDS,
@@ -330,7 +351,8 @@ class Supervisor:
             subscribe_messages = [TAPE_SUBSCRIBE, ORDERS_SUBSCRIBE] if live else [TAPE_SUBSCRIBE]
         if sharp_fetch is None:
             raise ValueError("a sharp_fetch source is required (ProviderSharpSource live, MockSharpSource in tests)")
-        self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move)
+        self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move,
+                              on_live=self._on_sharp_live)
         self.registry = registry if registry is not None else MarketRegistry()
         self.feed = NovigFeed(url=feed_url, token=token, registry=self.registry, on_update=self.on_market_update,
                               on_state_change=self.on_feed_state, subscribe_messages=subscribe_messages,
@@ -363,11 +385,16 @@ class Supervisor:
         self.synced = positions_client is None          # nothing to sync without a positions client
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         # ---- pregame cutoff (never trade or quote into a live game) ----
-        self.pregame_cutoff_s = pregame_cutoff_s
+        self.taker_cutoff_s = taker_cutoff_s
+        self.maker_cutoff_s = max(maker_cutoff_s, taker_cutoff_s)
+        self.cutoff_overrides = dict(cutoff_overrides or {})  # league -> (taker_s, maker_s)
         self.require_start_time = live if require_start_time is None else require_start_time
         self.game_start: dict[tuple, float] = {}          # (league, home, away) -> scheduled start (epoch)
-        self.cutoff_done: set[tuple] = set()
+        self.cutoff_phases: dict[tuple, set[str]] = {}     # gid -> {"maker", "taker", "start"} already run
         self._cutoff_noted: set[tuple] = set()
+        self.live_games: dict[tuple, str] = {}             # gid -> why we believe it is in play (never trade)
+        self.novig_games: set[tuple] = set()               # gids in Novig's pregame list at the last refresh
+        self._last_bootstrap = 0.0
         # ---- research / measurement ----
         self.research = research
         self.gaps = GapTracker(research) if research is not None else None
@@ -420,6 +447,7 @@ class Supervisor:
                 n = self.registry.replace_all(await self.novig_rest.fetch_open_markets())
                 log.info("BOOTSTRAP novig registry now holds %d outcomes", n)
                 self._index_start_times()
+                self._check_vanished_games(n)
             except Exception as exc:  # noqa: BLE001 — retried by the refresh loop
                 log.error("BOOTSTRAP novig failed (%s: %s); keeping previous registry", type(exc).__name__, exc)
         if self.kalshi_rest is not None and self.kalshi is not None:
@@ -435,9 +463,46 @@ class Supervisor:
                 log.error("BOOTSTRAP kalshi failed (%s: %s); keeping previous registry", type(exc).__name__, exc)
 
     async def _bootstrap_loop(self) -> None:
+        """Refresh every bootstrap_refresh seconds; every 30s while any game is close to its start."""
+        self._last_bootstrap = time.time()
         while True:
-            await asyncio.sleep(self.bootstrap_refresh)
-            await self.bootstrap()
+            await asyncio.sleep(min(5.0, self.bootstrap_refresh))
+            interval = self.bootstrap_refresh
+            if self._any_game_near_start():
+                interval = min(interval, NEAR_START_REFRESH_SECONDS)
+            if time.time() - self._last_bootstrap >= interval:
+                self._last_bootstrap = time.time()
+                await self.bootstrap()
+
+    def _any_game_near_start(self) -> bool:
+        now = time.time()
+        return any(gid not in self.live_games and start - NEAR_START_WINDOW_SECONDS <= now <= start + 3600
+                   for gid, start in self.game_start.items())
+
+    def _novig_gids(self) -> set[tuple]:
+        out = set()
+        for info in self.registry.all():
+            canon = self._canonical(MarketUpdate.from_info(info))
+            if canon is not None:
+                out.add(canon[0][:3])
+        return out
+
+    def _check_vanished_games(self, outcomes: int) -> None:
+        """
+        Novig's bootstrap lists only OPEN_PREGAME events. A game that drops out of that list close to its
+        start has most likely gone live (or been suspended): stop trading it and pull its quotes.
+        An empty response is treated as a glitch, not as "every game went live".
+        """
+        current = self._novig_gids()
+        if outcomes == 0:
+            log.warning("BOOTSTRAP novig returned no outcomes; live-game detection skipped this refresh")
+            return
+        now = time.time()
+        for gid in self.novig_games - current:
+            start = self.game_start.get(gid)
+            if start is None or start - now <= VANISHED_FLAG_WINDOW_SECONDS:
+                self.mark_game_live(gid, "no longer in Novig's pregame list")
+        self.novig_games = current
 
     # ---------------- event handlers ----------------
     async def on_feed_state(self, state: str, details: dict) -> None:
@@ -530,16 +595,25 @@ class Supervisor:
             await self._simulate_maker_fills(update, key)
 
         blocked = self._trade_blocked(gid)
+        shadow = False
         if blocked:
             self.stats["cutoff_blocked"] += 1
             if (gid, blocked) not in self._cutoff_noted:
                 self._cutoff_noted.add((gid, blocked))
                 log.info("CUTOFF no trading on %s: %s", gid, blocked)
-            return
+            # Paper only: keep evaluating between the cutoff and the scheduled start (never once a game is
+            # flagged live) and record what we WOULD have done, so the report shows what the cutoff costs.
+            start = self.game_start.get(gid)
+            shadow = (not self.live and self.research is not None and gid not in self.live_games
+                      and start is not None and time.time() < start)
+            if not shadow:
+                return
         if update.price is None:
             return
         held = self.positions.get(key)
         if held is not None:
+            if shadow:
+                return
             if held.hedged:
                 self.stats["lock_blocked"] += 1
                 log.debug("POSITION_LOCK %s fully hedged; ignoring", key)
@@ -560,14 +634,13 @@ class Supervisor:
         sharp_q = SharpQuote(odds_for=sharp.odds_for, odds_against=sharp.odds_against, line=sharp.line,
                              source=sharp.source)
         label = f"{update.venue}/{update.event_id}/{update.market_type}/{side}"
-        if update.venue == "kalshi":
-            decision = await evaluate_kalshi_edge(update.price * 100, sharp_q, line=update.line, label=label)
-        else:
-            decision = await evaluate_market_edge(NovigQuote(price=update.price, line=update.line, label=label),
-                                                  sharp_q)
-        self.stats[f"decision_{decision.action.lower()}"] += 1
+        decision = await self._evaluate(update.venue, update.price, sharp_q, update.line, label)
         if self.research is not None:
-            self._research_decision(update, key, side, decision)
+            self._research_decision(update, key, side, decision, blocked=blocked if shadow else None)
+        if shadow:
+            self.stats["shadow_decisions"] += 1
+            return
+        self.stats[f"decision_{decision.action.lower()}"] += 1
         log.info("DECISION %s %s %s %s edge=%s stake=$%.2f fee=$%.2f reason=%s", decision.action, update.venue,
                  key, side, "n/a" if decision.edge is None else f"{decision.edge:+.4%}", decision.stake_usd,
                  decision.fee_usd, decision.reason)
@@ -582,31 +655,87 @@ class Supervisor:
             self.stats["kalshi_exec_disabled"] += 1
             log.info("EV_TRIGGER not executed: %s is data-only in live mode", update.venue)
             return
-        contracts = min(decision.contracts, int(update.available_volume))
-        if self.max_stake < MAX_STAKE_USD:
-            contracts = min(contracts, int(math.floor(self.max_stake / update.price + 1e-9)))
+        contracts, stake, fee, avg_price, limit_price, used = await self._walk_asks(
+            update, sharp_q, label, decision)
         if contracts <= 0:
             self.stats["no_liquidity"] += 1
-            log.info("EV_TRIGGER skipped: no liquidity at best ask for %s", update.outcome_id)
+            log.info("EV_TRIGGER skipped: no liquidity with edge for %s", update.outcome_id)
             return
-        stake, fee = order_cost(update.venue, contracts, update.price)
+        if len(used) > 1:
+            self.stats["multi_level_takes"] += 1
+            log.info("EV_TRIGGER walked %d ask levels %s -> %d contracts avg %.4f, limit %.4f", len(used),
+                     json.dumps(used), contracts, avg_price, limit_price)
         if contracts < decision.contracts:
             log.info("EV_TRIGGER size limited by liquidity: %d of %d contracts ($%.2f)", contracts,
                      decision.contracts, stake)
-            if update.venue == "kalshi":   # the rounded fee changes with size: re-check the net edge
-                net = (contracts * decision.fair_prob - stake) / stake
-                if net <= MIN_EDGE + 1e-9:
-                    log.info("EV_TRIGGER skipped: net edge %+.4f%% after fee at reduced size", net * 100)
-                    return
-        if not self._kill_switch_allows(stake, update.outcome_id):
+        reserve = round(contracts * limit_price + fee, 2) if self.live else stake
+        if not self._kill_switch_allows(reserve, update.outcome_id):
             return
         if self.live:
-            await self._send_live_taker("DIRECTIONAL", update, key, side, contracts, stake, decision.edge,
-                                        decision.capped)
+            await self._send_live_taker("DIRECTIONAL", update, key, side, contracts, reserve, decision.edge,
+                                        decision.capped, limit_price=limit_price)
             return
-        self._record("DIRECTIONAL", update, side, contracts, stake, fee, decision.edge, decision.capped)
+        self._record("DIRECTIONAL", update, side, contracts, stake, fee, decision.edge, decision.capped,
+                     price=avg_price)
         self.positions[key] = MarketPosition(legs=[self.orders[-1]])
         await self._after_taker(key)
+
+    @staticmethod
+    async def _evaluate(venue: str, price: float, sharp_q: SharpQuote, line: Optional[float], label: str):
+        if venue == "kalshi":
+            return await evaluate_kalshi_edge(price * 100, sharp_q, line=line, label=label)
+        return await evaluate_market_edge(NovigQuote(price=price, line=line, label=label), sharp_q)
+
+    @staticmethod
+    def _ask_levels(update: MarketUpdate) -> list[tuple[float, float]]:
+        """Ask levels cheapest first; falls back to the best ask alone if the depth is missing or inconsistent."""
+        levels = [(p, q) for p, q in update.ask_levels if q > 0]
+        if not levels or not math.isclose(levels[0][0], update.price):
+            return [(update.price, update.available_volume)]
+        return levels
+
+    async def _walk_asks(self, update: MarketUpdate, sharp_q: SharpQuote, label: str, decision):
+        """
+        Buy through several ask levels while EACH level still clears the edge threshold.
+        Size never exceeds the 1/4-Kelly stake of the worst level used (Kelly shrinks as the price worsens),
+        the $1,000 per-position cap, or the live canary stake.
+        Returns (contracts, total cost incl. fees, fee, average price, worst price = limit, [(price, n), ...]).
+        """
+        cap = decision.stake_usd
+        if self.max_stake < MAX_STAKE_USD:
+            cap = min(cap, self.max_stake)
+        used: list[tuple[float, int]] = []
+        spent = 0.0
+        for i, (price, size) in enumerate(self._ask_levels(update)):
+            if i == 0:
+                n = min(decision.contracts, int(size))
+            else:
+                level = await self._evaluate(update.venue, price, sharp_q, update.line, label)
+                if level.action != "BET":
+                    break
+                cap = min(cap, level.stake_usd)
+                unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
+                n = min(int(size), int(math.floor((cap - spent) / unit + 1e-9)))
+            if self.max_stake < MAX_STAKE_USD:
+                n = min(n, int(math.floor((self.max_stake - spent) / price + 1e-9)))
+            if n <= 0:
+                break
+            used.append((price, n))
+            spent += n * price
+            if n < int(size):
+                break
+        while used:
+            contracts = sum(n for _, n in used)
+            costs = [order_cost(update.venue, n, p) for p, n in used]
+            stake, fee = round(sum(c for c, _ in costs), 2), round(sum(f for _, f in costs), 2)
+            net = (contracts * decision.fair_prob - stake) / stake
+            if update.venue != "kalshi" or net > MIN_EDGE + 1e-9 or len(used) == 1 and contracts == decision.contracts:
+                avg = round(sum(p * n for p, n in used) / contracts, 6)
+                return contracts, stake, fee, avg, used[-1][0], used
+            log.info("EV_TRIGGER net edge %+.4f%% after fees too thin at %d levels; dropping the worst", net * 100,
+                     len(used))
+            used.pop()
+        return 0, 0.0, 0.0, update.price, update.price, []
 
     async def _after_taker(self, key: GameKey) -> None:
         if self.maker is not None:
@@ -621,31 +750,43 @@ class Supervisor:
             log.info("POSITION_LOCK live: no hedge on %s (%s)", key,
                      "first leg still filling" if first.pending else "Kalshi is data-only in live mode")
             return
-        ok, reason, contracts, cost, fee, scenarios = self._arb_check(first, update, key)
+        ok, reason, contracts, cost, fee, scenarios, avg_price, limit_price = self._arb_check(held, update, key)
         if not ok:
             self.stats["lock_blocked"] += 1
             log.info("POSITION_LOCK blocked opposite side %s on %s of %s (holding #%d %s %s @ %.4f): %s",
                      side, update.venue, key, first.order_id, first.venue, first.side, first.price, reason)
             return
-        log.info("ARB_TRIGGER %s: held %s %s @ %.4f + buy %s %s @ %.4f -> %d contracts, hedge $%.2f "
+        partial = contracts < held.unhedged()
+        log.info("ARB_TRIGGER %s: held %s %s @ %.4f + buy %s %s avg %.4f (limit %.4f) -> %d contracts%s, hedge $%.2f "
                  "(fee $%.2f), scenarios %s, guaranteed profit $%.2f", key, first.venue, first.side, first.price,
-                 update.venue, side, update.price, contracts, cost, fee, json.dumps(scenarios),
-                 min(scenarios.values()))
-        if not self._kill_switch_allows(cost, update.outcome_id):
+                 update.venue, side, avg_price, limit_price, contracts,
+                 f" (PARTIAL: {held.unhedged() - contracts:g} stay unhedged)" if partial else "", cost, fee,
+                 json.dumps(scenarios), min(scenarios.values()))
+        reserve = round(contracts * limit_price + fee, 2) if self.live else cost
+        if not self._kill_switch_allows(reserve, update.outcome_id):
             return
         if self.live:
             held.hedged = True        # blocks further hedges while this one fills
-            await self._send_live_taker("ARB_HEDGE", update, key, side, contracts, cost, None, False, held=held)
+            await self._send_live_taker("ARB_HEDGE", update, key, side, contracts, reserve, None, False, held=held,
+                                        limit_price=limit_price)
             return
-        self._record("ARB_HEDGE", update, side, contracts, cost, fee, None, False)
+        self._record("ARB_HEDGE", update, side, contracts, cost, fee, None, False, price=avg_price)
         held.legs.append(self.orders[-1])
-        held.hedged = True
+        held.hedged = held.unhedged() <= 0
         self.stats["arbs"] += 1
+        if partial:
+            self.stats["partial_hedges"] += 1
         await self._after_taker(key)
 
-    def _arb_check(self, first: PaperOrder, update: MarketUpdate, key: GameKey):
+    def _arb_check(self, held: MarketPosition, update: MarketUpdate, key: GameKey):
+        """
+        How many contracts of the opposite side can be bought, across ask levels, so that EVERY settlement
+        scenario still locks >= ARB_MIN_PROFIT_PER_CONTRACT per contract. Partial hedges are allowed
+        (at least MIN_PARTIAL_HEDGE_CONTRACTS); the rest of the first leg stays directional.
+        """
+        first = held.primary
         league, _, _, mtype = key
-        fail = lambda why: (False, why, 0, 0.0, 0.0, {})  # noqa: E731
+        fail = lambda why: (False, why, 0, 0.0, 0.0, {}, 0.0, 0.0)  # noqa: E731
         if mtype == "spread":
             if first.line is None or update.line is None or not math.isclose(update.line, -first.line):
                 return fail(f"lines not complementary ({first.line} vs {update.line})")
@@ -654,19 +795,42 @@ class Supervisor:
                 return fail(f"totals differ ({first.line} vs {update.line})")
         if mtype in {"spread", "total"} and not _is_half_point(update.line):
             return fail(f"whole-number line {update.line} can push")
-        contracts = first.contracts
-        if update.available_volume < contracts:
-            return fail(f"only {update.available_volume:g} contracts at ask, need {contracts} to fully hedge")
-        cost, fee = order_cost(update.venue, contracts, update.price)
-        if cost > MAX_STAKE_USD + 1e-9:
-            return fail(f"hedge ${cost:,.2f} exceeds the ${MAX_STAKE_USD:,.0f} per-position cap")
-        scenarios = arbitrage_scenarios(first, update.venue, contracts, cost, league, mtype)
-        need = round(ARB_MIN_PROFIT_PER_CONTRACT * contracts, 2)
-        worst = min(scenarios, key=scenarios.get)
-        if scenarios[worst] < need - 1e-9:
-            return fail(f"no arbitrage: worst case '{worst}' nets ${scenarios[worst]:,.2f} "
-                        f"(need >= ${need:,.2f}); scenarios {json.dumps(scenarios)}")
-        return True, "ok", contracts, cost, fee, scenarios
+        remaining = int(held.unhedged())
+        if remaining <= 0 or first.contracts <= 0:
+            return fail("nothing left to hedge")
+        c1 = first.stake_usd / first.contracts
+        worst_payout = 1.0
+        if league == "NFL" and mtype == "moneyline":
+            worst_payout = min(1.0, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
+                                        for v in (first.venue, update.venue)))
+        used: list[tuple[float, int]] = []
+        spent = 0.0
+        for price, size in self._ask_levels(update):
+            unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
+            if worst_payout - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
+                break
+            n = min(int(size), remaining - sum(k for _, k in used),
+                    int(math.floor((MAX_STAKE_USD - spent) / unit + 1e-9)))
+            if n <= 0:
+                break
+            used.append((price, n))
+            spent += n * unit
+        while used:
+            contracts = sum(n for _, n in used)
+            if contracts < remaining and contracts < MIN_PARTIAL_HEDGE_CONTRACTS:
+                return fail(f"only {contracts} contracts hedgeable at a locked profit (need all {remaining} or "
+                            f">= {MIN_PARTIAL_HEDGE_CONTRACTS} for a partial hedge)")
+            costs = [order_cost(update.venue, n, p) for p, n in used]
+            cost, fee = round(sum(c for c, _ in costs), 2), round(sum(f for _, f in costs), 2)
+            scenarios = arbitrage_scenarios(first, update.venue, contracts, cost, league, mtype)
+            need = round(ARB_MIN_PROFIT_PER_CONTRACT * contracts, 2)
+            if min(scenarios.values()) >= need - 1e-9:
+                avg = round(sum(p * n for p, n in used) / contracts, 6)
+                return True, "ok", contracts, cost, fee, scenarios, avg, used[-1][0]
+            used.pop()                                     # fee rounding ate the margin: drop the worst level
+        best = update.price + (kalshi_fee_per_contract(update.price * 100) if update.venue == "kalshi" else 0.0)
+        return fail(f"no arbitrage: worst case nets {worst_payout - c1 - best:+.4f}/contract at the best ask "
+                    f"(need >= {ARB_MIN_PROFIT_PER_CONTRACT:.4f})")
 
     # ---------------- orders / exposure ----------------
     def _kill_switch_allows(self, stake: float, outcome_id: str) -> bool:
@@ -703,8 +867,13 @@ class Supervisor:
     # ---------------- live execution ----------------
     async def _send_live_taker(self, kind: str, update: MarketUpdate, key: GameKey, side: str, contracts: int,
                                stake: float, edge: Optional[float], capped: bool,
-                               held: Optional[MarketPosition] = None) -> None:
-        """Reserve exposure + lock the game, then send a marketable LIMIT order at the best ask."""
+                               held: Optional[MarketPosition] = None, limit_price: Optional[float] = None) -> None:
+        """
+        Reserve exposure + lock the game, then send a marketable LIMIT order. The limit is the WORST ask level
+        we are willing to pay (default: the best ask); the exchange fills cheaper levels first and the real
+        average comes back on the fill slips. The reservation (`stake`) is sized at the limit, so it is never low.
+        """
+        price = update.price if limit_price is None else limit_price
         if not self._live_ready():
             self.stats["live_not_ready"] += 1
             log.warning("LIVE order not sent on %s: novig socket is down", update.outcome_id)
@@ -713,7 +882,7 @@ class Supervisor:
             return
         leg = PaperOrder(order_id=len(self.orders) + 1, kind=kind, venue="novig", outcome_id=update.outcome_id,
                          event_id=update.event_id, league=update.league, market_type=update.market_type, side=side,
-                         line=update.line, price=update.price, contracts=0, stake_usd=0.0, edge=edge, capped=capped,
+                         line=update.line, price=price, contracts=0, stake_usd=0.0, edge=edge, capped=capped,
                          placed_at=time.time(), live=True, pending=True, requested_contracts=contracts)
         self.exposure.record_open(leg.position_id, stake)               # reservation (re-checks the limit)
         self.orders.append(leg)
@@ -721,9 +890,9 @@ class Supervisor:
             self.positions[key] = MarketPosition(legs=[leg])
         else:
             held.legs.append(leg)
-        payload = order_body(update.outcome_id, "buy", round(update.price * 100, 4), contracts, f"tk-{leg.order_id}")
+        payload = order_body(update.outcome_id, "buy", round(price * 100, 4), contracts, f"tk-{leg.order_id}")
         try:
-            oid = await self.order_gateway.place_limit(update.outcome_id, "buy", round(update.price * 100, 4),
+            oid = await self.order_gateway.place_limit(update.outcome_id, "buy", round(price * 100, 4),
                                                        contracts, f"tk-{leg.order_id}")
         except Exception as exc:  # noqa: BLE001 — a rejected order must release everything it reserved
             log.error("LIVE_ORDER rejected %s %s x%d: %s", update.outcome_id, side, contracts, exc)
@@ -736,10 +905,10 @@ class Supervisor:
             return
         leg.exchange_order_id = oid
         self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id, key=key,
-                                          requested=contracts, limit_price=update.price, leg_id=leg.order_id)
+                                          requested=contracts, limit_price=price, leg_id=leg.order_id)
         self.stats["live_orders"] += 1
         order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f reserved=$%.2f", kind, oid, update.outcome_id, side,
-                       contracts, update.price, stake)
+                       contracts, price, stake)
         self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side, reserved_usd=stake,
                      payload=payload)
         self._spawn(self._taker_timeout(oid))
@@ -792,13 +961,16 @@ class Supervisor:
         if lo.filled <= 0:
             self._drop_leg(lo.key, leg)
             if lo.kind == "ARB_HEDGE" and pos is not None:
-                pos.hedged = False
+                pos.hedged = pos.unhedged() <= 0
             log.info("LIVE_DONE %s %s: nothing filled (%s); lock/reservation released", lo.kind,
                      lo.exchange_order_id, reason)
             return
-        if lo.kind == "ARB_HEDGE" and pos is not None and lo.filled < pos.primary.contracts:
-            log.warning("POSITION_RESIDUAL hedge %s filled %g of %d: %g contracts remain unhedged",
-                        lo.exchange_order_id, lo.filled, pos.primary.contracts, pos.primary.contracts - lo.filled)
+        if lo.kind == "ARB_HEDGE" and pos is not None:
+            pos.hedged = pos.unhedged() <= 0           # a partial fill leaves room for another hedge
+            if not pos.hedged:
+                log.warning("POSITION_RESIDUAL hedge %s filled %g of %d: %g contracts of the first leg remain "
+                            "unhedged (another hedge may follow)", lo.exchange_order_id, lo.filled, lo.requested,
+                            pos.unhedged())
         log.info("LIVE_DONE %s %s filled %g/%d cost=$%.2f (%s)", lo.kind, lo.exchange_order_id, lo.filled,
                  lo.requested, lo.fill_cost, reason)
         if self.research is not None:
@@ -913,17 +1085,51 @@ class Supervisor:
         start = self.game_start.get(gid)
         return None if start is None else round((start - time.time()) / 60.0, 2)
 
-    def _trade_blocked(self, gid: tuple) -> Optional[str]:
-        """Why this game may not be traded or quoted right now (None = allowed)."""
+    def cutoffs_for(self, league: str) -> tuple[float, float]:
+        """(taker, maker) cutoff in seconds before the scheduled start for this league."""
+        taker, maker = self.cutoff_overrides.get(league, (self.taker_cutoff_s, self.maker_cutoff_s))
+        return taker, max(maker, taker)
+
+    def _trade_blocked(self, gid: tuple, kind: str = "taker") -> Optional[str]:
+        """
+        Why this game may not be traded (kind="taker": takers + hedges) or quoted (kind="maker") right now.
+        None = allowed.
+        """
+        if gid in self.live_games:
+            return f"game is live ({self.live_games[gid]})"
         start = self.game_start.get(gid)
         if start is None:
             return "no scheduled start time (required in live mode)" if self.require_start_time else None
-        if time.time() >= start - self.pregame_cutoff_s:
-            return f"pregame cutoff ({self.pregame_cutoff_s / 60:.0f} min before start)"
+        taker_s, maker_s = self.cutoffs_for(gid[0])
+        window = maker_s if kind == "maker" else taker_s
+        if time.time() >= start - window:
+            return f"{kind} cutoff ({window / 60:g} min before start)"
         return None
 
+    def mark_game_live(self, gid: tuple, reason: str) -> None:
+        """A venue or the sharp feed says this game is in play: never trade it again this session."""
+        if gid in self.live_games:
+            return
+        self.live_games[gid] = reason
+        self.stats["games_flagged_live"] += 1
+        log.warning("GAME_LIVE %s: %s -> no orders, quotes pulled", gid, reason)
+        self._ledger("GAME_LIVE", game=list(gid), reason=reason, minutes_to_start=self.minutes_to_start(gid))
+        self._spawn(self._pull_game_quotes(gid, f"game live: {reason}"))
+
+    def _on_sharp_live(self, league: str, home: str, away: str) -> None:
+        self.mark_game_live((league, home, away), "sharp feed reports it in play")
+
+    async def _pull_game_quotes(self, gid: tuple, reason: str) -> int:
+        pulled = 0
+        if self.maker is not None:
+            for mk in {q.market_key for q in self.maker.quotes.values() if tuple(q.market_key)[:3] == gid}:
+                before = len(self.maker.quotes)
+                await self.maker.cancel_market(mk, reason)
+                pulled += before - len(self.maker.quotes)
+        return pulled
+
     async def _cutoff_loop(self) -> None:
-        """Every second: games entering the cutoff window get every quote pulled and their closing line recorded."""
+        """Every second: maker cutoff pulls quotes, taker cutoff ends trading, both record the closing line."""
         while True:
             try:
                 await self.run_cutoffs()
@@ -933,24 +1139,35 @@ class Supervisor:
                 log.exception("CUTOFF loop error (continuing)")
             await asyncio.sleep(1.0)
 
-    async def run_cutoffs(self) -> list[tuple]:
+    async def run_cutoffs(self) -> list[tuple[tuple, str]]:
+        """
+        Per game, in order, once each:
+          maker  (default 3 min before start): pull every resting quote on the game
+          taker  (default 1 min before start): no more takers/hedges; closing-line snapshot (research)
+          start  (scheduled start): second closing-line snapshot, the latest pregame price (research)
+        """
         now = time.time()
-        newly = [gid for gid, start in self.game_start.items()
-                 if gid not in self.cutoff_done and now >= start - self.pregame_cutoff_s]
-        for gid in newly:
-            self.cutoff_done.add(gid)
-            pulled = 0
-            if self.maker is not None:
-                for mk in {q.market_key for q in self.maker.quotes.values() if tuple(q.market_key)[:3] == gid}:
-                    before = len(self.maker.quotes)
-                    await self.maker.cancel_market(mk, "pregame cutoff")
-                    pulled += before - len(self.maker.quotes)
-            log.warning("CUTOFF %s reached (%.1f min to start): %d quote(s) pulled, no new orders",
-                        gid, (self.game_start[gid] - now) / 60, pulled)
-            self._ledger("CUTOFF", game=list(gid), quotes_pulled=pulled, minutes_to_start=self.minutes_to_start(gid))
-            if self.research is not None:
-                self._research_close(gid)
-        return newly
+        reached = []
+        for gid, start in list(self.game_start.items()):
+            taker_s, maker_s = self.cutoffs_for(gid[0])
+            done = self.cutoff_phases.setdefault(gid, set())
+            for phase, at in (("maker", start - maker_s), ("taker", start - taker_s), ("start", start)):
+                if phase in done or now < at:
+                    continue
+                done.add(phase)
+                reached.append((gid, phase))
+                if phase == "start":
+                    if self.research is not None and gid not in self.live_games:
+                        self._research_close(gid, "start")
+                    continue
+                pulled = await self._pull_game_quotes(gid, f"{phase} cutoff")
+                log.warning("CUTOFF %s %s cutoff reached (%.1f min to start): %d quote(s) pulled%s", gid, phase,
+                            (start - now) / 60, pulled, ", no new orders" if phase == "taker" else "")
+                self._ledger("CUTOFF", game=list(gid), phase=phase, quotes_pulled=pulled,
+                             minutes_to_start=self.minutes_to_start(gid))
+                if phase == "taker" and self.research is not None and gid not in self.live_games:
+                    self._research_close(gid, "cutoff")
+        return reached
 
     # ---------------- research hooks ----------------
     def _sides(self, key: tuple) -> tuple[str, str]:
@@ -966,7 +1183,8 @@ class Supervisor:
         self.gaps.update(key, update.venue, side, update.price, update.available_volume, update.line, tie,
                          self._sides(key), self.minutes_to_start(key[:3]))
 
-    def _research_decision(self, update: MarketUpdate, key: tuple, side: str, decision) -> None:
+    def _research_decision(self, update: MarketUpdate, key: tuple, side: str, decision,
+                           blocked: Optional[str] = None) -> None:
         age = self.book.age_of(key[0], key[1], key[2], key[3], side)
         venue_change = self.last_price_change.get((update.venue, update.outcome_id))
         sharp_at = None if age is None else time.time() - age
@@ -977,7 +1195,7 @@ class Supervisor:
             sharp_age_s=None if age is None else round(age, 3),
             moved_last=None if venue_change is None or sharp_at is None else (
                 update.venue if venue_change > sharp_at else "sharp"),
-            minutes_to_start=self.minutes_to_start(key[:3]))
+            minutes_to_start=self.minutes_to_start(key[:3]), blocked=blocked)
 
     def _research_entry(self, leg: PaperOrder, canon_key: Optional[tuple]) -> None:
         self.research.write("ENTRY", order_id=leg.order_id, order_kind=leg.kind, venue=leg.venue, live=leg.live,
@@ -985,7 +1203,7 @@ class Supervisor:
                             line=leg.line, price=leg.price, contracts=leg.contracts, stake_usd=leg.stake_usd,
                             edge=leg.edge, minutes_to_start=self.minutes_to_start(canon_key[:3]) if canon_key else None)
 
-    def _research_close(self, gid: tuple) -> None:
+    def _research_close(self, gid: tuple, point: str = "cutoff") -> None:
         """Closing snapshot at the cutoff: sharp fair value and venue prices for every side of every market."""
         for upd in list(self._latest_updates()):
             canon = self._canonical(upd)
@@ -995,13 +1213,15 @@ class Supervisor:
             sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=upd.line)
             fair = self._fair(sharp) if sharp is not None and (
                 upd.line is None or sharp.line is None or math.isclose(upd.line, sharp.line)) else None
-            self.research.write("CLOSE", game=list(key), side=side, line=upd.line, venue=upd.venue,
+            self.research.write("CLOSE", point=point, game=list(key), side=side, line=upd.line, venue=upd.venue,
                                 outcome_id=upd.outcome_id, close_fair_prob=fair, ask=upd.price, bid=upd.best_bid,
                                 depth=upd.available_volume, minutes_to_start=self.minutes_to_start(gid))
 
     def _schedule_markouts(self, key: tuple, side: str, line: Optional[float], price: float, contracts: int) -> None:
         if self.research is None:
             return
+
+        minutes = self.minutes_to_start(key[:3])
 
         async def markouts() -> None:
             start = time.time()
@@ -1010,6 +1230,7 @@ class Supervisor:
                 sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=line)
                 fair = self._fair(sharp) if sharp is not None else None
                 self.research.write("MARKOUT", game=list(key), side=side, line=line, fill_price=price,
+                                    minutes_to_start=minutes,
                                     contracts=contracts, delay_s=delay, fair_prob=fair,
                                     markout_per_contract=None if fair is None else round(fair - price, 5))
         self._spawn(markouts())
@@ -1228,7 +1449,7 @@ class Supervisor:
             if canon is None:
                 continue
             key, side = canon
-            if key in self.positions or self._trade_blocked(key[:3]):
+            if key in self.positions or self._trade_blocked(key[:3], "maker"):
                 continue
             sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
             if sharp is None or (info.line is not None and sharp.line is not None
@@ -1416,18 +1637,41 @@ def resolve_live_plan(env: dict) -> LivePlan:
                     approved_by=approver if scaled else None)
 
 
-def pregame_cutoff_from_env(env: dict) -> float:
-    """PREGAME_CUTOFF_MINUTES (default 10). At least 1 minute: quotes must never rest into a live game."""
-    raw = env.get("PREGAME_CUTOFF_MINUTES")
-    if not raw:
-        return PREGAME_CUTOFF_SECONDS
+def _minutes(name: str, raw: str) -> float:
     try:
         minutes = float(raw)
     except ValueError:
-        raise ConfigError(f"PREGAME_CUTOFF_MINUTES={raw!r} is not a number") from None
-    if not 1 <= minutes <= 24 * 60:
-        raise ConfigError("PREGAME_CUTOFF_MINUTES must be between 1 and 1440")
-    return minutes * 60
+        raise ConfigError(f"{name}={raw!r} is not a number") from None
+    if not 0.5 <= minutes <= 24 * 60:
+        raise ConfigError(f"{name} must be between 0.5 and 1440 minutes")
+    return minutes
+
+
+def cutoffs_from_env(env: dict) -> dict:
+    """
+    TAKER_CUTOFF_MINUTES (default 1): no new orders or hedges on a game this long before its scheduled start.
+    MAKER_CUTOFF_MINUTES (default 3): resting quotes pulled this long before. Never less than the taker cutoff.
+    CUTOFF_OVERRIDES: per league "taker/maker" minutes, e.g. "NBA=2/5,NFL=1/3".
+    """
+    taker = _minutes("TAKER_CUTOFF_MINUTES", env["TAKER_CUTOFF_MINUTES"]) if env.get("TAKER_CUTOFF_MINUTES") \
+        else TAKER_CUTOFF_SECONDS / 60
+    maker = _minutes("MAKER_CUTOFF_MINUTES", env["MAKER_CUTOFF_MINUTES"]) if env.get("MAKER_CUTOFF_MINUTES") \
+        else MAKER_CUTOFF_SECONDS / 60
+    if maker < taker:
+        raise ConfigError("MAKER_CUTOFF_MINUTES must be >= TAKER_CUTOFF_MINUTES (quotes come off first)")
+    overrides = {}
+    for item in filter(None, (x.strip() for x in (env.get("CUTOFF_OVERRIDES") or "").split(","))):
+        try:
+            league, pair = item.split("=")
+            t_raw, m_raw = pair.split("/")
+        except ValueError:
+            raise ConfigError(f"CUTOFF_OVERRIDES entry {item!r} must look like NBA=2/5 (taker/maker minutes)") \
+                from None
+        t, m = _minutes("CUTOFF_OVERRIDES", t_raw), _minutes("CUTOFF_OVERRIDES", m_raw)
+        if m < t:
+            raise ConfigError(f"CUTOFF_OVERRIDES {item!r}: maker minutes must be >= taker minutes")
+        overrides[league.strip().upper()] = (t * 60, m * 60)
+    return dict(taker_cutoff_s=taker * 60, maker_cutoff_s=maker * 60, cutoff_overrides=overrides)
 
 
 def research_from_env(env: dict) -> Optional[ResearchRecorder]:
@@ -1446,7 +1690,8 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     Live limits: canary $10 / $100 / maker off unless LIVE_SCALE_APPROVED_BY is set (see resolve_live_plan).
     Optional: NOVIG_WS_URL, NOVIG_API_BASE, NOVIG_EVENTS_URL, NOVIG_SUBSCRIBE_MESSAGES (JSON list),
               NOVIG_FILL_VOLUME_MODE (default cumulative, per Novig), TRADING_LOG_DIR,
-              PREGAME_CUTOFF_MINUTES (default 10), RESEARCH_ENABLED (default 1), RESEARCH_DIR (default research).
+              TAKER_CUTOFF_MINUTES (default 1), MAKER_CUTOFF_MINUTES (default 3), CUTOFF_OVERRIDES,
+              RESEARCH_ENABLED (default 1), RESEARCH_DIR (default research).
     """
     env = os.environ if env is None else env
     live = env.get("TRADING_MODE", "paper").lower() == "live"
@@ -1521,7 +1766,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         kw = dict(kalshi_url=env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
                   kalshi_auth=(key_id, pk),
                   kalshi_rest=KalshiRestClient(rest_base, key_id, pk, series_from_env(env.get("KALSHI_SERIES"))))
-    kw.update(pregame_cutoff_s=pregame_cutoff_from_env(env), research=research_from_env(env))
+    kw.update(research=research_from_env(env), **cutoffs_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"])),
@@ -1569,7 +1814,9 @@ def describe_state(sup: Supervisor) -> dict:
         "sharp_http_timeout_s": cfg.timeout_seconds if cfg else None,
         "sharp_poll_s": sup.poller.interval,
         "sharp_max_age_s": sup.book.max_age,
-        "pregame_cutoff_min": sup.pregame_cutoff_s / 60,
+        "taker_cutoff_min": sup.taker_cutoff_s / 60,
+        "maker_cutoff_min": sup.maker_cutoff_s / 60,
+        "cutoff_overrides": {k: f"{t / 60:g}/{m / 60:g}" for k, (t, m) in sorted(sup.cutoff_overrides.items())},
         "require_start_time": sup.require_start_time,
         "research_dir": str(sup.research.dir) if sup.research is not None else None,
     }
@@ -1596,7 +1843,11 @@ def format_state_report(sup: Supervisor) -> str:
         ("Minimum edge", f"> {st['min_edge']:.1%}"),
         ("Maker", st["maker"]),
         ("Dead-heat venues (NFL ML ties = 50c)", ", ".join(st["dead_heat_venues"])),
-        ("Pregame cutoff", f"stop trading + pull quotes {st['pregame_cutoff_min']:.0f} min before start"),
+        ("Taker/hedge cutoff", f"no new orders {st['taker_cutoff_min']:g} min before scheduled start"),
+        ("Maker cutoff", f"quotes pulled {st['maker_cutoff_min']:g} min before scheduled start"),
+        ("Per-league cutoffs (taker/maker min)", ", ".join(f"{k} {v}" for k, v in st["cutoff_overrides"].items())
+         or "none"),
+        ("Live-game stop", "sharp feed in-play flag; game gone from Novig's pregame list (30s refresh near start)"),
         ("Games with no start time", "NEVER traded" if st["require_start_time"] else "traded (paper only)"),
         ("Research data", st["research_dir"] or "off"),
         ("Ledger", st["ledger"] or "(paper: none)"),

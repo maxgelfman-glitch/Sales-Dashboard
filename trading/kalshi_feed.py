@@ -45,7 +45,7 @@ from typing import Any, Optional, Union
 import aiohttp
 
 from execution import cents_to_american, cents_to_probability
-from novig_feed import MarketInfo, MarketRegistry, MarketUpdate, UpdateCallback
+from novig_feed import MAX_BOOK_LEVELS, MarketInfo, MarketRegistry, MarketUpdate, UpdateCallback
 from novig_rest import parse_start_time
 from team_normalizer import normalize_team_name
 from ws_base import (
@@ -169,6 +169,10 @@ class KalshiBook:
         best_no = max(self.no)
         return round(100 - best_no, 4), self.no[best_no]
 
+    def yes_ask_levels(self, n: int = MAX_BOOK_LEVELS) -> list[tuple[float, float]]:
+        """Cheapest n YES asks as (price as probability, contracts): each NO bid at c = a YES ask at 100 - c."""
+        return [(round(100 - p, 4) / 100, self.no[p]) for p in sorted(self.no, reverse=True)[:n] if 0 < p < 100]
+
     def yes_bid(self) -> Optional[tuple[float, float]]:
         if not self.yes:
             return None
@@ -281,7 +285,7 @@ class KalshiFeed(ResilientWebSocketFeed):
         top = dict(price=None if ask is None or not 0 < ask[0] < 100 else ask[0] / 100,
                    available_volume=0.0 if ask is None else ask[1],
                    best_bid=None if bid is None or not 0 < bid[0] < 100 else bid[0] / 100,
-                   bid_volume=0.0 if bid is None else bid[1])
+                   bid_volume=0.0 if bid is None else bid[1], ask_levels=book.yes_ask_levels())
         previous = self.latest.get(ticker)
         if previous is not None and all(getattr(previous, k) == v for k, v in top.items()):
             return

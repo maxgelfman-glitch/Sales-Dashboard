@@ -174,14 +174,16 @@ async def test_top_of_book_updates_and_line_shift(server):
     feed, task = await start_feed(server.url, rec)
     await server.broadcast(make_tick(price_cents=50, volume=1000))            # snapshot
     await server.broadcast(make_tick(price_cents=50, volume=1000))            # identical: ignored
-    await server.broadcast(make_tick(price_cents=55, volume=500))             # worse ask level: no change
+    await server.broadcast(make_tick(price_cents=55, volume=500))             # deeper ask level: depth update
     await server.broadcast(make_tick(price_cents=48, volume=200))             # new best ask
     await server.broadcast(make_tick(price_cents=45, side="buy", volume=90))  # new best bid
     await server.broadcast(make_tick("UNKNOWN", 10))                          # not registered
     await wait_until(lambda: feed.messages_received == 6)
     await asyncio.sleep(0.05)
     tops = [(u.price, u.available_volume, u.best_bid) for u, _ in rec.updates]
-    assert tops == [(0.50, 1000, None), (0.48, 200, None), (0.48, 200, 0.45)]
+    assert tops == [(0.50, 1000, None), (0.50, 1000, None), (0.48, 200, None), (0.48, 200, 0.45)]
+    assert rec.updates[1][0].ask_levels == [(0.50, 1000), (0.55, 500)]
+    assert rec.updates[2][0].ask_levels == [(0.48, 200), (0.50, 1000), (0.55, 500)]
     u = rec.updates[-1][0]
     assert (u.outcome_id, u.market_id, u.sibling_outcome_id, u.venue) == ("O-NYK", "MK-NYK-ML", "O-BOS", "novig")
     await shutdown(feed, task)

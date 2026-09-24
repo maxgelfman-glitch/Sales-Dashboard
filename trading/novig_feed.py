@@ -66,6 +66,7 @@ ORDERS_SUBSCRIBE = {"event": "subscribe", "channel": "orders"}
 SUBSCRIBE_PAYLOAD = TAPE_SUBSCRIBE        # paper mode needs only public prices
 
 TRACKED_LEAGUES = frozenset({"NFL", "NBA"})
+MAX_BOOK_LEVELS = 10                     # ask levels passed to the engine per update
 MARKET_TYPE_ALIASES = {
     "spread": "spread", "point_spread": "spread", "pointspread": "spread", "handicap": "spread", "ats": "spread",
     "moneyline": "moneyline", "money_line": "moneyline", "ml": "moneyline", "h2h": "moneyline",
@@ -174,6 +175,9 @@ class MarketUpdate(BaseModel):
     available_volume: float = 0.0                             # contracts at the best ask
     best_bid: Optional[float] = Field(default=None, gt=0, lt=1)
     bid_volume: float = 0.0
+    # every ask level, cheapest first: [(price, contracts), ...] (up to MAX_BOOK_LEVELS). Lets the engine buy
+    # through several prices while each one still has edge. Empty = only the best ask is known.
+    ask_levels: list[tuple[float, float]] = Field(default_factory=list)
     start_time: Optional[float] = None                        # scheduled game start (epoch seconds, UTC)
     received_at: float = Field(default_factory=time.time)
 
@@ -265,6 +269,10 @@ class OrderBook:
             return None
         p = max(self.bids)
         return p, self.bids[p]
+
+    def ask_levels(self, n: int = MAX_BOOK_LEVELS) -> list[tuple[float, float]]:
+        """Cheapest n ask levels as (price as probability, contracts)."""
+        return [(p / 100, self.asks[p]) for p in sorted(self.asks)[:n]]
 
 
 def parse_message(raw: Union[str, bytes]) -> list[TapeTick]:
@@ -383,7 +391,8 @@ class NovigFeed(ResilientWebSocketFeed):
 
         ask, bid = book.best_ask(), book.best_bid()
         top = dict(price=None if ask is None else ask[0] / 100, available_volume=0.0 if ask is None else ask[1],
-                   best_bid=None if bid is None else bid[0] / 100, bid_volume=0.0 if bid is None else bid[1])
+                   best_bid=None if bid is None else bid[0] / 100, bid_volume=0.0 if bid is None else bid[1],
+                   ask_levels=book.ask_levels())
         previous = self.latest.get(tick.outcome_id)
         if previous is not None and all(getattr(previous, k) == v for k, v in top.items()):
             return

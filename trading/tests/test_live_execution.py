@@ -245,7 +245,12 @@ async def test_live_partial_hedge_logs_residual(tmp_path):
     await sup.on_market_update(upd("O-BOS", 0.478), None)
     await sup.on_fill_slip(slip("ex-2", "PARTIAL", 600, 47.8))
     await asyncio.sleep(0.15)
-    assert "POSITION_RESIDUAL hedge ex-2 filled 600 of 1000: 400 contracts remain unhedged" in path.read_text()
+    assert ("POSITION_RESIDUAL hedge ex-2 filled 600 of 1000: 400 contracts of the first leg remain unhedged"
+            in path.read_text())
+    held = next(iter(sup.positions.values()))
+    assert not held.hedged and held.unhedged() == 400      # the rest can still be hedged later
+    await sup.on_market_update(upd("O-BOS", 0.47), None)
+    assert sup.order_gateway.placed[-1]["contracts"] == 400
 
 
 # ================================================================ live maker
