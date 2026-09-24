@@ -76,6 +76,15 @@ python main_supervisor.py
   `TAKER_MAX_SHARP_MOVE_AGE_SECONDS=5`. Turn them on only if the report's WHO MOVED FIRST section shows
   "sharp, < 5s" beating "venue".
 
+## Locked pairs (the core arbitrage, no fair value needed)
+When the two sides of a market, on any venues, cost less than the payout after fees in every outcome
+(NFL ties included, whole-number lines excluded), the engine buys **both** at once (`ARB_PAIRS_ENABLED=1`,
+default). This needs no sharp line, so it also runs in measurement mode. Neither side has to beat the
+sharp line on its own. Size = the thinner side's best level, capped at $1,000 per leg, the live canary
+stake, and a per-game cap applied to the worst case (one leg fills, the other doesn't). In live mode both
+venues must be live-enabled. If one leg misses, the other stays as a normal position and the regular hedge
+path keeps trying to complete it.
+
 ## Risk controls
 * `GAME_EXPOSURE_LIMIT_USD` (default $1,000): unhedged money per game across its moneyline, spread and total
   (they are correlated). Hedges are always allowed and free room. Maker quotes only on games we hold nothing in.

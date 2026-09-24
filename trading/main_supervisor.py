@@ -214,7 +214,7 @@ def setup_logging(log_dir: str | Path = "logs", level: int = logging.INFO, conso
 # ==========================================================================
 class PaperOrder(BaseModel):
     order_id: int
-    kind: Literal["DIRECTIONAL", "ARB_HEDGE", "MAKER_FILL", "RESTORED"]
+    kind: Literal["DIRECTIONAL", "ARB_HEDGE", "ARB_PAIR", "MAKER_FILL", "RESTORED"]
     venue: str
     outcome_id: str
     event_id: str
@@ -389,6 +389,7 @@ class Supervisor:
         taker_max_sharp_move_age_s: Optional[float] = None,
         kalshi_gateway=None,
         kalshi_positions_client=None,
+        arb_pairs_enabled: bool = True,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -422,6 +423,7 @@ class Supervisor:
         self.kalshi_gateway = kalshi_gateway
         self.kalshi_live = bool(live and kalshi_gateway is not None)
         self.kalshi_positions_client = kalshi_positions_client
+        self.arb_pairs_enabled = arb_pairs_enabled      # buy BOTH sides when they lock a profit (no sharp needed)
         self.kalshi_fills_confirmed = False            # set by the first Kalshi fill message of the session
         self.session_tag = session_tag()
         if self.kalshi_live and self.kalshi is not None:
@@ -739,6 +741,10 @@ class Supervisor:
                 await self._try_arbitrage(update, key, side, held)
             return
 
+        # A locked pair needs no fair value at all: both sides across venues cost less than the payout.
+        if self.arb_pairs_enabled and not shadow and await self._try_locked_pair(update, key, side):
+            return
+
         sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line)
         if sharp is None:
             self.stats["no_sharp"] += 1
@@ -902,6 +908,97 @@ class Supervisor:
         if self.maker is not None:
             self.maker.note_taker_activity()
             await self.maker.cancel_market(key, "position opened in this market")
+
+    # ---------------- locked pairs (both legs at once) ----------------
+    def _unit_cost(self, venue: str, price: float) -> float:
+        return price + (kalshi_fee_per_contract(price * 100) if venue == "kalshi" else 0.0)
+
+    def _pair_candidates(self, update: MarketUpdate, key: GameKey, side: str) -> list[MarketUpdate]:
+        """Latest asks for the OPPOSITE side of the same market on any venue, with a complementary line."""
+        league, _, _, mtype = key
+        out = []
+        for other in list(self._latest_updates()):
+            if other.price is None or other.outcome_id == update.outcome_id:
+                continue
+            canon = self._canonical(other)
+            if canon is None or canon[0] != key or canon[1] == side:
+                continue
+            if mtype == "spread" and (other.line is None or update.line is None
+                                      or not math.isclose(other.line, -update.line)):
+                continue
+            if mtype == "total" and (other.line is None or update.line is None
+                                     or not math.isclose(other.line, update.line)):
+                continue
+            if mtype in {"spread", "total"} and not _is_half_point(update.line):
+                continue                                   # a whole-number line can push
+            out.append(other)
+        return out
+
+    async def _try_locked_pair(self, update: MarketUpdate, key: GameKey, side: str) -> bool:
+        """
+        Buy both sides at once when, after fees, every settlement scenario (incl. an NFL tie) pays at least
+        ARB_MIN_PROFIT_PER_CONTRACT. Size: the thinner side's best level, the $1,000 per-leg cap, the canary,
+        and the per-game cap applied to the WORST case (one leg fills, the other does not).
+        Returns True when a pair was executed (or sent).
+        """
+        if update.price is None or self._loss_halted():
+            return False
+        league, _, _, mtype = key
+        if self.live and (update.venue not in self.live_venues() or not self._live_ready(update.venue)):
+            return False
+        best = None
+        for other in self._pair_candidates(update, key, side):
+            if self.live and (other.venue not in self.live_venues() or not self._live_ready(other.venue)):
+                continue
+            worst_payout = 1.0
+            if league == "NFL" and mtype == "moneyline":
+                worst_payout = min(1.0, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
+                                            for v in (update.venue, other.venue)))
+            profit = worst_payout - self._unit_cost(update.venue, update.price) - self._unit_cost(other.venue,
+                                                                                                 other.price)
+            if profit >= ARB_MIN_PROFIT_PER_CONTRACT - 1e-9 and (best is None or profit > best[1]):
+                best = (other, profit, worst_payout)
+        if best is None:
+            return False
+        other, profit, worst_payout = best
+        ua, ub = self._unit_cost(update.venue, update.price), self._unit_cost(other.venue, other.price)
+        per_leg_cap = min(MAX_STAKE_USD, self.max_stake)
+        n = int(min(update.available_volume, other.available_volume,
+                    math.floor(per_leg_cap / ua + 1e-9), math.floor(per_leg_cap / ub + 1e-9),
+                    math.floor(self.game_room(key[:3]) / max(ua, ub) + 1e-9)))
+        while n >= MIN_PARTIAL_HEDGE_CONTRACTS:
+            cost_a, fee_a = order_cost(update.venue, n, update.price)
+            cost_b, fee_b = order_cost(other.venue, n, other.price)
+            if n * worst_payout - cost_a - cost_b >= round(ARB_MIN_PROFIT_PER_CONTRACT * n, 2) - 1e-9:
+                break
+            n -= max(1, n // 20)                          # fee rounding ate the margin: shrink
+        if n < MIN_PARTIAL_HEDGE_CONTRACTS:
+            self.stats["arb_pair_too_small"] += 1
+            return False
+        if not self._kill_switch_allows(round(cost_a + cost_b, 2), update.outcome_id):
+            return False
+        other_side = self._canonical(other)[1]
+        locked = round(n * worst_payout - cost_a - cost_b, 2)
+        log.info("ARB_PAIR %s: buy %s %s @ %.4f + %s %s @ %.4f x%d -> cost $%.2f, locked profit $%.2f in every "
+                 "outcome", key, update.venue, side, update.price, other.venue, other_side, other.price, n,
+                 cost_a + cost_b, locked)
+        self.stats["arb_pairs"] += 1
+        if self.live:
+            self._ledger("ARB_PAIR", game=list(key), legs=[[update.venue, update.outcome_id, update.price],
+                                                           [other.venue, other.outcome_id, other.price]],
+                         contracts=n, locked_profit_usd=locked)
+            await self._send_live_taker("DIRECTIONAL", update, key, side, n, cost_a, None, False)
+            held = self.positions.get(key)
+            if held is None:                              # first leg rejected / not sent: nothing to pair
+                return True
+            held.hedged = True                            # the second leg is on its way
+            await self._send_live_taker("ARB_HEDGE", other, key, other_side, n, cost_b, None, False, held=held)
+            return True
+        leg_a = self._record("ARB_PAIR", update, side, n, cost_a, fee_a, None, False)
+        leg_b = self._record("ARB_PAIR", other, other_side, n, cost_b, fee_b, None, False)
+        self.positions[key] = MarketPosition(legs=[leg_a, leg_b], hedged=True)
+        await self._after_taker(key)
+        return True
 
     # ---------------- arbitrage ----------------
     async def _try_arbitrage(self, update: MarketUpdate, key: GameKey, side: str, held: MarketPosition) -> None:
@@ -1213,8 +1310,9 @@ class Supervisor:
         self.exposure.adjust(leg.position_id, round(lo.fill_cost, 2))
         if lo.filled <= 0:
             self._drop_leg(lo.key, leg)
-            if lo.kind == "ARB_HEDGE" and pos is not None:
-                pos.hedged = pos.unhedged() <= 0
+            pos = self.positions.get(lo.key)
+            if pos is not None and pos.legs:            # any leg of a pair can be the missing one
+                pos.hedged = pos.unhedged() <= 0 and len(pos.legs) > 1
             log.info("LIVE_DONE %s %s: nothing filled (%s); lock/reservation released", lo.kind,
                      lo.exchange_order_id, reason)
             return
@@ -1226,6 +1324,10 @@ class Supervisor:
                             pos.unhedged())
         log.info("LIVE_DONE %s %s filled %g/%d cost=$%.2f (%s)", lo.kind, lo.exchange_order_id, lo.filled,
                  lo.requested, lo.fill_cost, reason)
+        if pos is not None and len(pos.legs) > 1 and not any(l.pending for l in pos.legs) and pos.unhedged() < 0:
+            log.warning("POSITION_RESIDUAL %s over-hedged by %g contracts (the second leg filled more than the "
+                        "first): that excess is a directional position", lo.key, -pos.unhedged())
+            self._ledger("POSITION_RESIDUAL", game=list(lo.key), over_hedged_contracts=-pos.unhedged())
         if self.research is not None:
             self._research_entry(leg, lo.key)
         self._ledger("DONE", exchange_order_id=lo.exchange_order_id, filled=lo.filled, cost_usd=round(lo.fill_cost, 2),
@@ -2118,7 +2220,8 @@ def taker_filters_from_env(env: dict) -> dict:
             raise ConfigError(f"TAKER_MAX_SHARP_MOVE_AGE_SECONDS={raw!r} is not a number") from None
         if not 0 < age <= 3600:
             raise ConfigError("TAKER_MAX_SHARP_MOVE_AGE_SECONDS must be > 0 and <= 3600")
-    return dict(taker_require_sharp_moved_last=moved, taker_max_sharp_move_age_s=age)
+    return dict(taker_require_sharp_moved_last=moved, taker_max_sharp_move_age_s=age,
+                arb_pairs_enabled=(env.get("ARB_PAIRS_ENABLED") or "1").strip().lower() not in {"0", "false", "off"})
 
 
 def research_from_env(env: dict) -> Optional[ResearchRecorder]:
