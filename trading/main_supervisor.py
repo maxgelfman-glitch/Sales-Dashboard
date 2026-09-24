@@ -159,6 +159,10 @@ NEAR_START_REFRESH_SECONDS = 30.0      # re-read Novig's pregame list this often
 NEAR_START_WINDOW_SECONDS = 15 * 60    # ... "close" = within this long of its scheduled start
 VANISHED_FLAG_WINDOW_SECONDS = 60 * 60 # a game gone from Novig's pregame list within 1h of start = treat as live
 MIN_PARTIAL_HEDGE_CONTRACTS = 10       # smaller partial hedges are not worth an order
+# How to buy through several ask levels. "staggered": one order per level at that level's price (default:
+# Novig is believed to fill a taker at its limit). "single": one order limited at the worst level (only right
+# if the exchange fills cheaper levels first). "off": best level only.
+MULTI_LEVEL_MODES = ("staggered", "single", "off")
 
 log = logging.getLogger("trading.supervisor")
 bridge_log = logging.getLogger("trading.bridge")
@@ -358,6 +362,7 @@ class Supervisor:
         require_start_time: Optional[bool] = None,
         research: Optional[ResearchRecorder] = None,
         depth_sample_s: float = DEPTH_SAMPLE_SECONDS,
+        multi_level_mode: str = "staggered",
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -417,6 +422,9 @@ class Supervisor:
         # Multi-level live orders rely on the exchange filling cheaper levels first (standard price-time
         # matching, unconfirmed for Novig). Switched off for the session if a fill proves otherwise.
         self.multi_level_live = True
+        if multi_level_mode not in MULTI_LEVEL_MODES:
+            raise ValueError(f"multi_level_mode must be one of {MULTI_LEVEL_MODES}")
+        self.multi_level_mode = multi_level_mode
         self._last_hedge_levels: list[tuple[float, int]] = []
         self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
@@ -686,7 +694,7 @@ class Supervisor:
         if contracts < decision.contracts:
             log.info("EV_TRIGGER size limited by liquidity: %d of %d contracts ($%.2f)", contracts,
                      decision.contracts, stake)
-        reserve = round(contracts * limit_price + fee, 2) if self.live else stake
+        reserve = round(contracts * limit_price + fee, 2) if self._single_limit(used) else stake
         if not self._kill_switch_allows(reserve, update.outcome_id):
             return
         if self.live:
@@ -711,6 +719,10 @@ class Supervisor:
         if not levels or not math.isclose(levels[0][0], update.price):
             return [(update.price, update.available_volume)]
         return levels
+
+    def _single_limit(self, used: list) -> bool:
+        """True when one live order limited at the deepest level will be sent (reserve at that limit)."""
+        return self.live and len(used) > 1 and self.multi_level_mode == "single"
 
     @staticmethod
     def _fit_worst_case(venue: str, used: list[tuple[float, int]], cap: float) -> list[tuple[float, int]]:
@@ -748,7 +760,7 @@ class Supervisor:
         for i, (price, size) in enumerate(self._ask_levels(update)):
             if i == 0:
                 n = min(decision.contracts, int(size))
-            elif self.live and not self.multi_level_live:
+            elif self.multi_level_mode == "off" or (self.live and not self.multi_level_live):
                 break
             else:
                 level = await self._evaluate(update.venue, price, sharp_q, update.line, label)
@@ -765,9 +777,9 @@ class Supervisor:
             spent += n * price
             if n < int(size):
                 break
-        if len(used) > 1:
-            hard = min(cap, self.max_stake, MAX_STAKE_USD)
-            used = self._fit_worst_case(update.venue, used, hard)
+        if len(used) > 1 and self.multi_level_mode == "single":
+            # one order limited at the deepest level: size for everything filling at that limit
+            used = self._fit_worst_case(update.venue, used, min(cap, self.max_stake, MAX_STAKE_USD))
         while used:
             contracts = sum(n for _, n in used)
             costs = [order_cost(update.venue, n, p) for p, n in used]
@@ -806,7 +818,7 @@ class Supervisor:
                  update.venue, side, avg_price, limit_price, contracts,
                  f" (PARTIAL: {held.unhedged() - contracts:g} stay unhedged)" if partial else "", cost, fee,
                  json.dumps(scenarios), min(scenarios.values()))
-        reserve = round(contracts * limit_price + fee, 2) if self.live else cost
+        reserve = round(contracts * limit_price + fee, 2) if self._single_limit(self._last_hedge_levels) else cost
         if not self._kill_switch_allows(reserve, update.outcome_id):
             return
         if self.live:
@@ -850,7 +862,7 @@ class Supervisor:
         used: list[tuple[float, int]] = []
         spent = 0.0
         for i, (price, size) in enumerate(self._ask_levels(update)):
-            if i > 0 and self.live and not self.multi_level_live:
+            if i > 0 and (self.multi_level_mode == "off" or (self.live and not self.multi_level_live)):
                 break
             unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
             if worst_payout - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
@@ -861,7 +873,8 @@ class Supervisor:
                 break
             used.append((price, n))
             spent += n * unit
-        used = self._fit_worst_case(update.venue, used, MAX_STAKE_USD)
+        if self.multi_level_mode == "single":
+            used = self._fit_worst_case(update.venue, used, MAX_STAKE_USD)
         while used:
             contracts = sum(n for _, n in used)
             if contracts < remaining and contracts < MIN_PARTIAL_HEDGE_CONTRACTS:
@@ -918,9 +931,14 @@ class Supervisor:
                                held: Optional[MarketPosition] = None, limit_price: Optional[float] = None,
                                levels: Optional[list[tuple[float, int]]] = None) -> None:
         """
-        Reserve exposure + lock the game, then send a marketable LIMIT order. The limit is the WORST ask level
-        we are willing to pay (default: the best ask); the exchange fills cheaper levels first and the real
-        average comes back on the fill slips. The reservation (`stake`) is sized at the limit, so it is never low.
+        Reserve exposure + lock the game, then send marketable LIMIT order(s) for one position leg.
+
+        multi_level_mode "staggered" (default; Novig is believed to fill a taker at its LIMIT, not at each
+        resting price): one order per ask level, each priced at that level, all sent at once. No contract can
+        cost more than its own level; a tranche whose level vanished rests at its (still profitable) price
+        until the fill timeout cancels it.
+        "single": one order limited at the worst level (only right if the exchange fills cheaper levels first).
+        The reservation (`stake`) covers the worst case, so it is never low.
         """
         price = update.price if limit_price is None else limit_price
         if not self._live_ready():
@@ -929,6 +947,8 @@ class Supervisor:
             if held is not None:
                 held.hedged = False
             return
+        staggered = self.multi_level_mode == "staggered" and levels is not None and len(levels) > 1
+        tranches = [(p, n) for p, n in levels] if staggered else [(price, contracts)]
         leg = PaperOrder(order_id=len(self.orders) + 1, kind=kind, venue="novig", outcome_id=update.outcome_id,
                          event_id=update.event_id, league=update.league, market_type=update.market_type, side=side,
                          line=update.line, price=price, contracts=0, stake_usd=0.0, edge=edge, capped=capped,
@@ -939,31 +959,56 @@ class Supervisor:
             self.positions[key] = MarketPosition(legs=[leg])
         else:
             held.legs.append(leg)
-        payload = order_body(update.outcome_id, "buy", round(price * 100, 4), contracts, f"tk-{leg.order_id}")
-        try:
-            oid = await self.order_gateway.place_limit(update.outcome_id, "buy", round(price * 100, 4),
-                                                       contracts, f"tk-{leg.order_id}")
-        except Exception as exc:  # noqa: BLE001 — a rejected order must release everything it reserved
-            log.error("LIVE_ORDER rejected %s %s x%d: %s", update.outcome_id, side, contracts, exc)
-            self._ledger("REJECTED", kind=kind, payload=payload, error=f"{type(exc).__name__}: {exc}")
-            self.stats["live_rejected"] += 1
+        cids = [f"tk-{leg.order_id}" if len(tranches) == 1 else f"tk-{leg.order_id}-{i + 1}"
+                for i in range(len(tranches))]
+        payloads = [order_body(update.outcome_id, "buy", round(p * 100, 4), n, cid)
+                    for (p, n), cid in zip(tranches, cids)]
+        results = await asyncio.gather(*(self.order_gateway.place_limit(update.outcome_id, "buy", round(p * 100, 4),
+                                                                        n, cid)
+                                         for (p, n), cid in zip(tranches, cids)), return_exceptions=True)
+        placed = []
+        for (p, n), payload, res in zip(tranches, payloads, results):
+            if isinstance(res, BaseException):   # a rejected order must release everything it reserved
+                log.error("LIVE_ORDER rejected %s %s x%d @ %.4f: %s", update.outcome_id, side, n, p, res)
+                self._ledger("REJECTED", kind=kind, payload=payload, error=f"{type(res).__name__}: {res}")
+                self.stats["live_rejected"] += 1
+                continue
+            placed.append((res, p, n, payload))
+        if not placed:
             self.exposure.adjust(leg.position_id, 0)
             self._drop_leg(key, leg)
             if held is not None:
                 held.hedged = False
             return
-        leg.exchange_order_id = oid
-        self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id, key=key,
-                                          requested=contracts, limit_price=price, leg_id=leg.order_id,
-                                          expected_levels=levels or [])
-        self.stats["live_orders"] += 1
-        order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f reserved=$%.2f", kind, oid, update.outcome_id, side,
-                       contracts, price, stake)
-        self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side, reserved_usd=stake,
-                     payload=payload, expected_levels=levels or [[price, contracts]],
-                     expected_avg_price=_sweep_avg(levels, contracts) if levels else price)
-        self._spawn(self._taker_timeout(oid))
+        if len(placed) < len(tranches):                # some tranches rejected: shrink the reservation to the rest
+            leg.requested_contracts = sum(n for _, _, n, _ in placed)
+            self.exposure.adjust(leg.position_id, round(sum(p * n for _, p, n, _ in placed), 2))
+        leg.exchange_order_id = ",".join(oid for oid, *_ in placed)
+        for oid, p, n, payload in placed:
+            self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id,
+                                              key=key, requested=n, limit_price=p, leg_id=leg.order_id,
+                                              expected_levels=[] if staggered else (levels or []))
+            self.stats["live_orders"] += 1
+            order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f%s", kind, oid, update.outcome_id, side, n, p,
+                           f" (tranche of leg #{leg.order_id})" if len(tranches) > 1 else f" reserved=${stake:.2f}")
+            self._ledger("ORDER", exchange_order_id=oid, kind=kind, canonical_side=side,
+                         reserved_usd=round(p * n, 2) if len(tranches) > 1 else stake, payload=payload,
+                         leg=leg.order_id, tranches=len(tranches),
+                         expected_levels=[[p, n]] if staggered else (levels or [[p, n]]),
+                         expected_avg_price=p if staggered or not levels else _sweep_avg(levels, n))
+            self._spawn(self._taker_timeout(oid))
+        if staggered:
+            self.stats["staggered_orders"] += 1
         await self._after_taker(key)
+
+    def _children(self, leg_id: Optional[int]) -> list[LiveOrder]:
+        """Every exchange order (tranche) feeding one taker position leg."""
+        return [lo for lo in self.live_orders.values() if lo.leg_id == leg_id and lo.kind != "MAKER"]
+
+    @staticmethod
+    def _leg_exposure(kids: list[LiveOrder]) -> float:
+        """What a leg can cost: finished tranches at their fills, working ones at their full reservation."""
+        return round(sum(k.fill_cost if k.done else max(k.fill_cost, k.requested * k.limit_price) for k in kids), 2)
 
     async def _taker_timeout(self, oid: str) -> None:
         await asyncio.sleep(self.taker_fill_timeout)
@@ -997,14 +1042,28 @@ class Supervisor:
         leg = self._leg(lo.leg_id)
         if leg is None:
             return
+        kids = self._children(leg.order_id)
+        if len(kids) > 1:
+            self._ledger("TRANCHE_DONE", exchange_order_id=lo.exchange_order_id, leg=leg.order_id,
+                         filled=lo.filled, requested=lo.requested, price=lo.limit_price,
+                         cost_usd=round(lo.fill_cost, 2), reason=reason)
+            if any(not k.done for k in kids):          # other tranches still working
+                self.exposure.adjust(leg.position_id, self._leg_exposure(kids))
+                return
+            lo = lo.model_copy(update=dict(          # the whole leg, seen as one order from here on
+                exchange_order_id=",".join(k.exchange_order_id for k in kids),
+                requested=sum(k.requested for k in kids), filled=sum(k.filled for k in kids),
+                fill_cost=sum(k.fill_cost for k in kids), limit_price=max(k.limit_price for k in kids),
+                expected_levels=[]))
         leg.pending = False
         pos = self.positions.get(lo.key)
         if lo.filled <= 0 and not self.orders_channel_confirmed:
             self.stats["unconfirmed_zero_fill"] += 1
             log.critical("LIVE_UNCONFIRMED %s %s ended with no observed fill, but no execution slip has been seen "
                          "this session: it may have filled unseen. Lock and $%.2f reservation KEPT — check the "
-                         "Novig order history", lo.kind, lo.exchange_order_id, lo.requested * lo.limit_price)
-            self.exposure.adjust(leg.position_id, round(lo.requested * lo.limit_price, 2))
+                         "Novig order history", lo.kind, lo.exchange_order_id,
+                         sum(k.requested * k.limit_price for k in kids))
+            self.exposure.adjust(leg.position_id, round(sum(k.requested * k.limit_price for k in kids), 2))
             self._ledger("UNCONFIRMED", exchange_order_id=lo.exchange_order_id, reason=reason)
             self.unconfirmed_legs[leg.order_id] = time.time()   # the settlement sweep reconciles it
             return
@@ -1091,12 +1150,14 @@ class Supervisor:
             else:
                 leg = self._leg(lo.leg_id)
                 if leg is not None:
-                    leg.contracts = int(round(lo.filled))
-                    leg.stake_usd = round(lo.fill_cost, 2)
-                    leg.price = round(lo.fill_cost / lo.filled, 6)
+                    kids = self._children(leg.order_id)       # one order, or several staggered tranches
+                    filled, cost = sum(k.filled for k in kids), sum(k.fill_cost for k in kids)
+                    leg.contracts = int(round(filled))
+                    leg.stake_usd = round(cost, 2)
+                    leg.price = round(cost / filled, 6)
                     if lo.done:   # late fill after we cancelled the remainder: still real
                         log.warning("LIVE late fill on %s after cancel: +%g", lo.exchange_order_id, delta)
-                        self.exposure.adjust(leg.position_id, round(lo.fill_cost, 2))
+                        self.exposure.adjust(leg.position_id, self._leg_exposure(kids))
             log.info("FILL %s %s +%g (total %g/%d) @ %.4f cost=$%.2f", lo.kind, lo.exchange_order_id, delta,
                      lo.filled, lo.requested, price, lo.fill_cost)
             self._ledger("FILL", exchange_order_id=lo.exchange_order_id, kind=lo.kind, delta=delta,
@@ -1764,6 +1825,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     Live limits: canary $10 / $100 / maker off unless LIVE_SCALE_APPROVED_BY is set (see resolve_live_plan).
     Optional: NOVIG_WS_URL, NOVIG_API_BASE, NOVIG_EVENTS_URL, NOVIG_SUBSCRIBE_MESSAGES (JSON list),
               NOVIG_FILL_VOLUME_MODE (default cumulative, per Novig), TRADING_LOG_DIR,
+              NOVIG_MULTI_LEVEL_MODE (staggered | single | off; default staggered),
               TAKER_CUTOFF_MINUTES (default 1), MAKER_CUTOFF_MINUTES (default 3), CUTOFF_OVERRIDES,
               RESEARCH_ENABLED (default 1), RESEARCH_DIR (default research).
     """
@@ -1840,7 +1902,10 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         kw = dict(kalshi_url=env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
                   kalshi_auth=(key_id, pk),
                   kalshi_rest=KalshiRestClient(rest_base, key_id, pk, series_from_env(env.get("KALSHI_SERIES"))))
-    kw.update(research=research_from_env(env), **cutoffs_from_env(env))
+    mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
+    if mode not in MULTI_LEVEL_MODES:
+        raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
+    kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"])),
@@ -1888,6 +1953,7 @@ def describe_state(sup: Supervisor) -> dict:
         "sharp_http_timeout_s": cfg.timeout_seconds if cfg else None,
         "sharp_poll_s": sup.poller.interval,
         "sharp_max_age_s": sup.book.max_age,
+        "multi_level_mode": sup.multi_level_mode,
         "taker_cutoff_min": sup.taker_cutoff_s / 60,
         "maker_cutoff_min": sup.maker_cutoff_s / 60,
         "cutoff_overrides": {k: f"{t / 60:g}/{m / 60:g}" for k, (t, m) in sorted(sup.cutoff_overrides.items())},
@@ -1917,6 +1983,10 @@ def format_state_report(sup: Supervisor) -> str:
         ("Minimum edge", f"> {st['min_edge']:.1%}"),
         ("Maker", st["maker"]),
         ("Dead-heat venues (NFL ML ties = 50c)", ", ".join(st["dead_heat_venues"])),
+        ("Buying through the book", {
+            "staggered": "staggered: one order per ask level at that level's price",
+            "single": "single order limited at the worst level (needs price improvement)",
+            "off": "best ask level only"}[st["multi_level_mode"]]),
         ("Taker/hedge cutoff", f"no new orders {st['taker_cutoff_min']:g} min before scheduled start"),
         ("Maker cutoff", f"quotes pulled {st['maker_cutoff_min']:g} min before scheduled start"),
         ("Per-league cutoffs (taker/maker min)", ", ".join(f"{k} {v}" for k, v in st["cutoff_overrides"].items())

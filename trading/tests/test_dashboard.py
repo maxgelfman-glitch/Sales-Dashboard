@@ -186,6 +186,25 @@ async def test_dashboard_matches_engine_on_timeout_and_unconfirmed(tmp_path):
     assert s["audit"]["severity"].iloc[0] == "crimson" and "UNCONFIRMED" in s["audit"]["text"].iloc[0]
 
 
+async def test_dashboard_matches_engine_with_staggered_tranches(tmp_path):
+    from main_supervisor import DEMO_MARKETS
+    from novig_feed import MarketUpdate
+    from novig_private import FillSlip
+    info = {m["outcome_id"]: m for m in DEMO_MARKETS}
+    sup, ledger = engine_and_ledger(tmp_path, timeout=0.05)
+    levels = [(0.47, 10), (0.49, 400)]
+    await sup.on_market_update(MarketUpdate(**info["O-NYK"], price=0.47, available_volume=10, ask_levels=levels),
+                               None)
+    assert sup.order_gateway.n == 2                                   # two tranches, two prices
+    assert dash(ledger)["exposure"] == pytest.approx(sup.total_exposure(), abs=0.01)
+    await sup.on_fill_slip(FillSlip(order_id="ex-2", status="FILLED", filled_volume=10, price_cents=49))
+    assert dash(ledger)["exposure"] == pytest.approx(sup.total_exposure(), abs=0.01)
+    await asyncio.sleep(0.15)                                         # the 47c tranche never filled: cancelled
+    s = dash(ledger)
+    assert s["exposure"] == pytest.approx(sup.total_exposure(), abs=0.01) == pytest.approx(4.90)
+    assert set(s["positions"]["Status"]) == {"DONE"}
+
+
 def test_new_session_resets_exposure_view(tmp_path):
     f = tmp_path / "l.jsonl"
     rows = [{"ts": 1, "event": "SESSION_START"},

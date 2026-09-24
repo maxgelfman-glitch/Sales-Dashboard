@@ -260,7 +260,9 @@ def order_book_state(session: pd.DataFrame, now: float) -> pd.DataFrame:
         out = out.join(last_fill)
     else:
         out["contracts"], out["cost_usd"] = np.nan, np.nan
-    done_ids = set(session.loc[session["event"].eq("DONE"), "exchange_order_id"].astype("string")) \
+    # DONE closes a whole leg (a staggered leg lists its tranche ids comma-separated); TRANCHE_DONE closes one tranche
+    done_ids = set(session.loc[session["event"].isin(["DONE", "TRANCHE_DONE"]), "exchange_order_id"]
+                   .astype("string").str.split(",").explode().str.strip()) \
         if "exchange_order_id" in session.columns else set()
     unconf_ids = set(session.loc[session["event"].eq("UNCONFIRMED"), "exchange_order_id"].astype("string")) \
         if "exchange_order_id" in session.columns else set()

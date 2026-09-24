@@ -41,6 +41,7 @@ from research_report import (
 )
 from sharp_feed import MockSharpSource, ProviderConfig, SharpLine, pair_fixture_outcomes
 from execution import SharpQuote
+from tests.test_live_execution import FakeGateway as FakeGatewayBase
 from tests.test_live_execution import live_sup, slip, upd
 
 NYK_GAME = ("NBA", "New York Knicks", "Boston Celtics")
@@ -356,8 +357,8 @@ async def test_inconsistent_depth_falls_back_to_best_ask(tmp_path):
     assert sup.orders[0].contracts == 300 and sup.orders[0].price == 0.49
 
 
-async def test_live_walk_sends_one_limit_at_the_worst_level_and_reserves_at_it():
-    sup = live_sup()
+async def test_single_mode_sends_one_limit_at_the_worst_level_and_reserves_at_it():
+    sup = live_sup(multi_level_mode="single")
     await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400)]), None)
     [sent] = sup.order_gateway.placed
     assert (sent["price_cents"], sent["contracts"]) == (50.0, 700)
@@ -369,8 +370,8 @@ async def test_live_walk_sends_one_limit_at_the_worst_level_and_reserves_at_it()
     assert sup.total_exposure() == pytest.approx(300 * 0.49 + 400 * 0.50)     # real cost, not the reservation
 
 
-async def test_live_canary_stake_caps_the_walk():
-    sup = live_sup(max_stake=10.0)
+async def test_single_mode_canary_stake_caps_the_walk():
+    sup = live_sup(max_stake=10.0, multi_level_mode="single")
     await sup.on_market_update(book_upd("O-NYK", [(0.49, 10), (0.50, 400)]), None)
     [sent] = sup.order_gateway.placed
     assert sent["contracts"] * sent["price_cents"] / 100 <= 10.0 + 1e-9 and sent["contracts"] == 20
@@ -632,8 +633,8 @@ def test_report_loads_files_skips_torn_lines_and_filters_by_date(tmp_path):
     ([(0.47, 15), (0.49, 400)], 10.0, 10.0),            # canary
     ([(0.45, 1500), (0.49, 5000)], 1000.0, 1000.0),     # hard per-position ceiling
 ])
-async def test_worst_case_fill_at_limit_never_breaks_a_cap(levels, max_stake, cap):
-    sup = live_sup(max_stake=max_stake)
+async def test_single_mode_worst_case_fill_at_limit_never_breaks_a_cap(levels, max_stake, cap):
+    sup = live_sup(max_stake=max_stake, multi_level_mode="single")
     await sup.on_market_update(book_upd("O-NYK", levels), None)
     [sent] = sup.order_gateway.placed
     assert sent["contracts"] * sent["price_cents"] / 100 <= cap + 1e-9
@@ -648,11 +649,11 @@ async def test_never_buys_a_level_without_edge_and_never_more_than_shown(tmp_pat
     assert order.contracts == 110                                               # exactly what was shown
     live = live_sup()
     await live.on_market_update(book_upd("O-NYK", [(0.49, 50), (0.50, 60), (0.51, 100_000)]), None)
-    assert live.order_gateway.placed[0]["price_cents"] == 50.0
+    assert [(o["price_cents"], o["contracts"]) for o in live.order_gateway.placed] == [(49.0, 50), (50.0, 60)]
 
 
-async def test_hedge_worst_case_fits_the_cap(tmp_path):
-    sup = paper_sup(tmp_path)
+async def test_single_mode_hedge_worst_case_fits_the_cap(tmp_path):
+    sup = paper_sup(tmp_path, multi_level_mode="single")
     await sup.on_market_update(upd("O-NYK", 0.30, volume=3000), None)          # big cheap first leg
     first = sup.orders[0]
     await sup.on_market_update(book_upd("O-BOS", [(0.40, 1000), (0.60, 5000)]), None)
@@ -666,7 +667,7 @@ async def test_hedge_worst_case_fits_the_cap(tmp_path):
 # ---------------------------------------------------------------------------
 async def test_price_improvement_confirmed_keeps_multi_level(tmp_path):
     ledger = tmp_path / "live_ledger.jsonl"
-    sup = live_sup(ledger_path=ledger)
+    sup = live_sup(ledger_path=ledger, multi_level_mode="single")
     await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400)]), None)
     await sup.on_fill_slip(slip("ex-1", "PARTIAL", 300, 49))                   # cheaper level at its own price
     await sup.on_fill_slip(slip("ex-1", "FILLED", 700, 50))
@@ -681,7 +682,7 @@ async def test_price_improvement_confirmed_keeps_multi_level(tmp_path):
 
 async def test_fill_all_at_limit_switches_multi_level_off(tmp_path):
     ledger = tmp_path / "live_ledger.jsonl"
-    sup = live_sup(ledger_path=ledger)
+    sup = live_sup(ledger_path=ledger, multi_level_mode="single")
     await sup.on_market_update(book_upd("O-NYK", [(0.45, 300), (0.49, 400)]), None)
     await sup.on_fill_slip(slip("ex-1", "FILLED", 700, 49))                    # everything at the limit
     assert not sup.multi_level_live and '"PRICE_IMPROVEMENT_MISSING"' in ledger.read_text()
@@ -696,3 +697,94 @@ async def test_single_level_orders_never_trip_the_check(tmp_path):
     await sup.on_market_update(upd("O-NYK", 0.49), None)
     await sup.on_fill_slip(slip("ex-1", "FILLED", 2040, 49))
     assert sup.multi_level_live
+
+
+# ---------------------------------------------------------------------------
+# Staggered orders (default): one order per level, each at its own price
+# ---------------------------------------------------------------------------
+async def test_staggered_sends_one_order_per_level_at_its_own_price(tmp_path):
+    ledger = tmp_path / "live_ledger.jsonl"
+    sup = live_sup(ledger_path=ledger)
+    await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400), (0.51, 5000)]), None)
+    assert [(o["price_cents"], o["contracts"], o["client_id"]) for o in sup.order_gateway.placed] == [
+        (49.0, 300, "tk-1-1"), (50.0, 400, "tk-1-2")]
+    assert sup.total_exposure() == pytest.approx(347.0)                   # exact: no tranche can cost more
+    assert len(sup.orders) == 1 and sup.orders[0].requested_contracts == 700
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 300, 49))
+    leg = sup.orders[0]
+    assert leg.pending and leg.contracts == 300                            # the 50c tranche is still working
+    assert sup.total_exposure() == pytest.approx(347.0)
+    await sup.on_fill_slip(slip("ex-2", "FILLED", 400, 50))
+    assert not leg.pending and leg.contracts == 700
+    assert leg.price == pytest.approx(347.0 / 700) and sup.total_exposure() == pytest.approx(347.0)
+    rows = [json.loads(line)["event"] for line in ledger.read_text().splitlines()]
+    assert rows.count("ORDER") == 2 and rows.count("TRANCHE_DONE") == 2 and rows.count("DONE") == 1
+
+
+async def test_staggered_tranche_whose_level_vanished_is_cancelled_and_released():
+    sup = live_sup(timeout=0.05)
+    await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400)]), None)
+    await sup.on_fill_slip(slip("ex-2", "FILLED", 400, 50))               # someone took the 49c offers first
+    await asyncio.sleep(0.15)
+    assert sup.order_gateway.cancels == [["ex-1"]]
+    leg = sup.orders[0]
+    assert not leg.pending and leg.contracts == 400 and leg.price == 0.50
+    assert sup.total_exposure() == pytest.approx(200.0)
+
+
+async def test_staggered_nothing_filled_releases_the_lock():
+    sup = live_sup(timeout=0.05)
+    await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400)]), None)
+    await asyncio.sleep(0.15)
+    assert sup.total_exposure() == 0 and not sup.positions
+
+
+async def test_staggered_one_tranche_rejected_keeps_the_rest():
+    class HalfRejecting(FakeGatewayBase):
+        async def place_limit(self, outcome_id, side, price_cents, contracts, client_id):
+            if price_cents == 50.0:
+                raise RuntimeError("rejected")
+            return await super().place_limit(outcome_id, side, price_cents, contracts, client_id)
+    sup = live_sup(gateway=HalfRejecting())
+    await sup.on_market_update(book_upd("O-NYK", [(0.49, 300), (0.50, 400)]), None)
+    assert [o["contracts"] for o in sup.order_gateway.placed] == [300]
+    assert sup.orders[0].requested_contracts == 300 and sup.total_exposure() == pytest.approx(147.0)
+
+
+async def test_staggered_never_reaches_a_level_without_edge_and_respects_the_canary():
+    sup = live_sup(max_stake=10.0)
+    await sup.on_market_update(book_upd("O-NYK", [(0.47, 15), (0.49, 400), (0.51, 1000)]), None)
+    placed = sup.order_gateway.placed
+    assert all(o["price_cents"] <= 49.0 for o in placed)
+    assert sum(o["contracts"] * o["price_cents"] / 100 for o in placed) <= 10.0 + 1e-9
+
+
+async def test_staggered_hedge_tranches(tmp_path):
+    sup = live_sup()
+    await sup.on_market_update(upd("O-NYK", 0.49, volume=1000), None)
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 1000, 49))
+    await sup.on_market_update(book_upd("O-BOS", [(0.45, 300), (0.47, 300), (0.51, 5000)]), None)
+    hedges = sup.order_gateway.placed[1:]
+    assert [(o["price_cents"], o["contracts"]) for o in hedges] == [(45.0, 300), (47.0, 300)]
+    await sup.on_fill_slip(slip("ex-2", "FILLED", 300, 45))
+    await sup.on_fill_slip(slip("ex-3", "FILLED", 300, 47))
+    pos = next(iter(sup.positions.values()))
+    assert pos.unhedged() == 400 and not pos.hedged                        # rest can be hedged later
+
+
+def test_unknown_multi_level_mode_is_refused():
+    with pytest.raises(ValueError):
+        live_sup(multi_level_mode="sideways")
+
+
+def test_multi_level_mode_from_env_and_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHARP_API_KEY", "x")
+    from main_supervisor import build_live_supervisor
+    cfg = tmp_path / "sharp.json"
+    cfg.write_text(json.dumps({"url": "https://example.test/odds"}))
+    base = {"SHARP_PROVIDER_CONFIG": str(cfg), "NOVIG_BEARER_TOKEN": "t", "RESEARCH_ENABLED": "0"}
+    assert build_live_supervisor(base).multi_level_mode == "staggered"
+    sup = build_live_supervisor({**base, "NOVIG_MULTI_LEVEL_MODE": "single"})
+    assert sup.multi_level_mode == "single" and "single order limited" in format_state_report(sup)
+    with pytest.raises(ConfigError):
+        build_live_supervisor({**base, "NOVIG_MULTI_LEVEL_MODE": "sideways"})
