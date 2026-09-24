@@ -94,7 +94,10 @@ from execution import (
     NovigQuote,
     SharpQuote,
     american_to_decimal,
-    devig_multiplicative,
+    fair_devig,
+    set_devig_method,
+    DEVIG_METHODS,
+    devig,
     evaluate_kalshi_edge,
     evaluate_market_edge,
     kalshi_fee_per_contract,
@@ -374,6 +377,8 @@ class Supervisor:
         multi_level_mode: str = "staggered",
         game_exposure_limit: float = GAME_EXPOSURE_LIMIT_USD,
         daily_loss_limit: Optional[float] = DAILY_LOSS_LIMIT_USD,
+        devig_method: str = "multiplicative",
+        sharp_weights: Optional[dict[str, float]] = None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -384,8 +389,10 @@ class Supervisor:
         self.sharp_enabled = sharp_fetch is not None
         if sharp_fetch is None:
             sharp_fetch = NoSharpSource()
+        set_devig_method(devig_method)                  # engine-wide: edges, maker fair values, research
+        self.devig_method = devig_method
         self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move,
-                              on_live=self._on_sharp_live)
+                              on_live=self._on_sharp_live, weights=sharp_weights)
         self.registry = registry if registry is not None else MarketRegistry()
         self.feed = NovigFeed(url=feed_url, token=token, registry=self.registry, on_update=self.on_market_update,
                               on_state_change=self.on_feed_state, subscribe_messages=subscribe_messages,
@@ -602,7 +609,7 @@ class Supervisor:
     @staticmethod
     def _fair(line: SharpLine) -> Optional[float]:
         try:
-            (p, _), _ = devig_multiplicative([american_to_decimal(line.odds_for),
+            (p, _), _ = fair_devig([american_to_decimal(line.odds_for),
                                               american_to_decimal(line.odds_against)])
             return p
         except ValueError:
@@ -1417,6 +1424,14 @@ class Supervisor:
                            blocked: Optional[str] = None) -> None:
         age = self.book.age_of(key[0], key[1], key[2], key[3], side)
         venue_change = self.last_price_change.get((update.venue, update.outcome_id))
+        fair_by_method = {}
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line)
+        if sharp is not None:
+            try:
+                odds = [american_to_decimal(sharp.odds_for), american_to_decimal(sharp.odds_against)]
+                fair_by_method = {m: round(devig(odds, m)[0][0], 6) for m in DEVIG_METHODS}
+            except ValueError:
+                pass
         sharp_at = None if age is None else time.time() - age
         self.research.write(
             "DECISION", venue=update.venue, outcome_id=update.outcome_id, game=list(key), side=side,
@@ -1425,7 +1440,8 @@ class Supervisor:
             sharp_age_s=None if age is None else round(age, 3),
             moved_last=None if venue_change is None or sharp_at is None else (
                 update.venue if venue_change > sharp_at else "sharp"),
-            minutes_to_start=self.minutes_to_start(key[:3]), blocked=blocked)
+            minutes_to_start=self.minutes_to_start(key[:3]), blocked=blocked, fair_by_method=fair_by_method,
+            sharp_source=None if sharp is None else sharp.source)
 
     def _research_entry(self, leg: PaperOrder, canon_key: Optional[tuple]) -> None:
         self.research.write("ENTRY", order_id=leg.order_id, order_kind=leg.kind, venue=leg.venue, live=leg.live,
@@ -1931,6 +1947,28 @@ def risk_controls_from_env(env: dict) -> dict:
                 daily_loss_limit=_usd(env, "DAILY_LOSS_LIMIT_USD", DAILY_LOSS_LIMIT_USD, BASELINE_CAPITAL_USD))
 
 
+def fair_value_from_env(env: dict) -> dict:
+    """
+    DEVIG_METHOD: multiplicative (default) | power | shin.
+    SHARP_BOOK_WEIGHTS: consensus weights per sportsbook in the feed, e.g. "pinnacle:2,circa sports:1"
+    (books not listed are ignored; "*:1" includes every other book). Empty = every book equally.
+    """
+    method = (env.get("DEVIG_METHOD") or "multiplicative").strip().lower()
+    if method not in DEVIG_METHODS:
+        raise ConfigError(f"DEVIG_METHOD={method!r} must be one of {', '.join(DEVIG_METHODS)}")
+    weights = {}
+    for item in filter(None, (x.strip() for x in (env.get("SHARP_BOOK_WEIGHTS") or "").split(","))):
+        book, _, raw = item.rpartition(":")
+        try:
+            w = float(raw)
+        except ValueError:
+            raise ConfigError(f"SHARP_BOOK_WEIGHTS entry {item!r} must look like pinnacle:2") from None
+        if not book or w < 0:
+            raise ConfigError(f"SHARP_BOOK_WEIGHTS entry {item!r} must look like pinnacle:2 (weight >= 0)")
+        weights[book.strip().lower()] = w
+    return dict(devig_method=method, sharp_weights=weights or None)
+
+
 def research_from_env(env: dict) -> Optional[ResearchRecorder]:
     """RESEARCH_ENABLED (default on) writes measurement rows to RESEARCH_DIR (default ./research)."""
     if env.get("RESEARCH_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
@@ -2029,7 +2067,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
     kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env),
-              **risk_controls_from_env(env))
+              **risk_controls_from_env(env), **fair_value_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"]))
@@ -2071,6 +2109,8 @@ def describe_state(sup: Supervisor) -> dict:
         "ledger": str(sup.ledger_path) if sup.ledger_path else None,
         "sharp_url": cfg.url if cfg else ("mock" if sup.sharp_enabled else "NONE: measurement mode"),
         "sharp_mode": cfg.mode if cfg else ("mock" if sup.sharp_enabled else "-"),
+        "devig_method": sup.devig_method,
+        "sharp_weights": sup.book.weights,
         "game_exposure_limit": sup.game_exposure_limit,
         "daily_loss_limit": sup.daily_loss_limit,
         "sharp_odds_format": cfg.odds_format if cfg else "-",
@@ -2135,6 +2175,9 @@ def format_state_report(sup: Supervisor) -> str:
         ("Provider URL", st["sharp_url"]),
         ("Mode / odds / timestamps", f"{st['sharp_mode']} / {st['sharp_odds_format']} / {st['sharp_timestamp_format']}"),
         ("Markets", ", ".join(st["sharp_markets"]) or "-"),
+        ("Margin removal (DEVIG_METHOD)", st["devig_method"]),
+        ("Book weights (consensus fair value)", ", ".join(f"{k}:{v:g}" for k, v in st["sharp_weights"].items())
+         or "every book in the feed, equally"),
         ("Per-market overrides", ", ".join(st["sharp_overrides"]) or "none"),
         ("HTTP timeout / poll / freshness", f"{st['sharp_http_timeout_s']}s / {st['sharp_poll_s']}s / {st['sharp_max_age_s']}s"),
         ("KALSHI", None),

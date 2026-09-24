@@ -114,8 +114,14 @@ class SharpBook:
     def __init__(self, max_age_seconds: float = SHARP_MAX_AGE_SECONDS,
                  clock: Callable[[], float] = time.time,
                  on_move: Optional[Callable[[BookKey, SharpLine, SharpLine], None]] = None,
-                 on_live: Optional[Callable[[str, str, str], None]] = None) -> None:
+                 on_live: Optional[Callable[[str, str, str], None]] = None,
+                 weights: Optional[dict[str, float]] = None) -> None:
         self.max_age = max_age_seconds
+        # Per-book weights for the consensus fair value, e.g. {"pinnacle": 2, "circa sports": 1}.
+        # Empty = every book in the feed counts equally. A book weighted 0 is ignored.
+        self.weights = {k.strip().lower(): float(v) for k, v in (weights or {}).items()}
+        self._src: dict[tuple[BookKey, Optional[float]], dict[str, tuple[SharpLine, float]]] = {}  # every line
+        self._main_src: dict[BookKey, dict[str, tuple[SharpLine, float]]] = {}                       # main per book
         self.clock = clock
         self.on_move = on_move    # called with (key, old, new) whenever a stored line/price changes
         self.on_live = on_live    # called with (league, home, away) when the provider marks a game in-play
@@ -177,6 +183,10 @@ class SharpBook:
                     del self._lines[k]
                 for k in [k for k in self._by_line if k[0][:3] == (league, home, away)]:
                     del self._by_line[k]
+                for k in [k for k in self._src if k[0][:3] == (league, home, away)]:
+                    del self._src[k]
+                for k in [k for k in self._main_src if k[:3] == (league, home, away)]:
+                    del self._main_src[k]
                 if self.on_live is not None:
                     try:
                         self.on_live(league, home, away)
@@ -184,12 +194,16 @@ class SharpBook:
                         sharp_log.exception("SHARP_LIVE listener failed")
                 continue
             key = (league, home, away, canon.market_type, canon.side)
-            old = self._lines.get(key) if canon.is_main else None
+            src = (canon.source or "sharp").strip().lower()
+            # a "move" is the SAME book changing its price, never one book replacing another
+            old = self._main_src.get(key, {}).get(src) if canon.is_main else None
             for item in (canon, canon.mirrored()):
                 item_key = (league, home, away, item.market_type, item.side)
                 self._by_line[(item_key, item.line)] = (item, observed_at)
+                self._src.setdefault((item_key, item.line), {})[src] = (item, observed_at)
                 if canon.is_main:
                     self._lines[item_key] = (item, observed_at)
+                    self._main_src.setdefault(item_key, {})[src] = (item, observed_at)
             stored += 1
             if old is not None and self.on_move is not None and (
                     old[0].line != canon.line or old[0].odds_for != canon.odds_for
@@ -212,11 +226,43 @@ class SharpBook:
         """
         key = (league, home, away, market_type, side)
         now = self.clock()
-        candidates = [self._by_line.get((key, line)) if line is not None else None, self._lines.get(key)]
-        for hit in candidates:
-            if hit is not None and now - hit[1] <= self.max_age:
-                return hit[0]      # a stale exact match falls back to the fresh main line
-        return None
+
+        def fresh(books: dict[str, tuple[SharpLine, float]]) -> dict[str, tuple[SharpLine, float]]:
+            return {b: v for b, v in books.items() if now - v[1] <= self.max_age and self._weight(b) > 0}
+
+        pool = fresh(self._src.get((key, line), {})) if line is not None else {}
+        if not pool:                               # a stale/missing exact match falls back to the fresh main line
+            mains = fresh(self._main_src.get(key, {}))
+            if not mains:
+                return None
+            best = max(mains, key=lambda b: (self._weight(b), b))     # deterministic: never flip-flops by recency
+            pool = fresh(self._src.get((key, mains[best][0].line), {})) or {best: mains[best]}
+        if len(pool) == 1:
+            return next(iter(pool.values()))[0]
+        return self._consensus(pool)
+
+    def _weight(self, book: str) -> float:
+        return self.weights.get(book, 1.0 if not self.weights else self.weights.get("*", 0.0))
+
+    def _consensus(self, pool: dict[str, tuple[SharpLine, float]]) -> Optional[SharpLine]:
+        """Weighted average of each book's de-vigged probability, returned as a zero-margin line."""
+        from execution import american_to_decimal, fair_devig   # local: execution does not import this module
+        num = den = 0.0
+        for book, (ln, _) in pool.items():
+            try:
+                (p, _), _ = fair_devig([american_to_decimal(ln.odds_for), american_to_decimal(ln.odds_against)])
+            except ValueError:
+                continue
+            w = self._weight(book)
+            num, den = num + w * p, den + w
+        if den <= 0:
+            return None
+        p = min(max(num / den, 0.005), 0.995)
+        first = next(iter(pool.values()))[0]
+        return first.model_copy(update=dict(
+            odds_for=decimal_to_american(1 / p), odds_against=decimal_to_american(1 / (1 - p)),
+            source="consensus:" + "+".join(sorted(pool)),
+            updated_at=min(t for _, t in pool.values())))
 
     def age_of(self, league: str, home: str, away: str, market_type: str, side: str) -> Optional[float]:
         hit = self._lines.get((league, home, away, market_type, side))
@@ -229,6 +275,11 @@ class SharpBook:
             del self._lines[k]
         for k in [k for k, (_, t) in self._by_line.items() if now - t > self.max_age]:
             del self._by_line[k]
+        for store in (self._src, self._main_src):
+            for k in list(store):
+                store[k] = {b: v for b, v in store[k].items() if now - v[1] <= self.max_age}
+                if not store[k]:
+                    del store[k]
         return len(dead)
 
     def alternates(self, league: str, home: str, away: str, market_type: str, side: str) -> list[float]:

@@ -42,6 +42,8 @@ from typing import Any, Callable, Literal, Optional, Protocol, Union
 
 from pydantic import BaseModel, Field, ValidationError
 
+from devig import DEVIG_METHODS, devig, devig_multiplicative  # noqa: F401  (devig_multiplicative re-exported)
+
 # --------------------------------------------------------------------------
 # Risk parameters. These are deliberate, reviewed constants — change with care.
 # --------------------------------------------------------------------------
@@ -107,13 +109,24 @@ def american_to_decimal(odds: float) -> float:
     raise ValueError(f"invalid American odds {odds!r}: must be >= +100 or <= -100")
 
 
-def devig_multiplicative(decimal_odds: list[float]) -> tuple[list[float], float]:
-    """Strip the bookmaker margin proportionally. Returns (fair_probs, overround)."""
-    if len(decimal_odds) < 2 or any(d <= 1.0 for d in decimal_odds):
-        raise ValueError(f"need >= 2 decimal odds all > 1.0, got {decimal_odds}")
-    raw = [1.0 / d for d in decimal_odds]
-    overround = sum(raw)
-    return [r / overround for r in raw], overround
+# Margin removal lives in devig.py; the engine-wide method is chosen once at startup (DEVIG_METHOD).
+_devig_method = "multiplicative"
+
+
+def set_devig_method(method: str) -> None:
+    if method not in DEVIG_METHODS:
+        raise ValueError(f"unknown devig method {method!r}; use one of {DEVIG_METHODS}")
+    global _devig_method
+    _devig_method = method
+
+
+def devig_method() -> str:
+    return _devig_method
+
+
+def fair_devig(decimal_odds: list[float]) -> tuple[list[float], float]:
+    """De-vig with the engine-wide method."""
+    return devig(decimal_odds, _devig_method)
 
 
 def kelly_fraction_for_contract(p: float, price: float) -> float:
@@ -167,7 +180,7 @@ async def evaluate_market_edge(
     if novig.line is not None and sharp.line is not None and not math.isclose(novig.line, sharp.line):
         return EdgeDecision(action="PASS", reason=f"line mismatch novig={novig.line} sharp={sharp.line}")
 
-    (fair_prob, _), overround = devig_multiplicative([dec_for, dec_against])
+    (fair_prob, _), overround = fair_devig([dec_for, dec_against])
     price = novig.effective_price
     if price >= 1.0:
         return EdgeDecision(action="PASS", reason="price incl. fees >= $1", fair_prob=fair_prob, novig_price=price)
