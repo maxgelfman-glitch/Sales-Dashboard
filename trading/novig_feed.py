@@ -65,10 +65,13 @@ TAPE_SUBSCRIBE = {"event": "subscribe", "channel": "tape"}
 ORDERS_SUBSCRIBE = {"event": "subscribe", "channel": "orders"}
 SUBSCRIBE_PAYLOAD = TAPE_SUBSCRIBE        # paper mode needs only public prices
 
-TRACKED_LEAGUES = frozenset({"NFL", "NBA"})
+# Two-way markets only. Soccer is NOT here on purpose: its moneyline has a draw (3 outcomes), so buying both
+# teams is not a hedge. College leagues need a team list built from the venues' own names first.
+TRACKED_LEAGUES = frozenset({"NFL", "NBA", "MLB", "NHL", "WNBA"})
 MAX_BOOK_LEVELS = 10                     # ask levels passed to the engine per update
 MARKET_TYPE_ALIASES = {
     "spread": "spread", "point_spread": "spread", "pointspread": "spread", "handicap": "spread", "ats": "spread",
+    "run_line": "spread", "runline": "spread", "puck_line": "spread", "puckline": "spread", "spreads": "spread",
     "moneyline": "moneyline", "money_line": "moneyline", "ml": "moneyline", "h2h": "moneyline",
     "winner": "moneyline", "game_winner": "moneyline",
     "total": "total", "totals": "total", "game_total": "total", "over_under": "total", "ou": "total",

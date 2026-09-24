@@ -4,7 +4,11 @@
   "headers": {},
   "mode": "outcomes",
   "list_path": "data",
-  "fixture_fields": {"league": "league", "home_team": "home_team", "away_team": "away_team"},
+  "fixture_fields": {
+    "league": "league",
+    "home_team": "home_team",
+    "away_team": "away_team"
+  },
   "outcomes_path": "odds",
   "outcome_fields": {
     "sportsbook": "sports_book_name",
@@ -15,10 +19,22 @@
     "timestamp": "timestamp",
     "is_main": "is_main"
   },
-  "market_map": {"moneyline": "moneyline", "point spread": "spread", "total points": "total"},
-  "sportsbooks": ["Pinnacle"],
+  "market_map": {
+    "moneyline": "moneyline",
+    "point spread": "spread",
+    "total points": "total",
+    "run line": "spread",
+    "puck line": "spread",
+    "runline": "spread",
+    "puckline": "spread"
+  },
+  "sportsbooks": [
+    "Pinnacle"
+  ],
   "main_only": true,
-  "constants": {"source": "oddsjam-pinnacle"},
+  "constants": {
+    "source": "oddsjam-pinnacle"
+  },
   "odds_format": "american",
   "timestamp_format": "epoch",
   "timeout_seconds": 5.0

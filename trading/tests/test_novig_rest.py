@@ -25,7 +25,7 @@ EVENTS = {"events": [
                   "outcomes": [{"id": "O10", "name": "Buffalo Bills", "line": 2.5},
                                {"id": "O11", "name": "Kansas City Chiefs", "line": -2.5}]}]},
     {"eventId": "E3", "league": "NBA", "homeTeam": "A", "awayTeam": "B", "status": "SETTLED", "markets": []},
-    {"eventId": "E4", "league": "MLB", "homeTeam": "Yankees", "awayTeam": "Mets",
+    {"eventId": "E4", "league": "EPL", "homeTeam": "Arsenal", "awayTeam": "Chelsea",   # untracked (3-way)
      "markets": [{"marketId": "M9", "type": "moneyline",
                   "outcomes": [{"outcomeId": "O90", "name": "Yankees"}, {"outcomeId": "O91", "name": "Mets"}]}]},
 ]}

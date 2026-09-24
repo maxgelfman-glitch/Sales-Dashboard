@@ -21,7 +21,7 @@ from team_normalizer import NBA_TEAMS, NFL_TEAMS, normalize_outcome, normalize_t
     ("Blazers", None, "Portland Trail Blazers"),
     ("Portland Trail Blazers", None, "Portland Trail Blazers"),
     ("OKC", None, "Oklahoma City Thunder"),
-    ("Boston", None, "Boston Celtics"),               # city unique across both leagues
+    ("Boston", "NBA", "Boston Celtics"),              # unique city inside the league
     ("KC Chiefs", None, "Kansas City Chiefs"),
     ("Niners", None, "San Francisco 49ers"),
     ("SF 49ers", "NFL", "San Francisco 49ers"),
@@ -82,3 +82,17 @@ def test_league_sizes():
 ])
 def test_normalize_outcome(raw, expected):
     assert normalize_outcome(raw, "NBA") == expected
+
+
+@pytest.mark.parametrize("raw,league,expected", [
+    ("NYY", "MLB", "New York Yankees"), ("Yankees", "MLB", "New York Yankees"), ("CWS", "MLB", "Chicago White Sox"),
+    ("St. Louis Cardinals", "MLB", "St. Louis Cardinals"), ("Athletics", "MLB", "Oakland Athletics"),
+    ("Sacramento Athletics", "MLB", "Oakland Athletics"), ("Cardinals", "NFL", "Arizona Cardinals"),
+    ("Montréal Canadiens", "NHL", "Montreal Canadiens"), ("Utah Hockey Club", "NHL", "Utah Mammoth"),
+    ("VGK", "NHL", "Vegas Golden Knights"), ("NY Rangers", "NHL", "New York Rangers"),
+    ("Rangers", "MLB", "Texas Rangers"), ("Liberty", "WNBA", "New York Liberty"), ("LV Aces", "WNBA", "Las Vegas Aces"),
+    ("Giants", "MLB", "San Francisco Giants"), ("Giants", "NFL", "New York Giants"),
+    ("Boston", None, None), ("New York", "MLB", None), ("Rangers", None, None),   # ambiguous: refuse to guess
+])
+def test_new_leagues(raw, league, expected):
+    assert normalize_team_name(raw, league) == expected

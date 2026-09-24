@@ -46,7 +46,7 @@ def registry():
         make_outcome(outcome_id="O-KC", sibling="O-BUF", market_id="MK-KC", event_id="NFL-BUF-KC", league="NFL",
                      market_type="Point Spread", home_team="Kansas City Chiefs", away_team="Buffalo Bills",
                      outcome="Kansas City Chiefs", line=-3.5),
-        make_outcome(outcome_id="O-MLB", league="MLB"),                            # untracked: dropped
+        make_outcome(outcome_id="O-MLB", league="EPL"),                            # untracked: dropped
     ])
 
 

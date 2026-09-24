@@ -1,6 +1,6 @@
 {
   "_comment": "OpticOdds mapping per the brief. Each record holds a nested `odds` object: moneyline/spread use home_odds / away_odds, totals use over / under (via market_overrides). Each price may be a decimal number, an odds object ({\"decimal\": 1.91}) or an ARRAY of such objects carrying their own \"points\" (alternate lines; the entry with is_main=true, else the first, is the main line). `updated_at` (record- or entry-level) drives the 30s freshness rule. Record paths and the URL are ASSUMED - verify against a real response from your OpticOdds account. Copy to sharp_provider.json and export SHARP_API_KEY.",
-  "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&league=NBA&league=NFL",
+  "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&league=NBA&league=NFL&league=MLB&league=NHL&league=WNBA",
   "headers": {
     "X-Api-Key": "${SHARP_API_KEY}"
   },
@@ -30,7 +30,11 @@
     "point spread": "spread",
     "total": "total",
     "totals": "total",
-    "total points": "total"
+    "total points": "total",
+    "run line": "spread",
+    "puck line": "spread",
+    "runline": "spread",
+    "puckline": "spread"
   },
   "market_overrides": {
     "total": {

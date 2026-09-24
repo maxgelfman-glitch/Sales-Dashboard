@@ -334,7 +334,8 @@ class ProviderConfig(BaseModel):
     outcome_fields: dict[str, str] = Field(default_factory=dict)   # market/selection/price/points/timestamp/...
     market_map: dict[str, str] = Field(default_factory=lambda: {
         "moneyline": "moneyline", "point spread": "spread", "spread": "spread",
-        "total points": "total", "total": "total", "totals": "total"})
+        "total points": "total", "total": "total", "totals": "total", "run line": "spread", "puck line": "spread",
+        "total runs": "total", "total goals": "total"})
     sportsbooks: list[str] = Field(default_factory=list)            # e.g. ["Pinnacle"]; empty = any
     main_only: bool = True                                          # ignore alternate lines
 

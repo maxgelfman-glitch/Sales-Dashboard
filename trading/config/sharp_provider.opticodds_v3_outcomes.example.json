@@ -1,10 +1,16 @@
 {
   "_comment": "OpticOdds v3 /fixtures/odds (one fixture per record, per-side prices in `odds`). Field names reflect OpticOdds' published v3 schema as best known; VERIFY against developer.opticodds.com for your plan before going live. Copy to sharp_provider.json and export SHARP_API_KEY.",
-  "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&market=Moneyline&market=Point%20Spread&market=Total%20Points&league=NBA&league=NFL",
-  "headers": {"X-Api-Key": "${SHARP_API_KEY}"},
+  "url": "https://api.opticodds.com/api/v3/fixtures/odds?sportsbook=Pinnacle&market=Moneyline&market=Point%20Spread&market=Total%20Points&market=Run%20Line&market=Total%20Runs&market=Puck%20Line&market=Total%20Goals&league=NBA&league=NFL&league=MLB&league=NHL&league=WNBA",
+  "headers": {
+    "X-Api-Key": "${SHARP_API_KEY}"
+  },
   "mode": "outcomes",
   "list_path": "data",
-  "fixture_fields": {"league": "league.name", "home_team": "home_team_display", "away_team": "away_team_display"},
+  "fixture_fields": {
+    "league": "league.name",
+    "home_team": "home_team_display",
+    "away_team": "away_team_display"
+  },
   "outcomes_path": "odds",
   "outcome_fields": {
     "sportsbook": "sportsbook",
@@ -15,10 +21,22 @@
     "timestamp": "timestamp",
     "is_main": "is_main"
   },
-  "market_map": {"moneyline": "moneyline", "point spread": "spread", "total points": "total"},
-  "sportsbooks": ["Pinnacle"],
+  "market_map": {
+    "moneyline": "moneyline",
+    "point spread": "spread",
+    "total points": "total",
+    "run line": "spread",
+    "puck line": "spread",
+    "runline": "spread",
+    "puckline": "spread"
+  },
+  "sportsbooks": [
+    "Pinnacle"
+  ],
   "main_only": true,
-  "constants": {"source": "opticodds-pinnacle"},
+  "constants": {
+    "source": "opticodds-pinnacle"
+  },
   "odds_format": "american",
   "timestamp_format": "epoch",
   "timeout_seconds": 5.0

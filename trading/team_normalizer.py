@@ -21,6 +21,7 @@ Matching order (first unique hit wins):
 from __future__ import annotations
 
 import re
+import unicodedata
 from functools import lru_cache
 from typing import Iterable, Optional
 
@@ -56,6 +57,43 @@ NFL_TEAMS = [
     ("Washington", "Commanders", ["WAS", "WSH"]),
 ]
 
+MLB_TEAMS = [
+    ("Arizona", "Diamondbacks", ["ARI", "AZ"]), ("Atlanta", "Braves", ["ATL"]), ("Baltimore", "Orioles", ["BAL"]),
+    ("Boston", "Red Sox", ["BOS"]), ("Chicago", "Cubs", ["CHC"]), ("Chicago", "White Sox", ["CWS", "CHW"]),
+    ("Cincinnati", "Reds", ["CIN"]), ("Cleveland", "Guardians", ["CLE"]), ("Colorado", "Rockies", ["COL"]),
+    ("Detroit", "Tigers", ["DET"]), ("Houston", "Astros", ["HOU"]), ("Kansas City", "Royals", ["KC", "KCR"]),
+    ("Los Angeles", "Angels", ["LAA"]), ("Los Angeles", "Dodgers", ["LAD"]), ("Miami", "Marlins", ["MIA"]),
+    ("Milwaukee", "Brewers", ["MIL"]), ("Minnesota", "Twins", ["MIN"]), ("New York", "Mets", ["NYM"]),
+    ("New York", "Yankees", ["NYY"]), ("Oakland", "Athletics", ["OAK", "ATH"]),
+    ("Philadelphia", "Phillies", ["PHI"]), ("Pittsburgh", "Pirates", ["PIT"]), ("San Diego", "Padres", ["SD", "SDP"]),
+    ("San Francisco", "Giants", ["SF", "SFG"]), ("Seattle", "Mariners", ["SEA"]),
+    ("St. Louis", "Cardinals", ["STL"]), ("Tampa Bay", "Rays", ["TB", "TBR"]), ("Texas", "Rangers", ["TEX"]),
+    ("Toronto", "Blue Jays", ["TOR"]), ("Washington", "Nationals", ["WSH", "WSN", "WAS"]),
+]
+
+NHL_TEAMS = [
+    ("Anaheim", "Ducks", ["ANA"]), ("Boston", "Bruins", ["BOS"]), ("Buffalo", "Sabres", ["BUF"]),
+    ("Calgary", "Flames", ["CGY"]), ("Carolina", "Hurricanes", ["CAR"]), ("Chicago", "Blackhawks", ["CHI"]),
+    ("Colorado", "Avalanche", ["COL"]), ("Columbus", "Blue Jackets", ["CBJ"]), ("Dallas", "Stars", ["DAL"]),
+    ("Detroit", "Red Wings", ["DET"]), ("Edmonton", "Oilers", ["EDM"]), ("Florida", "Panthers", ["FLA"]),
+    ("Los Angeles", "Kings", ["LAK"]), ("Minnesota", "Wild", ["MIN"]), ("Montreal", "Canadiens", ["MTL", "MON"]),
+    ("Nashville", "Predators", ["NSH"]), ("New Jersey", "Devils", ["NJD", "NJ"]),
+    ("New York", "Islanders", ["NYI"]), ("New York", "Rangers", ["NYR"]), ("Ottawa", "Senators", ["OTT"]),
+    ("Philadelphia", "Flyers", ["PHI"]), ("Pittsburgh", "Penguins", ["PIT"]), ("San Jose", "Sharks", ["SJS", "SJ"]),
+    ("Seattle", "Kraken", ["SEA"]), ("St. Louis", "Blues", ["STL"]), ("Tampa Bay", "Lightning", ["TBL", "TB"]),
+    ("Toronto", "Maple Leafs", ["TOR"]), ("Utah", "Mammoth", ["UTA", "UTAH"]), ("Vancouver", "Canucks", ["VAN"]),
+    ("Vegas", "Golden Knights", ["VGK", "VEG"]), ("Washington", "Capitals", ["WSH", "WAS"]),
+    ("Winnipeg", "Jets", ["WPG"]),
+]
+
+WNBA_TEAMS = [
+    ("Atlanta", "Dream", ["ATL"]), ("Chicago", "Sky", ["CHI"]), ("Connecticut", "Sun", ["CON", "CONN"]),
+    ("Dallas", "Wings", ["DAL"]), ("Golden State", "Valkyries", ["GSV", "GS"]), ("Indiana", "Fever", ["IND"]),
+    ("Las Vegas", "Aces", ["LVA", "LV"]), ("Los Angeles", "Sparks", ["LAS"]), ("Minnesota", "Lynx", ["MIN"]),
+    ("New York", "Liberty", ["NYL"]), ("Phoenix", "Mercury", ["PHX", "PHO"]), ("Seattle", "Storm", ["SEA"]),
+    ("Washington", "Mystics", ["WAS", "WSH"]), ("Portland", "Fire", ["POR"]), ("Toronto", "Tempo", ["TOR"]),
+]
+
 # Informal nicknames and former names -> canonical full name.
 EXTRA_ALIASES = {
     "NBA": {
@@ -69,6 +107,24 @@ EXTRA_ALIASES = {
         "oakland raiders": "Las Vegas Raiders", "san diego chargers": "Los Angeles Chargers",
         "st louis rams": "Los Angeles Rams", "jags": "Jacksonville Jaguars",
     },
+    "MLB": {
+        "athletics": "Oakland Athletics", "as": "Oakland Athletics", "sacramento athletics": "Oakland Athletics",
+        "las vegas athletics": "Oakland Athletics", "dbacks": "Arizona Diamondbacks", "d backs": "Arizona Diamondbacks",
+        "cleveland indians": "Cleveland Guardians", "chi sox": "Chicago White Sox", "yanks": "New York Yankees",
+        "saint louis cardinals": "St. Louis Cardinals", "jays": "Toronto Blue Jays", "nats": "Washington Nationals",
+        "halos": "Los Angeles Angels", "la angels": "Los Angeles Angels", "anaheim angels": "Los Angeles Angels",
+        "la dodgers": "Los Angeles Dodgers",
+    },
+    "NHL": {
+        "habs": "Montreal Canadiens", "leafs": "Toronto Maple Leafs", "caps": "Washington Capitals",
+        "utah hockey club": "Utah Mammoth", "utah hc": "Utah Mammoth", "vegas": "Vegas Golden Knights",
+        "las vegas golden knights": "Vegas Golden Knights", "saint louis blues": "St. Louis Blues",
+        "bolts": "Tampa Bay Lightning", "canes": "Carolina Hurricanes", "sens": "Ottawa Senators",
+        "la kings": "Los Angeles Kings", "pens": "Pittsburgh Penguins",
+    },
+    "WNBA": {
+        "ny liberty": "New York Liberty", "la sparks": "Los Angeles Sparks", "vegas aces": "Las Vegas Aces",
+    },
 }
 
 # Shorthand tokens expanded before a second lookup attempt.
@@ -79,11 +135,12 @@ TOKEN_EXPANSIONS = {
     "philly": "philadelphia", "wash": "washington", "st": "saint",
 }
 
-LEAGUES = {"NBA": NBA_TEAMS, "NFL": NFL_TEAMS}
+LEAGUES = {"NBA": NBA_TEAMS, "NFL": NFL_TEAMS, "MLB": MLB_TEAMS, "NHL": NHL_TEAMS, "WNBA": WNBA_TEAMS}
 
 
 def clean(text: str) -> str:
     """Lowercase, '&' -> 'and', drop punctuation, collapse spaces. 'L.A. Lakers!' -> 'la lakers'."""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()   # "Montréal" -> "Montreal"
     text = text.lower().replace("&", " and ")
     text = re.sub(r"[.’']", "", text)          # "L.A." -> "la", "O'Neil" -> "oneil"
     text = re.sub(r"[^a-z0-9]+", " ", text)
