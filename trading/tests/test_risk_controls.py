@@ -185,3 +185,14 @@ async def test_kill_switch_engaging_logs_critical_once():
         logging.getLogger("trading").removeHandler(grab)
     assert sup.orders == []
     assert sum("KILL_SWITCH engaged" in r.getMessage() for r in records) == 1
+
+
+def test_load_env_file(tmp_path):
+    from main_supervisor import load_env_file
+    f = tmp_path / "live.env"
+    f.write_text("# comment\nTRADING_MODE=paper   # paper | live\nexport A='x # y'\nB=\"q\"\n\nEMPTY=\nKEEP=file\n"
+                 "C=value\t# tab comment\n")
+    env = {"KEEP": "real"}
+    loaded = load_env_file(str(f), env)
+    assert env == {"KEEP": "real", "TRADING_MODE": "paper", "A": "x # y", "B": "q", "EMPTY": "", "C": "value"}
+    assert "KEEP" not in loaded

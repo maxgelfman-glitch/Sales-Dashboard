@@ -6,6 +6,7 @@ edges net of taker fee). It also runs a two-sided maker loop on Novig and enforc
 a cross-venue one-position-per-game lock with a scenario-checked arbitrage
 exception and a $15,000 global exposure kill-switch.
 **Paper trading by default.** Live Novig execution exists behind an explicit gate (below); Kalshi is data-only in live mode.
+Runs 24/7 on a small server: see `docs/deploy.md`. Open questions for the venues: `docs/venue_questions.md`.
 
 | File | Role |
 |---|---|
@@ -14,15 +15,20 @@ exception and a $15,000 global exposure kill-switch.
 | `novig_private.py` | Execution-slip parsing (`order_id`, `status`, cumulative `filled_volume`, `price_cents`) |
 | `novig_rest.py` | Startup bootstrap (events → markets → 2 outcomes) + order gateway (`POST`/`DELETE /v1/orders`) |
 | `kalshi_feed.py` | Kalshi orderbook_delta feed, RSA-PSS auth, cents→probability→American translator, bootstrap |
-| `sharp_feed.py` | Sharp provider polling (flat or OpticOdds/OddsJam per-outcome arrays), strict 30s freshness |
+| `sharp_feed.py` | Sharp provider polling (flat or OpticOdds/OddsJam per-outcome arrays), strict 30s freshness, multi-book consensus, in-play flag |
+| `therundown_feed.py` | TheRundown v2 sharp source: REST snapshot + real-time WebSocket (`SHARP_PROVIDER=therundown`) |
+| `devig.py` | Margin removal: multiplicative, power, Shin (`DEVIG_METHOD`) |
+| `alerts.py` | CRITICAL events → phone/chat webhook (`ALERT_WEBHOOK_URL`) |
 | `execution.py` | De-vig, edge, Kelly, caps, Kalshi fee, `ExposureMonitor`, `MakerEngine` (quotes + <200ms bulk cancel) |
-| `team_normalizer.py` | Cross-feed team-name mapping |
+| `team_normalizer.py` | Cross-feed team-name mapping (NFL, NBA, MLB, NHL, WNBA) |
 | `main_supervisor.py` | Orchestrator: bootstrap, lock, arbitrage scenarios (incl. NFL ties), maker wiring, logging |
 | `settlement.py` | Exchange positions: parsing, settlement P&L (WIN/LOSS/TIE 50¢/VOID), positions REST client |
 | `research.py` | Measurement rows (`research/research-YYYYMMDD.jsonl`): decisions, entries, closing lines, markouts, depth, cross-venue gaps |
 | `research_report.py` | Summarises the research rows: CLV, markouts, liquidity by time to start, gap frequency/profit, near misses |
 | `dashboard.py` | Read-only Streamlit cockpit (separate process; tails `live_ledger.jsonl` + `trading_engine.log`) |
 | `mock_novig_server.py` | Local fake exchange used by tests and `--simulate` |
+| `docs/venue_questions.md` | Questions to send Novig, Kalshi and TheRundown (each answer removes an assumption) |
+| `docs/deploy.md` | Running 24/7 on a small cloud server (systemd, secrets, alerts, backups) |
 
 ## Quick start
 ```bash
@@ -33,6 +39,19 @@ python main_supervisor.py --simulate 30      # offline dual-venue simulation -> 
 ```
 
 ## Paper mode against real feeds
+All settings can live in one file: `python main_supervisor.py --env-file live.env` (template:
+`config/live.env.example`; the real environment wins over the file).
+
+**Measurement mode (no paid data):** leave `SHARP_PROVIDER` and `SHARP_PROVIDER_CONFIG` unset. The engine
+records Novig/Kalshi prices, cross-venue locked-profit gaps, near misses and liquidity by time to start.
+Nothing that needs a fair value trades. This alone answers whether the arbitrage/hedged-maker strategies
+have enough room.
+
+**TheRundown (recommended fair-value source):** `SHARP_PROVIDER=therundown`, `THERUNDOWN_API_KEY=...`,
+`THERUNDOWN_AFFILIATE_IDS=3` (Pinnacle). The Ultra plan streams price changes over a WebSocket; without
+it set `THERUNDOWN_WEBSOCKET=0` (REST snapshots every 15s).
+
+Generic JSON-mapped provider (OpticOdds/OddsJam):
 ```bash
 export NOVIG_BEARER_TOKEN=...  SHARP_API_KEY=...
 export NOVIG_EVENTS_URL=https://...           # Novig events endpoint (confirm path in Novig docs)
@@ -42,6 +61,27 @@ export SHARP_PROVIDER_CONFIG=config/sharp_provider.json
 export KALSHI_ENABLED=1 KALSHI_ENV=demo KALSHI_KEY_ID=... KALSHI_PRIVATE_KEY_PATH=/secure/kalshi.pem
 python main_supervisor.py
 ```
+
+## Leagues and fair value
+* Leagues: NFL, NBA, MLB, NHL, WNBA (moneyline, spread incl. run/puck line, total). Soccer is excluded (3-way
+  moneyline); college needs a team list built from the venues' own names first.
+* `DEVIG_METHOD` = multiplicative (default) | power | shin. Power/Shin take more margin off longshots.
+  Every DECISION research row records all three so the report can show which one holds up at the close.
+* `SHARP_BOOK_WEIGHTS=pinnacle:2,circa sports:1`: fresh books quoting the same number are blended into one
+  consensus fair value; unlisted books are ignored (`*:1` includes them).
+* A sharp move re-checks every venue price of that market immediately: the stale-price edge no longer waits
+  for the venue's next tick.
+* Optional taker filters, off by default: `TAKER_REQUIRE_SHARP_MOVED_LAST=1` and
+  `TAKER_MAX_SHARP_MOVE_AGE_SECONDS=5`. Turn them on only if the report's WHO MOVED FIRST section shows
+  "sharp, < 5s" beating "venue".
+
+## Risk controls
+* `GAME_EXPOSURE_LIMIT_USD` (default $1,000): unhedged money per game across its moneyline, spread and total
+  (they are correlated). Hedges are always allowed and free room. Maker quotes only on games we hold nothing in.
+* `DAILY_LOSS_LIMIT_USD` (default $2,000): settled loss per UTC day that stops new positions and quotes until
+  00:00 UTC. Survives restarts.
+* `ALERT_WEBHOOK_URL`: every CRITICAL event goes to Slack/Discord/ntfy (see `docs/deploy.md`).
+* Plus: $1,000 per position, $15,000 total exposure, live canary $10/$100, pregame cutoffs, live-game stop.
 
 ## Pregame cutoffs and the live-game stop (never trade into a live game)
 Every game gets its scheduled start time from the Novig events data (Kalshi: `occurrence_datetime`).

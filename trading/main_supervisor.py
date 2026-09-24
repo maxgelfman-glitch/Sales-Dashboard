@@ -2067,6 +2067,31 @@ def sharp_source_from_env(env: dict):
     return None
 
 
+def load_env_file(path: str, environ=None) -> list[str]:
+    """
+    Read KEY=VALUE lines (blank lines, '#' comments and trailing ' # comments' ignored; optional quotes and
+    'export ' prefix allowed) into the environment. Values already set in the real environment win.
+    Returns the keys it set. Values are never logged.
+    """
+    environ = os.environ if environ is None else environ
+    loaded = []
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key = key.strip()
+        value = value.strip()
+        if value[:1] in {'"', "'"} and value[-1:] == value[:1] and len(value) >= 2:
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].split("\t#", 1)[0].strip()
+        if key and key not in environ:
+            environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
 def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None) -> Supervisor:
     """
     Build the production supervisor from environment variables.
@@ -2397,10 +2422,19 @@ def main() -> None:
     parser.add_argument("--simulate", type=float, metavar="SECONDS", help="self-contained local simulation")
     parser.add_argument("--log-dir", default=os.environ.get("TRADING_LOG_DIR", "logs"))
     parser.add_argument("--url", default=None, help="override the Novig WebSocket URL")
+    parser.add_argument("--env-file", metavar="PATH",
+                        help="load settings from a KEY=VALUE file such as live.env (real environment wins)")
     parser.add_argument("--check-config", action="store_true",
                         help="build from the environment, print the system state, connect to nothing")
     args = parser.parse_args()
 
+    if args.env_file:
+        try:
+            loaded = load_env_file(args.env_file)
+        except OSError as exc:
+            print(f"cannot read --env-file {args.env_file}: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"loaded {len(loaded)} setting(s) from {args.env_file}")
     path = setup_logging(args.log_dir, alert_url=os.environ.get("ALERT_WEBHOOK_URL") or None)
     log.info("SUPERVISOR logging to %s", path.resolve())
     try:
