@@ -694,6 +694,27 @@ class Supervisor:
             return [(update.price, update.available_volume)]
         return levels
 
+    @staticmethod
+    def _fit_worst_case(venue: str, used: list[tuple[float, int]], cap: float) -> list[tuple[float, int]]:
+        """
+        Trim the deepest level until the WORST case fits the cap: if the cheaper levels vanish before our
+        order lands, every contract fills at the limit (the deepest price), never above it.
+        """
+        used = list(used)
+        while used:
+            limit = used[-1][0]
+            total = sum(n for _, n in used)
+            if order_cost(venue, total, limit)[0] <= cap + 1e-9:
+                return used
+            unit = limit + (kalshi_fee_per_contract(limit * 100) if venue == "kalshi" else 0.0)
+            allowed = int(math.floor(cap / unit + 1e-9))
+            excess = max(1, total - allowed)
+            price, n = used[-1]
+            used[-1] = (price, n - excess)
+            if used[-1][1] <= 0:
+                used.pop()
+        return used
+
     async def _walk_asks(self, update: MarketUpdate, sharp_q: SharpQuote, label: str, decision):
         """
         Buy through several ask levels while EACH level still clears the edge threshold.
@@ -724,6 +745,9 @@ class Supervisor:
             spent += n * price
             if n < int(size):
                 break
+        if len(used) > 1:
+            hard = min(cap, self.max_stake, MAX_STAKE_USD)
+            used = self._fit_worst_case(update.venue, used, hard)
         while used:
             contracts = sum(n for _, n in used)
             costs = [order_cost(update.venue, n, p) for p, n in used]
@@ -815,6 +839,7 @@ class Supervisor:
                 break
             used.append((price, n))
             spent += n * unit
+        used = self._fit_worst_case(update.venue, used, MAX_STAKE_USD)
         while used:
             contracts = sum(n for _, n in used)
             if contracts < remaining and contracts < MIN_PARTIAL_HEDGE_CONTRACTS:

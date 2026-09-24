@@ -623,3 +623,39 @@ def test_report_loads_files_skips_torn_lines_and_filters_by_date(tmp_path):
     assert [r["ts"] for r in load_rows(tmp_path)] == [1, 2]
     assert [r["ts"] for r in load_rows(tmp_path, since="2026-09-21")] == [2]
     assert "No research rows yet" in build_report([])
+
+
+# ---------------------------------------------------------------------------
+# Worst case: the cheap levels vanish and everything fills at the limit
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("levels,max_stake,cap", [
+    ([(0.47, 15), (0.49, 400)], 10.0, 10.0),            # canary
+    ([(0.45, 1500), (0.49, 5000)], 1000.0, 1000.0),     # hard per-position ceiling
+])
+async def test_worst_case_fill_at_limit_never_breaks_a_cap(levels, max_stake, cap):
+    sup = live_sup(max_stake=max_stake)
+    await sup.on_market_update(book_upd("O-NYK", levels), None)
+    [sent] = sup.order_gateway.placed
+    assert sent["contracts"] * sent["price_cents"] / 100 <= cap + 1e-9
+    assert sup.total_exposure() <= cap + 1e-9                                    # reservation at the limit
+
+
+async def test_never_buys_a_level_without_edge_and_never_more_than_shown(tmp_path):
+    sup = paper_sup(tmp_path)
+    # fair 0.52174 -> 0.51 is +2.3%: below the threshold, so the limit can never be 0.51
+    await sup.on_market_update(book_upd("O-NYK", [(0.49, 50), (0.50, 60), (0.51, 100_000)]), None)
+    [order] = sup.orders
+    assert order.contracts == 110                                               # exactly what was shown
+    live = live_sup()
+    await live.on_market_update(book_upd("O-NYK", [(0.49, 50), (0.50, 60), (0.51, 100_000)]), None)
+    assert live.order_gateway.placed[0]["price_cents"] == 50.0
+
+
+async def test_hedge_worst_case_fits_the_cap(tmp_path):
+    sup = paper_sup(tmp_path)
+    await sup.on_market_update(upd("O-NYK", 0.30, volume=3000), None)          # big cheap first leg
+    first = sup.orders[0]
+    await sup.on_market_update(book_upd("O-BOS", [(0.40, 1000), (0.60, 5000)]), None)
+    hedge = sup.orders[1]
+    assert hedge.contracts * 0.60 <= 1000.0 + 1e-9 or hedge.price == 0.40
+    assert hedge.contracts <= first.contracts
