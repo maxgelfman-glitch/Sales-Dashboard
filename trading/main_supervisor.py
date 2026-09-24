@@ -122,6 +122,7 @@ from novig_feed import (
 from novig_rest import NovigOrderGateway, NovigRestClient, PaperOrderGateway, order_body
 from sharp_feed import (
     MockSharpSource,
+    NoSharpSource,
     ProviderConfig,
     ProviderSharpSource,
     SharpBook,
@@ -129,6 +130,7 @@ from sharp_feed import (
     SharpLine,
     SharpPoller,
 )
+from alerts import AlertHandler
 from research import DEPTH_SAMPLE_SECONDS, MARKOUT_DELAYS, GapTracker, ResearchRecorder
 from settlement import (
     BASELINE_CAPITAL_USD,
@@ -163,6 +165,11 @@ MIN_PARTIAL_HEDGE_CONTRACTS = 10       # smaller partial hedges are not worth an
 # Novig is believed to fill a taker at its limit). "single": one order limited at the worst level (only right
 # if the exchange fills cheaper levels first). "off": best level only.
 MULTI_LEVEL_MODES = ("staggered", "single", "off")
+# A game's moneyline, spread and total are strongly correlated: cap the UNHEDGED money per game across all
+# of its markets (hedged slices are risk-free and do not count).
+GAME_EXPOSURE_LIMIT_USD = 1_000.0
+# Realised (settled) net loss in one UTC day that stops new takers and pulls quotes until the next day.
+DAILY_LOSS_LIMIT_USD = 2_000.0
 
 log = logging.getLogger("trading.supervisor")
 bridge_log = logging.getLogger("trading.bridge")
@@ -173,7 +180,7 @@ order_log = logging.getLogger("trading.orders")
 # Logging
 # ==========================================================================
 def setup_logging(log_dir: str | Path = "logs", level: int = logging.INFO, console: bool = True,
-                  backup_days: int = 30) -> Path:
+                  backup_days: int = 30, alert_url: Optional[str] = None) -> Path:
     """Configure the 'trading' logger tree: daily-rolling file + optional console. Safe to call twice."""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +199,8 @@ def setup_logging(log_dir: str | Path = "logs", level: int = logging.INFO, conso
         stream = logging.StreamHandler()
         stream.setFormatter(formatter)
         root.addHandler(stream)
+    if alert_url:
+        root.addHandler(AlertHandler(alert_url))     # CRITICAL lines -> phone / chat (alerts.py)
     return path
 
 
@@ -363,13 +372,18 @@ class Supervisor:
         research: Optional[ResearchRecorder] = None,
         depth_sample_s: float = DEPTH_SAMPLE_SECONDS,
         multi_level_mode: str = "staggered",
+        game_exposure_limit: float = GAME_EXPOSURE_LIMIT_USD,
+        daily_loss_limit: Optional[float] = DAILY_LOSS_LIMIT_USD,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
         if subscribe_messages is None:
             subscribe_messages = [TAPE_SUBSCRIBE, ORDERS_SUBSCRIBE] if live else [TAPE_SUBSCRIBE]
+        # No sharp source = MEASUREMENT mode: prices, gaps, depth and research rows are recorded, but nothing
+        # needs a fair value (no directional takers, no maker quotes). Arbitrage research works on venue prices.
+        self.sharp_enabled = sharp_fetch is not None
         if sharp_fetch is None:
-            raise ValueError("a sharp_fetch source is required (ProviderSharpSource live, MockSharpSource in tests)")
+            sharp_fetch = NoSharpSource()
         self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move,
                               on_live=self._on_sharp_live)
         self.registry = registry if registry is not None else MarketRegistry()
@@ -425,6 +439,11 @@ class Supervisor:
         if multi_level_mode not in MULTI_LEVEL_MODES:
             raise ValueError(f"multi_level_mode must be one of {MULTI_LEVEL_MODES}")
         self.multi_level_mode = multi_level_mode
+        # ---- correlation + loss controls ----
+        self.game_exposure_limit = game_exposure_limit     # unhedged $ per GAME across all its markets
+        self.daily_loss_limit = daily_loss_limit            # realised loss per UTC day that halts new risk
+        self.daily_pnl: dict[str, float] = {}               # "YYYY-MM-DD" (UTC) -> settled net P&L
+        self.loss_halted_day: Optional[str] = None
         self._last_hedge_levels: list[tuple[float, int]] = []
         self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
@@ -442,7 +461,9 @@ class Supervisor:
         self._background: set[asyncio.Task] = set()
 
         self._task_factories: dict[str, Callable[[], Awaitable[None]]] = {
-            "novig_feed": self.feed.run, "sharp_poller": self.poller.run, "heartbeat": self._heartbeat_loop}
+            "novig_feed": self.feed.run, "heartbeat": self._heartbeat_loop}
+        if self.sharp_enabled:
+            self._task_factories["sharp_poller"] = self.poller.run
         if self.kalshi is not None:
             self._task_factories["kalshi_feed"] = self.kalshi.run
         if self.maker is not None:
@@ -455,6 +476,8 @@ class Supervisor:
         if research is not None:
             self._task_factories["research_depth"] = self._depth_loop
         self._index_start_times()
+        self._halt_alerted = False
+        self._load_today_pnl()
 
     # backwards-compatible alias used by older callers/tests
     @property
@@ -681,8 +704,18 @@ class Supervisor:
             self.stats["kalshi_exec_disabled"] += 1
             log.info("EV_TRIGGER not executed: %s is data-only in live mode", update.venue)
             return
+        if self._loss_halted():
+            self.stats["daily_loss_blocked"] += 1
+            log.info("EV_TRIGGER not executed: daily loss stop active until the next UTC day")
+            return
+        room = self.game_room(gid)
+        if room < 1.0:
+            self.stats["game_cap_blocked"] += 1
+            log.info("EV_TRIGGER not executed: game %s already carries $%.2f unhedged (cap $%.0f per game)", gid,
+                     self.game_unhedged(gid), self.game_exposure_limit)
+            return
         contracts, stake, fee, avg_price, limit_price, used = await self._walk_asks(
-            update, sharp_q, label, decision)
+            update, sharp_q, label, decision, room=room)
         if contracts <= 0:
             self.stats["no_liquidity"] += 1
             log.info("EV_TRIGGER skipped: no liquidity with edge for %s", update.outcome_id)
@@ -745,21 +778,23 @@ class Supervisor:
                 used.pop()
         return used
 
-    async def _walk_asks(self, update: MarketUpdate, sharp_q: SharpQuote, label: str, decision):
+    async def _walk_asks(self, update: MarketUpdate, sharp_q: SharpQuote, label: str, decision,
+                         room: float = MAX_STAKE_USD):
         """
         Buy through several ask levels while EACH level still clears the edge threshold.
         Size never exceeds the 1/4-Kelly stake of the worst level used (Kelly shrinks as the price worsens),
         the $1,000 per-position cap, or the live canary stake.
         Returns (contracts, total cost incl. fees, fee, average price, worst price = limit, [(price, n), ...]).
         """
-        cap = decision.stake_usd
+        cap = min(decision.stake_usd, room)                 # room = what the per-game cap still allows
         if self.max_stake < MAX_STAKE_USD:
             cap = min(cap, self.max_stake)
         used: list[tuple[float, int]] = []
         spent = 0.0
         for i, (price, size) in enumerate(self._ask_levels(update)):
             if i == 0:
-                n = min(decision.contracts, int(size))
+                unit0 = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
+                n = min(decision.contracts, int(size), int(math.floor(cap / unit0 + 1e-9)))
             elif self.multi_level_mode == "off" or (self.live and not self.multi_level_live):
                 break
             else:
@@ -896,7 +931,13 @@ class Supervisor:
     # ---------------- orders / exposure ----------------
     def _kill_switch_allows(self, stake: float, outcome_id: str) -> bool:
         ok, reason = self.exposure.check_taker(stake)
-        if not ok:
+        if ok:
+            self._halt_alerted = False
+        else:
+            if self.exposure.taker_halted and not self._halt_alerted:
+                self._halt_alerted = True
+                log.critical("KILL_SWITCH engaged: open exposure $%.2f of $%.2f — no new taker orders until "
+                             "settlements free room", self.exposure.open_exposure, self.exposure.limit)
             self.stats["kill_switch_blocked"] += 1
             log.warning("KILL_SWITCH blocked taker order on %s ($%.2f): %s", outcome_id, stake, reason)
             if self.maker is not None and self.maker.quotes and self.exposure.taker_halted:
@@ -1202,6 +1243,60 @@ class Supervisor:
             self.maker.on_fill(lo.exchange_order_id)
             await self.maker.cancel_market(lo.key, "maker fill: position lock")
 
+    # ---------------- correlation + loss controls ----------------
+    @staticmethod
+    def _position_unhedged_usd(pos: MarketPosition) -> float:
+        first = pos.primary
+        n = first.requested_contracts if first.pending else first.contracts
+        if n <= 0:
+            return 0.0
+        risk = first.requested_contracts * first.price if first.pending else first.stake_usd
+        return risk * max(0.0, n - pos.hedged_contracts()) / n
+
+    def game_unhedged(self, gid: tuple) -> float:
+        """Unhedged $ across every market (moneyline, spread, total) of one game."""
+        return round(sum(self._position_unhedged_usd(pos) for key, pos in self.positions.items() if key[:3] == gid), 2)
+
+    def game_room(self, gid: tuple) -> float:
+        return max(0.0, self.game_exposure_limit - self.game_unhedged(gid))
+
+    @staticmethod
+    def _utc_day(ts: Optional[float] = None) -> str:
+        return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).strftime("%Y-%m-%d")
+
+    def _loss_halted(self) -> bool:
+        return self.loss_halted_day is not None and self.loss_halted_day == self._utc_day()
+
+    def _record_daily_pnl(self, net: Optional[float], ts: Optional[float] = None, replay: bool = False) -> None:
+        if net is None:
+            return
+        day = self._utc_day(ts)
+        self.daily_pnl[day] = round(self.daily_pnl.get(day, 0.0) + net, 2)
+        if (self.daily_loss_limit is not None and self.daily_pnl[day] <= -self.daily_loss_limit
+                and self.loss_halted_day != day):
+            self.loss_halted_day = day
+            log.critical("DAILY_LOSS_STOP settled net P&L today $%.2f <= -$%.0f: no new positions or quotes until "
+                         "00:00 UTC (hedges still allowed)", self.daily_pnl[day], self.daily_loss_limit)
+            if not replay:
+                self._ledger("DAILY_LOSS_STOP", day=day, net_pnl_usd=self.daily_pnl[day],
+                             limit_usd=self.daily_loss_limit)
+                if self.maker is not None and self.maker.quotes:
+                    self._spawn(self.maker.cancel_all("daily loss stop"))
+
+    def _load_today_pnl(self) -> None:
+        """After a restart, today's settled P&L (and a loss stop already hit) come back from the ledger."""
+        if self.ledger_path is None or not self.ledger_path.exists():
+            return
+        today = self._utc_day()
+        with self.ledger_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("event") == "SETTLE" and self._utc_day(row.get("ts", 0)) == today:
+                    self._record_daily_pnl(row.get("net_profit_usd"), row.get("ts"), replay=True)
+
     # ---------------- pregame cutoff ----------------
     def _note_start(self, gid: tuple, start: float) -> None:
         prev = self.game_start.get(gid)
@@ -1473,6 +1568,7 @@ class Supervisor:
             self._drop_leg(key, leg)
         self.processed_settlements.add(pos.settlement_id)
         self.cumulative_pnl = round(self.cumulative_pnl + (net or 0.0), 2)
+        self._record_daily_pnl(net)
         first = legs[0][1]
         row = dict(timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                    settlement_id=pos.settlement_id, game_id=first.event_id or pos.event_id,
@@ -1584,7 +1680,8 @@ class Supervisor:
             if canon is None:
                 continue
             key, side = canon
-            if key in self.positions or self._trade_blocked(key[:3], "maker"):
+            if (key in self.positions or self._trade_blocked(key[:3], "maker") or self._loss_halted()
+                    or self.game_unhedged(key[:3]) > 0):      # correlated: only quote games we hold nothing in
                 continue
             sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
             if sharp is None or (info.line is not None and sharp.line is not None
@@ -1809,6 +1906,31 @@ def cutoffs_from_env(env: dict) -> dict:
     return dict(taker_cutoff_s=taker * 60, maker_cutoff_s=maker * 60, cutoff_overrides=overrides)
 
 
+def _usd(env: dict, name: str, default: Optional[float], ceiling: float) -> Optional[float]:
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    if raw.lower() in {"off", "none", "0"} and name == "DAILY_LOSS_LIMIT_USD":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(f"{name}={raw!r} is not a number") from None
+    if not 0 < value <= ceiling:
+        raise ConfigError(f"{name} must be > 0 and at most ${ceiling:,.0f}")
+    return value
+
+
+def risk_controls_from_env(env: dict) -> dict:
+    """
+    GAME_EXPOSURE_LIMIT_USD (default 1000): unhedged $ per game across its moneyline/spread/total.
+    DAILY_LOSS_LIMIT_USD (default 2000, "off" to disable): settled loss per UTC day that stops new risk.
+    """
+    return dict(game_exposure_limit=_usd(env, "GAME_EXPOSURE_LIMIT_USD", GAME_EXPOSURE_LIMIT_USD,
+                                         GLOBAL_EXPOSURE_LIMIT_USD),
+                daily_loss_limit=_usd(env, "DAILY_LOSS_LIMIT_USD", DAILY_LOSS_LIMIT_USD, BASELINE_CAPITAL_USD))
+
+
 def research_from_env(env: dict) -> Optional[ResearchRecorder]:
     """RESEARCH_ENABLED (default on) writes measurement rows to RESEARCH_DIR (default ./research)."""
     if env.get("RESEARCH_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
@@ -1832,7 +1954,8 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     env = os.environ if env is None else env
     live = env.get("TRADING_MODE", "paper").lower() == "live"
     if not env.get("SHARP_PROVIDER_CONFIG"):
-        raise ConfigError("SHARP_PROVIDER_CONFIG is required (use --simulate for a demo without it)")
+        log.warning("SUPERVISOR no SHARP_PROVIDER_CONFIG: MEASUREMENT mode — venue prices, cross-venue gaps and "
+                    "liquidity are recorded; nothing that needs a fair value (directional takers, maker quotes) runs")
     token = env.get("NOVIG_BEARER_TOKEN")
     api_base = (env.get("NOVIG_API_BASE") or NOVIG_PROD_API_BASE).rstrip("/")
     events_url = env.get("NOVIG_EVENTS_URL") or api_base + NOVIG_EVENTS_PATH
@@ -1905,10 +2028,12 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
-    kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env))
+    kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env),
+              **risk_controls_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
-                      sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"])),
+                      sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"]))
+                      if env.get("SHARP_PROVIDER_CONFIG") else None,
                       maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,
                       **kw, **live_kw)
 
@@ -1944,8 +2069,10 @@ def describe_state(sup: Supervisor) -> dict:
         "kalshi_rest": None if sup.kalshi_rest is None else sup.kalshi_rest.base_url,
         "dead_heat_venues": sorted(DEAD_HEAT_VENUES),
         "ledger": str(sup.ledger_path) if sup.ledger_path else None,
-        "sharp_url": cfg.url if cfg else "mock",
-        "sharp_mode": cfg.mode if cfg else "mock",
+        "sharp_url": cfg.url if cfg else ("mock" if sup.sharp_enabled else "NONE: measurement mode"),
+        "sharp_mode": cfg.mode if cfg else ("mock" if sup.sharp_enabled else "-"),
+        "game_exposure_limit": sup.game_exposure_limit,
+        "daily_loss_limit": sup.daily_loss_limit,
         "sharp_odds_format": cfg.odds_format if cfg else "-",
         "sharp_timestamp_format": cfg.timestamp_format if cfg else "-",
         "sharp_markets": sorted(set(cfg.market_map.values())) if cfg else [],
@@ -1987,6 +2114,9 @@ def format_state_report(sup: Supervisor) -> str:
             "staggered": "staggered: one order per ask level at that level's price",
             "single": "single order limited at the worst level (needs price improvement)",
             "off": "best ask level only"}[st["multi_level_mode"]]),
+        ("Unhedged $ per game (all markets)", f"${st['game_exposure_limit']:,.0f}"),
+        ("Daily loss stop (settled, UTC day)", "off" if st["daily_loss_limit"] is None
+         else f"-${st['daily_loss_limit']:,.0f} -> no new positions/quotes until 00:00 UTC"),
         ("Taker/hedge cutoff", f"no new orders {st['taker_cutoff_min']:g} min before scheduled start"),
         ("Maker cutoff", f"quotes pulled {st['maker_cutoff_min']:g} min before scheduled start"),
         ("Per-league cutoffs (taker/maker min)", ", ".join(f"{k} {v}" for k, v in st["cutoff_overrides"].items())
@@ -2135,7 +2265,7 @@ def main() -> None:
                         help="build from the environment, print the system state, connect to nothing")
     args = parser.parse_args()
 
-    path = setup_logging(args.log_dir)
+    path = setup_logging(args.log_dir, alert_url=os.environ.get("ALERT_WEBHOOK_URL") or None)
     log.info("SUPERVISOR logging to %s", path.resolve())
     try:
         if args.simulate:

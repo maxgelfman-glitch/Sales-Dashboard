@@ -438,6 +438,6 @@ async def test_kalshi_drop_does_not_touch_novig_quotes():
 
 
 # ---------------- configuration safety (live config: see test_live_execution.py)
-def test_supervisor_requires_a_sharp_source():
-    with pytest.raises(ValueError):
-        Supervisor()
+def test_no_sharp_source_means_measurement_mode():
+    sup = Supervisor()
+    assert not sup.sharp_enabled and "sharp_poller" not in sup._task_factories

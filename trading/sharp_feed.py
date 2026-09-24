@@ -580,6 +580,14 @@ class ProviderSharpSource:
             await self._session.close()
 
 
+class NoSharpSource:
+    """No sharp provider configured: measurement mode (the supervisor never polls it)."""
+    config = None
+
+    async def __call__(self) -> list[dict]:
+        return []
+
+
 class MockSharpSource:
     """Fixed demo lines for tests and --simulate. NEVER used in live mode."""
 
