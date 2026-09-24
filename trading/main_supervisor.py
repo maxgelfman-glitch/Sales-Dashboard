@@ -379,6 +379,8 @@ class Supervisor:
         daily_loss_limit: Optional[float] = DAILY_LOSS_LIMIT_USD,
         devig_method: str = "multiplicative",
         sharp_weights: Optional[dict[str, float]] = None,
+        taker_require_sharp_moved_last: bool = False,
+        taker_max_sharp_move_age_s: Optional[float] = None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -391,6 +393,10 @@ class Supervisor:
             sharp_fetch = NoSharpSource()
         set_devig_method(devig_method)                  # engine-wide: edges, maker fair values, research
         self.devig_method = devig_method
+        # "who moved first": optional taker filters (off by default until the research data says they pay)
+        self.taker_require_sharp_moved_last = taker_require_sharp_moved_last
+        self.taker_max_sharp_move_age_s = taker_max_sharp_move_age_s
+        self.last_sharp_change: dict[tuple, float] = {}   # (league, home, away, market_type) -> last real change
         self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move,
                               on_live=self._on_sharp_live, weights=sharp_weights)
         self.registry = registry if registry is not None else MarketRegistry()
@@ -600,11 +606,38 @@ class Supervisor:
         fair_move = abs(fair_new - fair_old) if None not in (fair_old, fair_new) else 0.0
         log.info("SHARP_MOVE %s line %s -> %s (%.2f pts) fair %.4f -> %.4f", key, old.line, new.line, points_move,
                  fair_old or 0, fair_new or 0)
+        market_key = tuple(key[:4])
+        self.last_sharp_change[market_key] = time.time()
+        # The classic stale-price edge: the sharp moved, the venue has not. Re-check every venue price of this
+        # market NOW instead of waiting for the venue's next tick.
+        self._spawn(self._reevaluate_market(market_key))
         if points_move > MAKER_LINE_MOVE_POINTS + 1e-9 or fair_move > MAKER_ML_FAIR_MOVE + 1e-9:
             if self.maker is not None and self.maker.quotes:
                 self.stats["maker_line_kills"] += 1
                 self._spawn(self.maker.cancel_all(
                     f"sharp move on {key}: {points_move:.2f} pts / {fair_move * 100:.2f}c fair"))
+
+    async def _reevaluate_market(self, market_key: tuple) -> None:
+        for upd in list(self._latest_updates()):
+            canon = self._canonical(upd)
+            if canon is not None and canon[0] == market_key and upd.price is not None:
+                self.stats["sharp_move_reevaluations"] += 1
+                await self.on_market_update(upd, upd)       # previous == current: the venue price did not move
+
+    def moved_last(self, update: MarketUpdate, market_key: tuple) -> tuple[Optional[str], Optional[float]]:
+        """
+        (who changed price most recently: the venue or "sharp", seconds since the sharp's last real move).
+        The venue side uses the last time THIS outcome's ask changed; the sharp side the last time the
+        sharp line actually moved (not merely re-polled).
+        """
+        sharp_at = self.last_sharp_change.get(market_key)
+        venue_at = self.last_price_change.get((update.venue, update.outcome_id))
+        age = None if sharp_at is None else round(time.time() - sharp_at, 3)
+        if sharp_at is None:
+            return (update.venue if venue_at is not None else None), age
+        if venue_at is None or sharp_at > venue_at:
+            return "sharp", age
+        return update.venue, age
 
     @staticmethod
     def _fair(line: SharpLine) -> Optional[float]:
@@ -710,6 +743,11 @@ class Supervisor:
         if self.live and update.venue != "novig":
             self.stats["kalshi_exec_disabled"] += 1
             log.info("EV_TRIGGER not executed: %s is data-only in live mode", update.venue)
+            return
+        why_not = self._moved_first_filter(update, key)
+        if why_not:
+            self.stats["moved_first_blocked"] += 1
+            log.info("EV_TRIGGER not executed: %s", why_not)
             return
         if self._loss_halted():
             self.stats["daily_loss_blocked"] += 1
@@ -1250,6 +1288,18 @@ class Supervisor:
             self.maker.on_fill(lo.exchange_order_id)
             await self.maker.cancel_market(lo.key, "maker fill: position lock")
 
+    def _moved_first_filter(self, update: MarketUpdate, key: tuple) -> Optional[str]:
+        """Optional: only take edges where the SHARP moved last (the venue is stale), and recently."""
+        if not self.taker_require_sharp_moved_last and self.taker_max_sharp_move_age_s is None:
+            return None
+        mover, age = self.moved_last(update, tuple(key))
+        if self.taker_require_sharp_moved_last and mover != "sharp":
+            return f"the venue moved last ({mover}): likely informed flow, not a stale price"
+        if self.taker_max_sharp_move_age_s is not None and (age is None or age > self.taker_max_sharp_move_age_s):
+            return (f"sharp move is {'unknown' if age is None else f'{age:.1f}s'} old "
+                    f"(> {self.taker_max_sharp_move_age_s:g}s freshness window)")
+        return None
+
     # ---------------- correlation + loss controls ----------------
     @staticmethod
     def _position_unhedged_usd(pos: MarketPosition) -> float:
@@ -1423,7 +1473,7 @@ class Supervisor:
     def _research_decision(self, update: MarketUpdate, key: tuple, side: str, decision,
                            blocked: Optional[str] = None) -> None:
         age = self.book.age_of(key[0], key[1], key[2], key[3], side)
-        venue_change = self.last_price_change.get((update.venue, update.outcome_id))
+        mover, move_age = self.moved_last(update, tuple(key))
         fair_by_method = {}
         sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line)
         if sharp is not None:
@@ -1432,14 +1482,12 @@ class Supervisor:
                 fair_by_method = {m: round(devig(odds, m)[0][0], 6) for m in DEVIG_METHODS}
             except ValueError:
                 pass
-        sharp_at = None if age is None else time.time() - age
         self.research.write(
             "DECISION", venue=update.venue, outcome_id=update.outcome_id, game=list(key), side=side,
             line=update.line, price=update.price, depth=update.available_volume, fair_prob=decision.fair_prob,
             edge=decision.edge, action=decision.action, reason=decision.reason, fee_usd=decision.fee_usd,
             sharp_age_s=None if age is None else round(age, 3),
-            moved_last=None if venue_change is None or sharp_at is None else (
-                update.venue if venue_change > sharp_at else "sharp"),
+            moved_last=mover, sharp_move_age_s=move_age,
             minutes_to_start=self.minutes_to_start(key[:3]), blocked=blocked, fair_by_method=fair_by_method,
             sharp_source=None if sharp is None else sharp.source)
 
@@ -1969,6 +2017,25 @@ def fair_value_from_env(env: dict) -> dict:
     return dict(devig_method=method, sharp_weights=weights or None)
 
 
+def taker_filters_from_env(env: dict) -> dict:
+    """
+    TAKER_REQUIRE_SHARP_MOVED_LAST=1: only take an edge when the sharp moved after the venue's price
+    (the venue is stale). TAKER_MAX_SHARP_MOVE_AGE_SECONDS=5: ... and only within 5s of that move.
+    Both default off; turn on only when research_report shows they separate good edges from bad.
+    """
+    moved = (env.get("TAKER_REQUIRE_SHARP_MOVED_LAST") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    raw = (env.get("TAKER_MAX_SHARP_MOVE_AGE_SECONDS") or "").strip()
+    age = None
+    if raw:
+        try:
+            age = float(raw)
+        except ValueError:
+            raise ConfigError(f"TAKER_MAX_SHARP_MOVE_AGE_SECONDS={raw!r} is not a number") from None
+        if not 0 < age <= 3600:
+            raise ConfigError("TAKER_MAX_SHARP_MOVE_AGE_SECONDS must be > 0 and <= 3600")
+    return dict(taker_require_sharp_moved_last=moved, taker_max_sharp_move_age_s=age)
+
+
 def research_from_env(env: dict) -> Optional[ResearchRecorder]:
     """RESEARCH_ENABLED (default on) writes measurement rows to RESEARCH_DIR (default ./research)."""
     if env.get("RESEARCH_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
@@ -2067,7 +2134,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
     kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env),
-              **risk_controls_from_env(env), **fair_value_from_env(env))
+              **risk_controls_from_env(env), **fair_value_from_env(env), **taker_filters_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=ProviderSharpSource(ProviderConfig.from_file(env["SHARP_PROVIDER_CONFIG"]))
@@ -2110,6 +2177,8 @@ def describe_state(sup: Supervisor) -> dict:
         "sharp_url": cfg.url if cfg else ("mock" if sup.sharp_enabled else "NONE: measurement mode"),
         "sharp_mode": cfg.mode if cfg else ("mock" if sup.sharp_enabled else "-"),
         "devig_method": sup.devig_method,
+        "moved_first": ("sharp must move last" if sup.taker_require_sharp_moved_last else "off")
+        + ("" if sup.taker_max_sharp_move_age_s is None else f", within {sup.taker_max_sharp_move_age_s:g}s"),
         "sharp_weights": sup.book.weights,
         "game_exposure_limit": sup.game_exposure_limit,
         "daily_loss_limit": sup.daily_loss_limit,
@@ -2176,6 +2245,7 @@ def format_state_report(sup: Supervisor) -> str:
         ("Mode / odds / timestamps", f"{st['sharp_mode']} / {st['sharp_odds_format']} / {st['sharp_timestamp_format']}"),
         ("Markets", ", ".join(st["sharp_markets"]) or "-"),
         ("Margin removal (DEVIG_METHOD)", st["devig_method"]),
+        ("Who-moved-first taker filter", st["moved_first"]),
         ("Book weights (consensus fair value)", ", ".join(f"{k}:{v:g}" for k, v in st["sharp_weights"].items())
          or "every book in the feed, equally"),
         ("Per-market overrides", ", ".join(st["sharp_overrides"]) or "none"),

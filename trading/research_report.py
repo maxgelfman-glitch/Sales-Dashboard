@@ -116,6 +116,47 @@ def clv_by_time(rows: list[dict]) -> dict:
             for k, v in cells.items()}
 
 
+def move_bucket(age: Optional[float]) -> str:
+    if age is None:
+        return "never moved"
+    return "< 5s" if age < 5 else "5-30s" if age < 30 else "30s-5m" if age < 300 else "> 5m"
+
+
+def clv_by_mover(rows: list[dict]) -> dict:
+    """
+    CLV of BET decisions split by who moved last and how long ago the sharp moved. If "sharp, < 5s"
+    clearly beats "venue", turn on TAKER_REQUIRE_SHARP_MOVED_LAST / TAKER_MAX_SHARP_MOVE_AGE_SECONDS.
+    """
+    closes = _closes(rows)
+    cells = defaultdict(list)
+    for r in rows:
+        if r["kind"] != "DECISION" or r.get("action") != "BET" or r.get("price") is None:
+            continue
+        fair = closes.get(_key(r))
+        if fair is None:
+            continue
+        mover = "sharp" if r.get("moved_last") == "sharp" else "venue" if r.get("moved_last") else "unknown"
+        cells[(mover, move_bucket(r.get("sharp_move_age_s")))].append(100 * (fair - r["price"]))
+    return {k: {"decisions": len(v), "mean_clv_cents": _mean(v), "beat_close": sum(x > 0 for x in v) / len(v)}
+            for k, v in cells.items()}
+
+
+def clv_by_method(rows: list[dict]) -> dict:
+    """Mean edge at decision time under each de-vig method vs CLV: which method's edges hold up at the close."""
+    closes = _closes(rows)
+    cells = defaultdict(list)
+    for r in rows:
+        if r["kind"] != "DECISION" or r.get("price") is None or not r.get("fair_by_method"):
+            continue
+        fair_close = closes.get(_key(r))
+        if fair_close is None:
+            continue
+        for method, fair in r["fair_by_method"].items():
+            if fair and fair / r["price"] - 1 > 0.025:              # would have been a bet under this method
+                cells[method].append(100 * (fair_close - r["price"]))
+    return {m: {"would_bet": len(v), "mean_clv_cents": _mean(v)} for m, v in cells.items()}
+
+
 def clv_summary(rows: list[dict]) -> dict:
     """
     Closing-line value per entry = closing fair probability - entry price (per contract, in $).
@@ -255,6 +296,20 @@ def build_report(rows: list[dict]) -> str:
         out.append("  (tighten the taker cutoff only if the late buckets still show positive CLV)")
     else:
         out.append("  no BET decisions with a closing line yet")
+
+    mv = clv_by_mover(rows)
+    out += ["", "[WHO MOVED FIRST]  (CLV of BET decisions by who changed price last / age of the sharp move)"]
+    if mv:
+        for (mover, age), v in sorted(mv.items()):
+            out.append(f"  {mover:<7} sharp moved {age:<12} decisions {v['decisions']:>5}   "
+                       f"mean CLV {v['mean_clv_cents']:+.2f}c   beat close {v['beat_close']:.0%}")
+        out.append("  (if 'sharp' clearly beats 'venue', set TAKER_REQUIRE_SHARP_MOVED_LAST=1 and a freshness window)")
+    else:
+        out.append("  no BET decisions with a closing line yet")
+    bm = clv_by_method(rows)
+    if bm:
+        out.append("  by de-vig method (edge > 2.5% under that method): " + "   ".join(
+            f"{m} {v['would_bet']} bets {v['mean_clv_cents']:+.2f}c" for m, v in sorted(bm.items())))
 
     m = markout_summary(rows)
     out += ["", "[MAKER MARKOUTS]  (fair value after each maker fill minus our fill price)"]
