@@ -414,9 +414,10 @@ def audit_feed(ledger: pd.DataFrame, log: pd.DataFrame, rows: int = AUDIT_ROWS) 
                   _col(tail, "outcome_id", "").fillna("").astype("string") + " " +
                   _col(tail, "reason", "").fillna("").astype("string")).str.replace(r"\s+", " ", regex=True).str.strip()
         sev = np.select([ev.isin(["UNCONFIRMED", "REJECTED", "CANCEL_FAILED", "SCALE_UP_AUTHORIZED", "SYNC_FAILED",
-                                  "POSITION_MISMATCH"]),
+                                  "POSITION_MISMATCH", "DAILY_LOSS_STOP", "PRICE_IMPROVEMENT_MISSING"]),
                          ev.isin(["CANCEL", "CANARY_LIMITS", "RESTORE", "UNCONFIRMED_RELEASED",
-                                  "UNCONFIRMED_RESOLVED"])], ["crimson", "amber"], default="normal")
+                                  "UNCONFIRMED_RESOLVED", "GAME_LIVE", "POSITION_RESIDUAL", "ARB_PAIR"])],
+                        ["crimson", "amber"], default="normal")
         parts.append(pd.DataFrame({
             # ledger ts is UTC epoch; engine-log ts is local wall time -> compare in local time
             "time": pd.to_datetime(tail["ts"].astype(float), unit="s", utc=True)
