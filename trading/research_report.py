@@ -141,6 +141,35 @@ def projected_monthly(rows: list[dict]) -> dict:
             "filled_usd_per_day": round(sum(r.get("filled_usd") or 0 for r in ex) / days, 2)}
 
 
+def combo_summary(rows: list[dict]) -> dict:
+    """
+    Combo (parlay) quoting: how many RFQs we could price, how often our price would have beaten the price the
+    combo actually traded at, the margin we would have had, and what the would-have-won quotes actually paid.
+    """
+    rfqs = [r for r in rows if r["kind"] == "COMBO_RFQ"]
+    if not rfqs:
+        return {"rfqs": 0}
+    quotable = [r for r in rfqs if r.get("action") == "QUOTE"]
+    trades = [r for r in rows if r["kind"] == "COMBO_TRADE" and r.get("traded_yes_price") is not None]
+    wins = [r for r in trades if r.get("would_win")]
+    results = [r for r in rows if r["kind"] == "COMBO_RESULT"]
+    reasons = Counter(str(r.get("reason", "")).split(" (")[0].split(" for leg")[0] for r in rfqs
+                      if r.get("action") == "SKIP")
+    return {
+        "rfqs": len(rfqs), "quotable": len(quotable),
+        "traded_after_pricing": len(trades), "would_win": len(wins),
+        "win_rate": len(wins) / len(trades) if trades else None,
+        "median_margin_when_winning": _median(r.get("margin_vs_winner") for r in wins),
+        "expected_profit_of_wins": sum((q.get("expected_profit") or 0) for q in quotable
+                                       if q.get("rfq_id") in {w.get("rfq_id") for w in wins}),
+        "settled": len(results), "settled_pnl": sum(r.get("pnl") or 0 for r in results),
+        "settled_expected": sum(r.get("expected_profit") or 0 for r in results),
+        "declines": sum(r["kind"] == "COMBO_DECLINE" for r in rows),
+        "confirms": sum(r["kind"] == "COMBO_CONFIRM" for r in rows),
+        "skip_reasons": dict(reasons.most_common(6)),
+    }
+
+
 def decisions_summary(rows: list[dict]) -> dict:
     dec = [r for r in rows if r["kind"] == "DECISION"]
     edges = [r["edge"] for r in dec if r.get("edge") is not None]
@@ -426,6 +455,22 @@ def build_report(rows: list[dict]) -> str:
         out.append("  (expected value, before data costs and taxes; CLV above says whether the edges were real)")
     else:
         out.append("  no filled orders yet")
+
+    c = combo_summary(rows)
+    out += ["", "[COMBO QUOTING]  (Kalshi parlays via RFQ; shadow = priced but not sent)"]
+    if c["rfqs"]:
+        out.append(f"  RFQs {c['rfqs']:,}   we would quote {c['quotable']:,}   traded after pricing "
+                   f"{c['traded_after_pricing']:,}   ours would have won {c['would_win']:,} "
+                   f"({_fmt(c['win_rate'] and c['win_rate'] * 100, '.1f')}%)")
+        out.append(f"  winning price vs our fair value: median "
+                   f"{_fmt(c['median_margin_when_winning'] and c['median_margin_when_winning'] * 100, '+.1f')}%   "
+                   f"expected profit of would-win quotes ${c['expected_profit_of_wins']:,.2f}")
+        out.append(f"  settled {c['settled']:,}: P&L ${c['settled_pnl']:,.2f} vs expected ${c['settled_expected']:,.2f}"
+                   f"   live last look: {c['confirms']} confirmed, {c['declines']} declined")
+        out.append(f"  top skip reasons: {c['skip_reasons']}")
+        out.append("  (Gate 1: win rate >= 5% at a median margin >= 8% before any real quoting)")
+    else:
+        out.append("  no RFQs seen (COMBO_QUOTER=shadow with Kalshi keys)")
 
     g = gap_summary(rows)
     out += ["", "[LOCKED-PROFIT GAPS]  (buy both sides, profit after fees in every outcome incl. ties)",

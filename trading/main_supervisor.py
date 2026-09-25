@@ -414,6 +414,7 @@ class Supervisor:
         paper_execution: str = "instant",
         sim_latency_ms: float = 500.0,
         sim_depth_haircut: float = 0.5,
+        combo_quoter=None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -537,6 +538,12 @@ class Supervisor:
             self._task_factories["sharp_poller"] = self.poller.run
         if prophetx_feed is not None:
             self._task_factories["prophetx_feed"] = prophetx_feed.run
+        self.combo = combo_quoter
+        if combo_quoter is not None:
+            combo_quoter.pricer.leg_fair = combo_quoter._leg_fair_with_fallback(self.combo_leg_fair)
+            combo_quoter.allowed = self._combo_block_reason
+            self._task_factories["combo_quoter"] = combo_quoter.run
+            self._task_factories["combo_results"] = combo_quoter.results_loop
         if self.kalshi is not None:
             self._task_factories["kalshi_feed"] = self.kalshi.run
         if self.maker is not None:
@@ -1564,6 +1571,31 @@ class Supervisor:
                     f"(> {self.taker_max_sharp_move_age_s:g}s freshness window)")
         return None
 
+    # ---------------- combo (parlay) quoting support ----------------
+    def combo_leg_fair(self, leg):
+        """Fair YES probability of a Kalshi leg from the sharp line, when the leg is a game market we track."""
+        from combo_quoter import LegFair
+        info = self.kalshi_registry.get(leg.market_ticker)
+        if info is None:
+            return None
+        canon = self._canonical(MarketUpdate.from_info(info))
+        if canon is None:
+            return None
+        key, side = canon
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+        fair = self._fair(sharp) if sharp is not None else None
+        if fair is None:
+            return None
+        age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
+        return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3])
+
+    def _combo_block_reason(self) -> Optional[str]:
+        if self._loss_halted():
+            return "daily loss stop"
+        if self.exposure.taker_halted:
+            return "exposure kill-switch"
+        return None
+
     # ---------------- correlation + loss controls ----------------
     @staticmethod
     def _position_unhedged_usd(pos: MarketPosition) -> float:
@@ -2561,6 +2593,35 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
             raise ConfigError("PROPHETX_ENABLED=1 needs PROPHETX_ACCESS_KEY and PROPHETX_SECRET_KEY")
         kw["prophetx_feed"] = ProphetXFeed(ProphetXClient(env["PROPHETX_ACCESS_KEY"], env["PROPHETX_SECRET_KEY"],
                                                           env.get("PROPHETX_API_BASE") or PROD_BASE))
+    combo_mode = (env.get("COMBO_QUOTER") or "off").strip().lower()
+    if combo_mode not in {"off", "shadow", "demo", "live"}:
+        raise ConfigError("COMBO_QUOTER must be off, shadow, demo or live")
+    if combo_mode != "off":
+        from combo_quoter import ComboConfig, ComboQuoter, KalshiComms
+        from kalshi_trading import KalshiOrderGateway
+        if combo_mode == "live" and not live:
+            raise ConfigError("COMBO_QUOTER=live needs TRADING_MODE=live (use shadow or demo otherwise)")
+        prod = env.get("KALSHI_ENV", "demo").lower() == "prod"
+        if combo_mode == "demo" and prod:
+            raise ConfigError("COMBO_QUOTER=demo needs KALSHI_ENV=demo (Kalshi's demo exchange)")
+        key_id, key_path = env.get("KALSHI_KEY_ID"), env.get("KALSHI_PRIVATE_KEY_PATH")
+        if not (key_id and key_path):
+            raise ConfigError("COMBO_QUOTER needs KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH (RFQs require a signed "
+                              "account)")
+        base = env.get("KALSHI_REST_BASE") or (KALSHI_PROD_REST_BASE if prod else DEFAULT_KALSHI_REST_BASE)
+
+        def f(name, default):
+            try:
+                return float(env.get(name) or default)
+            except ValueError:
+                raise ConfigError(f"{name} must be a number") from None
+        cfg = ComboConfig(mode=combo_mode, max_legs=int(f("COMBO_MAX_LEGS", 4)), base_margin=f("COMBO_BASE_MARGIN", 0.04),
+                          per_leg_margin=f("COMBO_PER_LEG_MARGIN", 0.02), min_roc=f("COMBO_MIN_ROC", 0.01),
+                          max_loss_per_combo=f("COMBO_MAX_LOSS_PER_COMBO", 25),
+                          max_leg_exposure=f("COMBO_MAX_LEG_EXPOSURE", 150),
+                          max_total_liability=f("COMBO_MAX_TOTAL_LIABILITY", 1000))
+        kw["combo_quoter"] = ComboQuoter(cfg, KalshiComms(KalshiOrderGateway(base, key_id, load_private_key(key_path))),
+                                         leg_fair=lambda leg: None, research=kw.get("research"))
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
@@ -2576,6 +2637,8 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         raise ConfigError("SIM_DEPTH_HAIRCUT must be in (0, 1] and SIM_LATENCY_MS >= 0")
     kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env),
               **risk_controls_from_env(env), **fair_value_from_env(env), **taker_filters_from_env(env))
+    if kw.get("combo_quoter") is not None:
+        kw["combo_quoter"].research = kw["research"]
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
                       novig_rest=None if registry is not None else NovigRestClient(events_url, token),
                       sharp_fetch=sharp_source_from_env(env),
@@ -2614,6 +2677,11 @@ def describe_state(sup: Supervisor) -> dict:
             if sup.live else "paper execution"),
         "kalshi_socket": None if sup.kalshi is None else sup.kalshi.url,
         "prophetx": "off" if sup.prophetx is None else f"price feed (paper + research only) {sup.prophetx.url}",
+        "combo": "off" if sup.combo is None else (
+            f"{sup.combo.cfg.mode.upper()}: <= {sup.combo.cfg.max_legs} legs, margin {sup.combo.cfg.base_margin:.0%} + "
+            f"{sup.combo.cfg.per_leg_margin:.0%}/leg, min return {sup.combo.cfg.min_roc:.0%}, caps "
+            f"${sup.combo.cfg.max_loss_per_combo:,.0f}/combo ${sup.combo.cfg.max_leg_exposure:,.0f}/leg "
+            f"${sup.combo.cfg.max_total_liability:,.0f} total"),
         "paper_execution": ("n/a (live)" if sup.live else
                             f"SIMULATED: {sup.sim_latency_ms:g}ms delay, {sup.sim_depth_haircut:.0%} of remaining depth"
                             if sup.sim else "instant (optimistic: full displayed size at the displayed price)"),
@@ -2697,6 +2765,8 @@ def format_state_report(sup: Supervisor) -> str:
          or "every book in the feed, equally"),
         ("Per-market overrides", ", ".join(st["sharp_overrides"]) or "none"),
         ("HTTP timeout / poll / freshness", f"{st['sharp_http_timeout_s']}s / {st['sharp_poll_s']}s / {st['sharp_max_age_s']}s"),
+        ("COMBOS (parlay quoting)", None),
+        ("Mode", st["combo"]),
         ("PROPHETX", None),
         ("Status", st["prophetx"]),
         ("KALSHI", None),
