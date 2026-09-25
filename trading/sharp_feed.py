@@ -49,7 +49,7 @@ from typing import Any, Awaitable, Callable, Literal, Optional
 import aiohttp
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from team_normalizer import normalize_outcome, normalize_team_name
+from team_normalizer import canonical_league, normalize_outcome, normalize_team_name, orient
 
 SHARP_MAX_AGE_SECONDS = 30.0      # the freshness rule
 CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
@@ -167,13 +167,14 @@ class SharpBook:
                 rejected += 1
                 continue
 
-            league = line.league.upper()
+            league = canonical_league(line.league)
             home = self._translate(line.home_team, league)
             away = self._translate(line.away_team, league)
             side = self._translate(line.side, league, outcome=True)
             if None in (home, away, side):
                 rejected += 1
                 continue
+            home, away = orient(league, home, away)
             canon = line.model_copy(update=dict(league=league, home_team=home, away_team=away, side=side))
             if canon.is_live:
                 # An in-play price must never be compared with a pregame venue price. Drop every stored

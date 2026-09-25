@@ -145,7 +145,7 @@ from settlement import (
     load_ledger_settlements,
     settlement_pnl,
 )
-from team_normalizer import normalize_outcome, normalize_team_name
+from team_normalizer import DYNAMIC_LEAGUES, normalize_outcome, normalize_team_name, orient, register_game
 
 LOG_FILE_NAME = "trading_engine.log"
 LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)-20s | %(message)s"
@@ -682,6 +682,7 @@ class Supervisor:
         side = normalize_outcome(update.outcome, league)
         if None in (home, away, side):
             return None
+        home, away = orient(league, home, away)
         return (league, home, away, update.market_type), side
 
     async def on_market_update(self, update: MarketUpdate, previous: Optional[MarketUpdate]) -> None:
@@ -1526,8 +1527,17 @@ class Supervisor:
         prev = self.game_start.get(gid)
         self.game_start[gid] = start if prev is None else min(prev, start)
 
+    def _register_dynamic_games(self) -> None:
+        """College leagues: register every listed game (Novig first, so its spellings become canonical)."""
+        for reg in (self.registry, self.kalshi_registry):
+            for info in sorted(reg.all(), key=lambda i: i.outcome_id):
+                if info.league in DYNAMIC_LEAGUES:
+                    if register_game(info.league, info.home_team, info.away_team, info.start_time) is None:
+                        self.stats["dynamic_game_unmatched"] += 1
+
     def _index_start_times(self) -> None:
         """Learn scheduled start times from every registry (any venue) for every canonical game."""
+        self._register_dynamic_games()
         for reg in (self.registry, self.kalshi_registry):
             for info in reg.all():
                 if info.start_time:

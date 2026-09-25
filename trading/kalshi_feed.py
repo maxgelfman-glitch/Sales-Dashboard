@@ -67,7 +67,7 @@ WS_SIGN_PATH = "/trade-api/ws/v2"
 # Game-winner series per league. MLB/NHL/WNBA tickers follow the same KX<LEAGUE>GAME pattern (assumed; a
 # wrong ticker simply returns no markets). Override with KALSHI_SERIES="KXNBAGAME:NBA,...".
 DEFAULT_SERIES = {"KXNBAGAME": "NBA", "KXNFLGAME": "NFL", "KXMLBGAME": "MLB", "KXNHLGAME": "NHL",
-                  "KXWNBAGAME": "WNBA"}
+                  "KXWNBAGAME": "WNBA", "KXNCAAFGAME": "NCAAF", "KXNCAAMBGAME": "NCAAB"}
 
 log = logging.getLogger("trading.kalshi")
 

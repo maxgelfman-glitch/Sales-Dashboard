@@ -49,7 +49,7 @@ log = logging.getLogger("trading.therundown")
 
 REST_BASE = "https://therundown.io/api/v2"
 WS_URL = "wss://therundown.io/api/v2/ws/markets"
-SPORT_IDS = {"NFL": 2, "NBA": 4, "MLB": 3, "NHL": 6, "WNBA": 8}
+SPORT_IDS = {"NFL": 2, "NBA": 4, "MLB": 3, "NHL": 6, "WNBA": 8, "NCAAF": 1, "NCAAB": 5}
 LEAGUE_BY_SPORT = {v: k for k, v in SPORT_IDS.items()}
 MARKETS = {1: "moneyline", 2: "spread", 3: "total"}
 AFFILIATE_NAMES = {3: "pinnacle", 19: "draftkings", 23: "fanduel", 22: "betmgm", 2: "bovada"}
@@ -79,7 +79,7 @@ def _epoch(v: Any) -> Optional[float]:
 class TheRundownSource:
     """SharpFetch-compatible: `await source()` returns SharpLine dicts for every tracked game and book."""
 
-    def __init__(self, api_key: str, leagues: tuple[str, ...] = ("NFL", "NBA", "MLB", "NHL", "WNBA"),
+    def __init__(self, api_key: str, leagues: tuple[str, ...] = ("NFL", "NBA", "MLB", "NHL", "WNBA", "NCAAF", "NCAAB"),
                  affiliate_ids: tuple[int, ...] = (3,), use_websocket: bool = True,
                  rest_base: str = REST_BASE, ws_url: str = WS_URL, days_ahead: int = 1,
                  timeout: float = 10.0, clock=time.time) -> None:

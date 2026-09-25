@@ -42,6 +42,7 @@ from typing import Any, Awaitable, Callable, Iterable, Literal, Optional, Union
 from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
 
 from novig_private import parse_slips
+from team_normalizer import canonical_league
 from ws_base import (  # re-exported: tests and callers use novig_feed.RECONNECT_DELAY_SECONDS etc.
     OPEN_TIMEOUT_SECONDS,
     PING_INTERVAL_SECONDS,
@@ -66,8 +67,8 @@ ORDERS_SUBSCRIBE = {"event": "subscribe", "channel": "orders"}
 SUBSCRIBE_PAYLOAD = TAPE_SUBSCRIBE        # paper mode needs only public prices
 
 # Two-way markets only. Soccer is NOT here on purpose: its moneyline has a draw (3 outcomes), so buying both
-# teams is not a hedge. College leagues need a team list built from the venues' own names first.
-TRACKED_LEAGUES = frozenset({"NFL", "NBA", "MLB", "NHL", "WNBA"})
+# teams is not a hedge. College teams are matched game by game (team_normalizer.register_game).
+TRACKED_LEAGUES = frozenset({"NFL", "NBA", "MLB", "NHL", "WNBA", "NCAAF", "NCAAB"})
 MAX_BOOK_LEVELS = 10                     # ask levels passed to the engine per update
 MARKET_TYPE_ALIASES = {
     "spread": "spread", "point_spread": "spread", "pointspread": "spread", "handicap": "spread", "ats": "spread",
@@ -149,7 +150,7 @@ class MarketInfo(BaseModel):
     @field_validator("league")
     @classmethod
     def _upper_league(cls, v: str) -> str:
-        return v.strip().upper()
+        return canonical_league(v)          # "CFB" / "College Football" -> "NCAAF" etc.
 
     @field_validator("market_type")
     @classmethod
@@ -183,6 +184,11 @@ class MarketUpdate(BaseModel):
     ask_levels: list[tuple[float, float]] = Field(default_factory=list)
     start_time: Optional[float] = None                        # scheduled game start (epoch seconds, UTC)
     received_at: float = Field(default_factory=time.time)
+
+    @field_validator("league")
+    @classmethod
+    def _canonical_league(cls, v: str) -> str:
+        return canonical_league(v)
 
     @classmethod
     def from_info(cls, info: MarketInfo, **top_of_book: Any) -> "MarketUpdate":
