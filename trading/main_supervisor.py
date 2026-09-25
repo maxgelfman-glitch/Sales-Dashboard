@@ -170,6 +170,10 @@ MIN_PARTIAL_HEDGE_CONTRACTS = 10       # smaller partial hedges are not worth an
 # Novig is believed to fill a taker at its limit). "single": one order limited at the worst level (only right
 # if the exchange fills cheaper levels first). "off": best level only.
 MULTI_LEVEL_MODES = ("staggered", "single", "off")
+# Leagues where venues' settlement rules differ in ways that break a "locked" pair across venues. Tennis: a
+# retirement mid-match is void on some venues and a win for the opponent on others, so both legs could lose.
+# Directional trades and same-venue hedges are still allowed.
+NO_CROSS_VENUE_HEDGE_LEAGUES = frozenset({"TENNIS"})
 # A game's moneyline, spread and total are strongly correlated: cap the UNHEDGED money per game across all
 # of its markets (hedged slices are risk-free and do not count).
 GAME_EXPOSURE_LIMIT_USD = 1_000.0
@@ -951,6 +955,8 @@ class Supervisor:
         for other in self._pair_candidates(update, key, side):
             if self.live and (other.venue not in self.live_venues() or not self._live_ready(other.venue)):
                 continue
+            if league in NO_CROSS_VENUE_HEDGE_LEAGUES and other.venue != update.venue:
+                continue
             worst_payout = 1.0
             if league == "NFL" and mtype == "moneyline":
                 worst_payout = min(1.0, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
@@ -1009,6 +1015,11 @@ class Supervisor:
             self.stats["lock_blocked"] += 1
             log.info("POSITION_LOCK live: no hedge on %s (%s)", key,
                      "first leg still filling" if first.pending else "Kalshi is data-only in live mode")
+            return
+        if key[0] in NO_CROSS_VENUE_HEDGE_LEAGUES and update.venue != first.venue:
+            self.stats["lock_blocked"] += 1
+            log.info("POSITION_LOCK %s: no cross-venue hedge in %s (settlement rules differ, e.g. retirements)",
+                     key, key[0])
             return
         ok, reason, contracts, cost, fee, scenarios, avg_price, limit_price = self._arb_check(held, update, key)
         if not ok:

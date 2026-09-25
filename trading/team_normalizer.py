@@ -235,11 +235,13 @@ def normalize_outcome(raw: object, league: Optional[str] = None) -> Optional[str
 # aliases when EXACTLY ONE pairing of the two teams matches. A name is never matched if the longer spelling
 # adds a school-distinguishing word ("Georgia" never matches "Georgia State" or "Georgia Tech").
 # Anything ambiguous stays unmapped, and an unmapped game is simply not traded.
-DYNAMIC_LEAGUES = frozenset({"NCAAF", "NCAAB"})
+DYNAMIC_LEAGUES = frozenset({"NCAAF", "NCAAB", "TENNIS"})
 LEAGUE_ALIASES = {
     "CFB": "NCAAF", "NCAAFB": "NCAAF", "NCAA FOOTBALL": "NCAAF", "COLLEGE FOOTBALL": "NCAAF", "NCAA_FOOTBALL": "NCAAF",
     "CBB": "NCAAB", "NCAAM": "NCAAB", "NCAAMB": "NCAAB", "NCAA BASKETBALL": "NCAAB", "COLLEGE BASKETBALL": "NCAAB",
     "NCAA_BASKETBALL": "NCAAB", "MCBB": "NCAAB",
+    # ATP and WTA share one league: some venues only say "Tennis"; player names never collide across tours
+    "ATP": "TENNIS", "WTA": "TENNIS", "ATP TENNIS": "TENNIS", "WTA TENNIS": "TENNIS", "TENNIS": "TENNIS",
 }
 DISTINGUISHING = frozenset({"state", "tech", "southern", "northern", "eastern", "western", "central", "north", "south",
                             "east", "west", "a", "and", "m", "international", "atlantic", "christian", "methodist",
@@ -275,6 +277,38 @@ def _school_tokens(name: str) -> tuple[frozenset[str], Optional[str]]:
     if toks and toks[-1] == "st":
         toks[-1] = "state"                      # "Ohio St" -> "ohio state"; a leading "St" stays (Saint)
     return frozenset(toks), qualifier
+
+
+def player_names_match(a: str, b: str) -> bool:
+    """
+    Tennis players: 'Carlos Alcaraz' = 'C. Alcaraz' = 'Alcaraz C.' = 'Alcaraz, Carlos' = 'Alcaraz'.
+    Every full word of the shorter spelling must appear in the longer one, and every initial must be the first
+    letter of a remaining word. Hyphenated names split ('Auger-Aliassime').
+    """
+    def parts(name: str) -> tuple[list[str], list[str]]:
+        toks = clean(name.replace("-", " ").replace(",", " ")).split()
+        return [t for t in toks if len(t) > 1], [t for t in toks if len(t) == 1]
+    wa, ia = parts(a)
+    wb, ib = parts(b)
+    if not wa or not wb:
+        return False
+    # the "shorter" spelling has fewer full words (initials stand in for words it leaves out)
+    a_short = (len(wa), -len(ia)) <= (len(wb), -len(ib))
+    (ws, is_), (wl, il) = ((wa, ia), (wb, ib)) if a_short else ((wb, ib), (wa, ia))
+    if not set(ws) <= set(wl):
+        return False
+    rest = [t for t in wl if t not in ws]
+    for initial in is_:
+        hit = next((t for t in rest if t[0] == initial), None)
+        if hit is None and initial not in il:
+            return False
+        if hit is not None:
+            rest.remove(hit)
+    return True
+
+
+def names_match(league: str, a: str, b: str) -> bool:
+    return player_names_match(a, b) if canonical_league(league) == "TENNIS" else college_names_match(a, b)
 
 
 def college_names_match(a: str, b: str) -> bool:
@@ -320,7 +354,7 @@ def _dynamic_resolve(raw: str, league: str) -> Optional[str]:
         return hit
     # not seen verbatim: accept only a UNIQUE conservative match among the league's registered teams
     teams = {t for g in _dyn_games.get(league, []) for t in g[:2]}
-    matches = {t for t in teams if college_names_match(raw, t)}
+    matches = {t for t in teams if names_match(league, raw, t)}
     if len(matches) == 1:
         canonical = matches.pop()
         aliases[clean(raw)] = canonical
@@ -343,8 +377,8 @@ def register_game(league: str, home: str, away: str, start: Optional[float] = No
     for ch, ca, cstart in games:
         if start is not None and cstart is not None and abs(start - cstart) > window_s:
             continue
-        straight = college_names_match(home, ch) and college_names_match(away, ca)
-        swapped = college_names_match(home, ca) and college_names_match(away, ch)
+        straight = names_match(lg, home, ch) and names_match(lg, away, ca)
+        swapped = names_match(lg, home, ca) and names_match(lg, away, ch)
         if straight and swapped:
             continue                            # both pairings fit: ambiguous, never guess
         if straight:

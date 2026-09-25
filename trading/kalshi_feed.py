@@ -47,7 +47,7 @@ import aiohttp
 from execution import cents_to_american, cents_to_probability
 from novig_feed import MAX_BOOK_LEVELS, MarketInfo, MarketRegistry, MarketUpdate, UpdateCallback
 from novig_rest import parse_start_time
-from team_normalizer import normalize_team_name
+from team_normalizer import DYNAMIC_LEAGUES, canonical_league, names_match, normalize_team_name
 from ws_base import (
     OPEN_TIMEOUT_SECONDS,
     PING_INTERVAL_SECONDS,
@@ -67,7 +67,8 @@ WS_SIGN_PATH = "/trade-api/ws/v2"
 # Game-winner series per league. MLB/NHL/WNBA tickers follow the same KX<LEAGUE>GAME pattern (assumed; a
 # wrong ticker simply returns no markets). Override with KALSHI_SERIES="KXNBAGAME:NBA,...".
 DEFAULT_SERIES = {"KXNBAGAME": "NBA", "KXNFLGAME": "NFL", "KXMLBGAME": "MLB", "KXNHLGAME": "NHL",
-                  "KXWNBAGAME": "WNBA", "KXNCAAFGAME": "NCAAF", "KXNCAAMBGAME": "NCAAB"}
+                  "KXWNBAGAME": "WNBA", "KXNCAAFGAME": "NCAAF", "KXNCAAMBGAME": "NCAAB",
+                  "KXATPMATCH": "TENNIS", "KXWTAMATCH": "TENNIS"}
 
 log = logging.getLogger("trading.kalshi")
 
@@ -339,19 +340,34 @@ def parse_kalshi_markets(payload: Any, league: str) -> list[MarketInfo]:
             if str(m.get("status", "open")).lower() in {"open", "active", "initialized"}:
                 by_event.setdefault(m["event_ticker"], []).append(m)
     rows: list[MarketInfo] = []
+    dynamic = canonical_league(league) in DYNAMIC_LEAGUES
     for event_ticker, ms in by_event.items():
         teams = _matchup(ms[0].get("title", ""))
+        subtitles = [m.get("yes_sub_title") or m.get("subtitle") or "" for m in ms]
+        if dynamic and len(ms) == 2 and all(subtitles):
+            fits = teams is not None and all(any(names_match(league, sub, t) for t in teams) for sub in subtitles)
+            if not fits:
+                teams = (subtitles[0], subtitles[1])   # tennis titles are questions: the two YES names ARE the players
         if teams is None:
             log.info("BOOTSTRAP kalshi %s: cannot read teams from %r", event_ticker, ms[0].get("title"))
             continue
-        home = normalize_team_name(teams[0], league)
-        away = normalize_team_name(teams[1], league)
+        if dynamic:
+            # college / tennis: keep the venue's own spellings; the supervisor matches them game by game
+            home, away = teams[0].strip(), teams[1].strip()
+        else:
+            home = normalize_team_name(teams[0], league)
+            away = normalize_team_name(teams[1], league)
         if home is None or away is None:
             log.info("BOOTSTRAP kalshi %s: unmapped teams %r", event_ticker, teams)
             continue
         tickers = [m["ticker"] for m in ms]
         for m in ms:
-            team = normalize_team_name(m.get("yes_sub_title") or m.get("subtitle") or "", league)
+            raw = m.get("yes_sub_title") or m.get("subtitle") or ""
+            if dynamic:
+                hits = [t for t in (home, away) if names_match(league, raw, t)]
+                team = hits[0] if len(hits) == 1 else None
+            else:
+                team = normalize_team_name(raw, league)
             if team not in {home, away}:
                 continue
             sibling = next((t for t in tickers if t != m["ticker"]), None) if len(tickers) == 2 else None

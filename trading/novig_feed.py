@@ -68,7 +68,7 @@ SUBSCRIBE_PAYLOAD = TAPE_SUBSCRIBE        # paper mode needs only public prices
 
 # Two-way markets only. Soccer is NOT here on purpose: its moneyline has a draw (3 outcomes), so buying both
 # teams is not a hedge. College teams are matched game by game (team_normalizer.register_game).
-TRACKED_LEAGUES = frozenset({"NFL", "NBA", "MLB", "NHL", "WNBA", "NCAAF", "NCAAB"})
+TRACKED_LEAGUES = frozenset({"NFL", "NBA", "MLB", "NHL", "WNBA", "NCAAF", "NCAAB", "TENNIS"})
 MAX_BOOK_LEVELS = 10                     # ask levels passed to the engine per update
 MARKET_TYPE_ALIASES = {
     "spread": "spread", "point_spread": "spread", "pointspread": "spread", "handicap": "spread", "ats": "spread",
