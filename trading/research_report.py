@@ -79,6 +79,68 @@ def _key(row: dict) -> tuple:
 # ---------------------------------------------------------------------------
 # Sections (each returns plain data so tests can check the numbers)
 # ---------------------------------------------------------------------------
+SIZE_BUCKETS = ((1000, "$1,000+"), (250, "$250-1,000"), (50, "$50-250"), (0, "< $50"))
+
+
+def size_bucket(usd: Optional[float]) -> str:
+    for floor, label in SIZE_BUCKETS:
+        if (usd or 0) >= floor:
+            return label
+    return "< $50"
+
+
+def execution_summary(rows: list[dict]) -> dict:
+    """
+    Per venue and order size: how much of what we asked for actually filled, how often we got nothing, the price
+    paid versus the price seen, and speed. Simulated and live orders are reported separately.
+    """
+    cells = defaultdict(list)
+    for r in rows:
+        if r["kind"] == "EXECUTION":
+            cells[("sim" if r.get("simulated") else "LIVE", r.get("venue"), size_bucket(r.get("requested_usd")))].append(r)
+    out = {}
+    for key, rs in cells.items():
+        req = sum(r.get("requested") or 0 for r in rs)
+        got = sum(r.get("filled") or 0 for r in rs)
+        slips = [r["slippage_cents"] for r in rs if r.get("slippage_cents") is not None]
+        out[key] = {"orders": len(rs), "fill_ratio": got / req if req else None,
+                    "missed": sum((r.get("filled") or 0) <= 0 for r in rs) / len(rs),
+                    "slippage_cents": _mean(slips), "ack_ms": _median(r.get("ack_ms") for r in rs),
+                    "fill_ms": _median(r.get("fill_ms") for r in rs),
+                    "requested_usd": sum(r.get("requested_usd") or 0 for r in rs),
+                    "filled_usd": sum(r.get("filled_usd") or 0 for r in rs)}
+    return out
+
+
+def survival_summary(rows: list[dict]) -> dict:
+    """How long +EV prices stayed available (ms): the share that outlived realistic reaction times."""
+    surv = [r["survival_ms"] for r in rows if r["kind"] == "EDGE_SURVIVAL" and r.get("survival_ms") is not None]
+    if not surv:
+        return {"edges": 0}
+    n = len(surv)
+    return {"edges": n, "median_ms": _median(surv),
+            **{f"over_{t}ms": sum(x > t for x in surv) / n for t in (250, 500, 1000, 5000)}}
+
+
+def projected_monthly(rows: list[dict]) -> dict:
+    """
+    Expected profit of what actually FILLED (edge x filled cost for directional trades, locked profit for pairs /
+    hedges), per day of data, x 30. Simulated fills already paid latency, depth haircuts and misses.
+    This is expected value, not settled P&L: CLV and settlements say whether the edge was real.
+    """
+    ex = [r for r in rows if r["kind"] == "EXECUTION"]
+    if not ex:
+        return {"days": 0}
+    days = max(1.0, (max(r["ts"] for r in ex) - min(r["ts"] for r in ex)) / 86400)
+    by_kind = defaultdict(float)
+    for r in ex:
+        by_kind["pairs_and_hedges" if r.get("kind") == "ARB_HEDGE" else "directional"] += r.get("expected_profit_usd") or 0
+    total = sum(by_kind.values())
+    return {"days": round(days, 2), "expected_profit_usd": round(total, 2), "per_day": round(total / days, 2),
+            "per_month": round(total / days * 30, 2), "by_kind": dict(by_kind),
+            "filled_usd_per_day": round(sum(r.get("filled_usd") or 0 for r in ex) / days, 2)}
+
+
 def decisions_summary(rows: list[dict]) -> dict:
     dec = [r for r in rows if r["kind"] == "DECISION"]
     edges = [r["edge"] for r in dec if r.get("edge") is not None]
@@ -328,6 +390,42 @@ def build_report(rows: list[dict]) -> str:
     for venue, cells in sorted(dep.items()):
         out.append("  " + f"{venue:<10}" + "".join(
             f"{_fmt(cells[b]['median_usd'], ',.0f') if b in cells else '-':>10}" for b in BUCKET_ORDER))
+
+    ex = execution_summary(rows)
+    out += ["", "[EXECUTION]  (what we asked for vs what we got; 'sim' = simulated delay + depth haircut)"]
+    if ex:
+        out.append(f"  {'mode':<5} {'venue':<9} {'size':<11} {'orders':>6} {'filled':>7} {'missed':>7} "
+                   f"{'slip':>7} {'ack':>7} {'fill':>7}")
+        for (mode, venue, size), v in sorted(ex.items(), key=lambda kv: (kv[0][0], kv[0][1],
+                                                                           [b for _, b in SIZE_BUCKETS].index(kv[0][2]))):
+            out.append(f"  {mode:<5} {venue:<9} {size:<11} {v['orders']:>6} "
+                       f"{_fmt(v['fill_ratio'] and v['fill_ratio'] * 100, '.0f'):>6}% {v['missed'] * 100:>6.0f}% "
+                       f"{_fmt(v['slippage_cents'], '+.2f'):>6}c {_fmt(v['ack_ms'], '.0f'):>5}ms "
+                       f"{_fmt(v['fill_ms'], '.0f'):>5}ms")
+        out.append("  (if 'filled' collapses as size grows, the displayed depth is not really there at size)")
+    else:
+        out.append("  no orders yet (paper needs PAPER_EXECUTION=simulated, the default)")
+
+    sv = survival_summary(rows)
+    out += ["", "[EDGE SURVIVAL]  (how long a +EV price stayed available after we first saw it)"]
+    if sv["edges"]:
+        out.append(f"  edges {sv['edges']:,}   median {sv['median_ms']:.0f}ms   lasted >250ms {sv['over_250ms']:.0%}   "
+                   f">500ms {sv['over_500ms']:.0%}   >1s {sv['over_1000ms']:.0%}   >5s {sv['over_5000ms']:.0%}")
+        out.append("  (compare with your real order round-trip from the LIVE execution rows: edges that die faster are "
+                   "not catchable)")
+    else:
+        out.append("  no BET decisions yet")
+
+    pm = projected_monthly(rows)
+    out += ["", "[PROJECTED MONTHLY]  (expected profit of what actually filled, per day x 30)"]
+    if pm["days"]:
+        out.append(f"  over {pm['days']} day(s): ${pm['expected_profit_usd']:,.2f} expected   "
+                   f"= ${pm['per_day']:,.2f}/day   = ${pm['per_month']:,.0f}/month   "
+                   f"(filled ${pm['filled_usd_per_day']:,.0f}/day)")
+        out.append("  by source: " + ", ".join(f"{k} ${v:,.2f}" for k, v in pm["by_kind"].items()))
+        out.append("  (expected value, before data costs and taxes; CLV above says whether the edges were real)")
+    else:
+        out.append("  no filled orders yet")
 
     g = gap_summary(rows)
     out += ["", "[LOCKED-PROFIT GAPS]  (buy both sides, profit after fees in every outcome incl. ties)",

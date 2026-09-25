@@ -259,6 +259,12 @@ class LiveOrder(BaseModel):
     fill_mode: str = "cumulative"           # Kalshi fills arrive as increments
     exchange_confirmed_zero: bool = False    # the exchange's own order record says nothing filled
     fees: float = 0.0                        # Kalshi taker fees included in fill_cost
+    expected_price: Optional[float] = None   # best ask when we decided (slippage is measured against it)
+    edge: Optional[float] = None
+    locked_per_contract: Optional[float] = None   # pairs / hedges: profit per contract if both legs fill
+    sent_at: Optional[float] = None
+    acked_at: Optional[float] = None
+    first_fill_at: Optional[float] = None
     filled: float = 0.0
     fill_cost: float = 0.0
     done: bool = False
@@ -405,6 +411,9 @@ class Supervisor:
         kalshi_positions_client=None,
         arb_pairs_enabled: bool = True,
         prophetx_feed=None,
+        paper_execution: str = "instant",
+        sim_latency_ms: float = 500.0,
+        sim_depth_haircut: float = 0.5,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -439,6 +448,17 @@ class Supervisor:
         self.kalshi_live = bool(live and kalshi_gateway is not None)
         self.kalshi_positions_client = kalshi_positions_client
         self.arb_pairs_enabled = arb_pairs_enabled      # buy BOTH sides when they lock a profit (no sharp needed)
+        # ---- realistic paper execution: the live order path against a simulated exchange ----
+        if paper_execution not in {"instant", "simulated"}:
+            raise ValueError("paper_execution must be 'instant' or 'simulated'")
+        self.sim = paper_execution == "simulated" and not live
+        self.sim_gateways: dict[str, Any] = {}
+        if self.sim:
+            from sim_exchange import SimulatedGateway
+            self.sim_gateways = {v: SimulatedGateway(v, self._latest_for, self.on_fill_slip, sim_latency_ms,
+                                                     sim_depth_haircut) for v in ("novig", "kalshi", "prophetx")}
+        self.sim_latency_ms, self.sim_depth_haircut = sim_latency_ms, sim_depth_haircut
+        self._edge_watch: dict[str, dict] = {}          # outcome_id -> open edge-survival measurement
         # ProphetX: price feed for paper trading and research only (never in live_venues until verified)
         self.prophetx = prophetx_feed
         if self.prophetx is not None:
@@ -531,6 +551,8 @@ class Supervisor:
         self._index_start_times()
         self._halt_alerted = False
         self._load_today_pnl()
+        if self.sim:                                    # the simulated exchange always reports its fills
+            self.orders_channel_confirmed = self.kalshi_fills_confirmed = True
 
     # backwards-compatible alias used by older callers/tests
     @property
@@ -619,17 +641,32 @@ class Supervisor:
             log.critical("LIVE novig socket down (prices AND executions): new orders halted; fills during the "
                          "outage may be missed — reconcile with the Novig order history if this persists")
 
+    @property
+    def executing(self) -> bool:
+        """True when orders go through the live order path: live trading, or simulated paper execution."""
+        return self.live or self.sim
+
+    def _latest_for(self, venue: str, outcome_id: str):
+        feed = {"novig": self.feed, "kalshi": self.kalshi, "prophetx": self.prophetx}.get(venue)
+        return None if feed is None else feed.latest.get(outcome_id)
+
     def _live_ready(self, venue: str = "novig") -> bool:
         """Live orders only while that venue's socket (prices + our executions) is connected."""
+        if self.sim:
+            return True
         if venue == "kalshi":
             return (self.kalshi_live and self.synced and self.kalshi is not None
                     and self.kalshi.connected.is_set())
         return self.live and self.synced and self.feed.connected.is_set()
 
     def live_venues(self) -> set[str]:
+        if self.sim:
+            return {"novig", "kalshi", "prophetx"}
         return {"novig", "kalshi"} if self.kalshi_live else {"novig"}
 
     def _gateway(self, venue: str):
+        if self.sim:
+            return self.sim_gateways[venue]
         return self.kalshi_gateway if venue == "kalshi" else self.order_gateway
 
     def record_live_plan(self) -> None:
@@ -732,6 +769,8 @@ class Supervisor:
             self.last_price_change[(update.venue, update.outcome_id)] = time.time()
         if self.gaps is not None:
             self._research_gap(update, key, side)
+        if self._edge_watch:
+            self._check_edge_watch(update)
 
         if not self.live and update.venue == "novig" and self.maker is not None and self.maker.quotes:
             await self._simulate_maker_fills(update, key)
@@ -783,6 +822,8 @@ class Supervisor:
         decision = await self._evaluate(update.venue, update.price, sharp_q, update.line, label)
         if self.research is not None:
             self._research_decision(update, key, side, decision, blocked=blocked if shadow else None)
+            if decision.action == "BET":
+                self._watch_edge(update, decision)
         if shadow:
             self.stats["shadow_decisions"] += 1
             return
@@ -832,7 +873,7 @@ class Supervisor:
         reserve = round(contracts * limit_price + fee, 2) if self._single_limit(used) else stake
         if not self._kill_switch_allows(reserve, update.outcome_id):
             return
-        if self.live:
+        if self.executing:
             await self._send_live_taker("DIRECTIONAL", update, key, side, contracts, reserve, decision.edge,
                                         decision.capped, limit_price=limit_price, levels=used)
             return
@@ -861,7 +902,7 @@ class Supervisor:
 
     def _single_limit(self, used: list) -> bool:
         """True when one live order limited at the deepest level will be sent (reserve at that limit)."""
-        return self.live and len(used) > 1 and self.multi_level_mode == "single"
+        return self.executing and len(used) > 1 and self.multi_level_mode == "single"
 
     @staticmethod
     def _fit_worst_case(venue: str, used: list[tuple[float, int]], cap: float) -> list[tuple[float, int]]:
@@ -974,11 +1015,11 @@ class Supervisor:
         if update.price is None or self._loss_halted():
             return False
         league, _, _, mtype = key
-        if self.live and (update.venue not in self.live_venues() or not self._live_ready(update.venue)):
+        if self.executing and (update.venue not in self.live_venues() or not self._live_ready(update.venue)):
             return False
         best = None
         for other in self._pair_candidates(update, key, side):
-            if self.live and (other.venue not in self.live_venues() or not self._live_ready(other.venue)):
+            if self.executing and (other.venue not in self.live_venues() or not self._live_ready(other.venue)):
                 continue
             if league in NO_CROSS_VENUE_HEDGE_LEAGUES and other.venue != update.venue:
                 continue
@@ -1015,16 +1056,18 @@ class Supervisor:
                  "outcome", key, update.venue, side, update.price, other.venue, other_side, other.price, n,
                  cost_a + cost_b, locked)
         self.stats["arb_pairs"] += 1
-        if self.live:
+        if self.executing:
             self._ledger("ARB_PAIR", game=list(key), legs=[[update.venue, update.outcome_id, update.price],
                                                            [other.venue, other.outcome_id, other.price]],
                          contracts=n, locked_profit_usd=locked)
-            await self._send_live_taker("DIRECTIONAL", update, key, side, n, cost_a, None, False)
+            await self._send_live_taker("DIRECTIONAL", update, key, side, n, cost_a, None, False,
+                                        locked_per_contract=locked / n)
             held = self.positions.get(key)
             if held is None:                              # first leg rejected / not sent: nothing to pair
                 return True
             held.hedged = True                            # the second leg is on its way
-            await self._send_live_taker("ARB_HEDGE", other, key, other_side, n, cost_b, None, False, held=held)
+            await self._send_live_taker("ARB_HEDGE", other, key, other_side, n, cost_b, None, False, held=held,
+                                        locked_per_contract=locked / n)
             return True
         leg_a = self._record("ARB_PAIR", update, side, n, cost_a, fee_a, None, False)
         leg_b = self._record("ARB_PAIR", other, other_side, n, cost_b, fee_b, None, False)
@@ -1036,7 +1079,7 @@ class Supervisor:
     async def _try_arbitrage(self, update: MarketUpdate, key: GameKey, side: str, held: MarketPosition) -> None:
         first = held.primary
         venues = self.live_venues()
-        if self.live and (update.venue not in venues or first.pending or first.venue not in venues):
+        if self.executing and (update.venue not in venues or first.pending or first.venue not in venues):
             self.stats["lock_blocked"] += 1
             log.info("POSITION_LOCK live: no hedge on %s (%s)", key,
                      "first leg still filling" if first.pending else "Kalshi is data-only in live mode")
@@ -1061,10 +1104,11 @@ class Supervisor:
         reserve = round(contracts * limit_price + fee, 2) if self._single_limit(self._last_hedge_levels) else cost
         if not self._kill_switch_allows(reserve, update.outcome_id):
             return
-        if self.live:
+        if self.executing:
             held.hedged = True        # blocks further hedges while this one fills
             await self._send_live_taker("ARB_HEDGE", update, key, side, contracts, reserve, None, False, held=held,
-                                        limit_price=limit_price, levels=self._last_hedge_levels)
+                                        limit_price=limit_price, levels=self._last_hedge_levels,
+                                        locked_per_contract=round(min(scenarios.values()) / contracts, 6))
             return
         self._record("ARB_HEDGE", update, side, contracts, cost, fee, None, False, price=avg_price)
         held.legs.append(self.orders[-1])
@@ -1177,7 +1221,8 @@ class Supervisor:
     async def _send_live_taker(self, kind: str, update: MarketUpdate, key: GameKey, side: str, contracts: int,
                                stake: float, edge: Optional[float], capped: bool,
                                held: Optional[MarketPosition] = None, limit_price: Optional[float] = None,
-                               levels: Optional[list[tuple[float, int]]] = None) -> None:
+                               levels: Optional[list[tuple[float, int]]] = None,
+                               locked_per_contract: Optional[float] = None) -> None:
         """
         Reserve exposure + lock the game, then send marketable LIMIT order(s) for one position leg.
 
@@ -1218,8 +1263,10 @@ class Supervisor:
         else:
             payloads = [order_body(update.outcome_id, "buy", round(p * 100, 4), n, cid)
                         for (p, n), cid in zip(tranches, cids)]
+        sent_at = time.time()
         results = await asyncio.gather(*(gateway.place_limit(update.outcome_id, "buy", round(p * 100, 4), n, cid)
                                          for (p, n), cid in zip(tranches, cids)), return_exceptions=True)
+        acked_at = time.time()
         placed = []
         for (p, n), payload, res in zip(tranches, payloads, results):
             if isinstance(res, BaseException):   # a rejected order must release everything it reserved
@@ -1242,7 +1289,10 @@ class Supervisor:
             self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id,
                                               key=key, requested=n, limit_price=p, leg_id=leg.order_id,
                                               expected_levels=[] if staggered else (levels or []), venue=venue,
-                                              fill_mode="incremental" if venue == "kalshi" else self.fill_volume_mode)
+                                              fill_mode="incremental" if venue == "kalshi" else self.fill_volume_mode,
+                                              expected_price=update.price, edge=edge,
+                                              locked_per_contract=locked_per_contract, sent_at=sent_at,
+                                              acked_at=acked_at)
             self.stats["live_orders"] += 1
             order_log.info("ORDER LIVE %s id=%s %s %s x%d @ %.4f%s", kind, oid, update.outcome_id, side, n, p,
                            f" (tranche of leg #{leg.order_id})" if len(tranches) > 1 else f" reserved=${stake:.2f}")
@@ -1329,6 +1379,10 @@ class Supervisor:
                 return
             lo = lo.model_copy(update=dict(          # the whole leg, seen as one order from here on
                 exchange_confirmed_zero=all(k.exchange_confirmed_zero for k in kids),
+                sent_at=min((k.sent_at for k in kids if k.sent_at), default=None),
+                acked_at=max((k.acked_at for k in kids if k.acked_at), default=None),
+                first_fill_at=min((k.first_fill_at for k in kids if k.first_fill_at), default=None),
+                fees=sum(k.fees for k in kids),
                 exchange_order_id=",".join(k.exchange_order_id for k in kids),
                 requested=sum(k.requested for k in kids), filled=sum(k.filled for k in kids),
                 fill_cost=sum(k.fill_cost for k in kids), limit_price=max(k.limit_price for k in kids),
@@ -1354,6 +1408,7 @@ class Supervisor:
                 pos.hedged = pos.unhedged() <= 0 and len(pos.legs) > 1
             log.info("LIVE_DONE %s %s: nothing filled (%s); lock/reservation released", lo.kind,
                      lo.exchange_order_id, reason)
+            self._research_execution(lo, leg, None)
             return
         if lo.kind == "ARB_HEDGE" and pos is not None:
             pos.hedged = pos.unhedged() <= 0           # a partial fill leaves room for another hedge
@@ -1369,6 +1424,7 @@ class Supervisor:
             self._ledger("POSITION_RESIDUAL", game=list(lo.key), over_hedged_contracts=-pos.unhedged())
         if self.research is not None:
             self._research_entry(leg, lo.key)
+        self._research_execution(lo, leg, pos)
         self._ledger("DONE", exchange_order_id=lo.exchange_order_id, filled=lo.filled, cost_usd=round(lo.fill_cost, 2),
                      reason=reason, avg_fill_price=round(lo.fill_cost / lo.filled, 6),
                      expected_avg_price=_sweep_avg(lo.expected_levels, lo.filled) if lo.expected_levels else None)
@@ -1430,6 +1486,8 @@ class Supervisor:
                 price = slip.price_cents / 100 if lo.maker_side != "sell" else 1 - slip.price_cents / 100
             else:
                 price = lo.limit_price
+            if lo.first_fill_at is None:
+                lo.first_fill_at = time.time()
             lo.filled += delta
             lo.fill_cost += delta * price
             if lo.venue == "kalshi":                   # taker fee per fill, rounded up: never understated
@@ -1707,6 +1765,68 @@ class Supervisor:
             moved_last=mover, sharp_move_age_s=move_age,
             minutes_to_start=self.minutes_to_start(key[:3]), blocked=blocked, fair_by_method=fair_by_method,
             sharp_source=None if sharp is None else sharp.source)
+
+    def _research_execution(self, lo: LiveOrder, leg: PaperOrder, pos: Optional[MarketPosition]) -> None:
+        """
+        One EXECUTION row per finished order (live or simulated): how much of what we asked for we actually got,
+        at what price versus the price we saw, how fast, and the expected profit of what filled.
+        """
+        if self.research is None:
+            return
+        filled = lo.filled
+        avg = (lo.fill_cost - lo.fees) / filled if filled else None
+        requested_usd = round(lo.requested * (lo.expected_price or lo.limit_price), 2)
+        if lo.kind == "DIRECTIONAL" and lo.edge is not None:
+            expected = round(lo.edge * lo.fill_cost, 2) if lo.locked_per_contract is None else 0.0
+        elif lo.kind == "ARB_HEDGE" and lo.locked_per_contract is not None and pos is not None:
+            expected = round(lo.locked_per_contract * min(filled, pos.primary.contracts), 2)
+        else:
+            expected = 0.0
+        ms = lambda a, b: None if a is None or b is None else round((b - a) * 1000, 1)  # noqa: E731
+        self.research.write(
+            "EXECUTION", simulated=self.sim, venue=lo.venue, kind=lo.kind, outcome_id=lo.outcome_id,
+            game=list(lo.key), requested=lo.requested, filled=filled,
+            fill_ratio=round(filled / lo.requested, 4) if lo.requested else None, requested_usd=requested_usd,
+            filled_usd=round(lo.fill_cost, 2), expected_price=lo.expected_price, limit_price=lo.limit_price,
+            avg_price=None if avg is None else round(avg, 6),
+            slippage_cents=None if avg is None or lo.expected_price is None else round((avg - lo.expected_price) * 100, 3),
+            ack_ms=ms(lo.sent_at, lo.acked_at), fill_ms=ms(lo.sent_at, lo.first_fill_at), edge=lo.edge,
+            expected_profit_usd=expected, minutes_to_start=self.minutes_to_start(tuple(lo.key)[:3]))
+
+    # ---- edge survival: how long does an opportunity stay available? ----
+    EDGE_WATCH_MAX_S = 120.0
+
+    def _watch_edge(self, update: MarketUpdate, decision) -> None:
+        if self.research is None or update.price is None or update.outcome_id in self._edge_watch:
+            return
+        self._edge_watch[update.outcome_id] = dict(
+            t0=time.time(), price=update.price, depth=self._depth_at(update, update.price), venue=update.venue,
+            edge=decision.edge, game=list(self._canonical(update)[0]) if self._canonical(update) else None)
+
+    @staticmethod
+    def _depth_at(update: MarketUpdate, price: float) -> float:
+        levels = update.ask_levels or ([(update.price, update.available_volume)] if update.price else [])
+        return round(sum(q for p, q in levels if p <= price + 1e-9), 2)
+
+    def _check_edge_watch(self, update: MarketUpdate) -> None:
+        w = self._edge_watch.get(update.outcome_id)
+        if w is None:
+            return
+        now = time.time()
+        depth = 0.0 if update.price is None else self._depth_at(update, w["price"])
+        if update.price is not None and update.price > w["price"] + 1e-9:
+            reason = "price moved away"
+        elif depth < 0.5 * w["depth"]:
+            reason = "more than half the size gone"
+        elif now - w["t0"] > self.EDGE_WATCH_MAX_S:
+            reason = "still there"
+        else:
+            return
+        del self._edge_watch[update.outcome_id]
+        self.research.write("EDGE_SURVIVAL", venue=w["venue"], outcome_id=update.outcome_id, game=w["game"],
+                            price=w["price"], start_depth=w["depth"], end_depth=depth, edge=w["edge"],
+                            survival_ms=round((now - w["t0"]) * 1000, 1), reason=reason,
+                            censored=reason == "still there")
 
     def _research_entry(self, leg: PaperOrder, canon_key: Optional[tuple]) -> None:
         self.research.write("ENTRY", order_id=leg.order_id, order_kind=leg.kind, venue=leg.venue, live=leg.live,
@@ -2089,7 +2209,8 @@ class Supervisor:
         closeables = {id(c): c for c in (self.poller.fetch, self.novig_rest, self.kalshi_rest, self.maker_gateway,
                                          self.order_gateway, self.positions_client, self.kalshi_gateway,
                                          self.kalshi_positions_client,
-                                         self.prophetx.client if self.prophetx is not None else None)
+                                         self.prophetx.client if self.prophetx is not None else None,
+                                         *self.sim_gateways.values())
                       if c is not None}
         for closeable in closeables.values():
             closer = getattr(closeable, "close", None)
@@ -2443,6 +2564,16 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
+    pe = (env.get("PAPER_EXECUTION") or "simulated").strip().lower()
+    if pe not in {"simulated", "instant"}:
+        raise ConfigError("PAPER_EXECUTION must be simulated (default: realistic fills) or instant")
+    try:
+        kw.update(paper_execution=pe, sim_latency_ms=float(env.get("SIM_LATENCY_MS") or 500),
+                  sim_depth_haircut=float(env.get("SIM_DEPTH_HAIRCUT") or 0.5))
+    except ValueError:
+        raise ConfigError("SIM_LATENCY_MS and SIM_DEPTH_HAIRCUT must be numbers") from None
+    if not 0 < kw["sim_depth_haircut"] <= 1 or kw["sim_latency_ms"] < 0:
+        raise ConfigError("SIM_DEPTH_HAIRCUT must be in (0, 1] and SIM_LATENCY_MS >= 0")
     kw.update(research=research_from_env(env), multi_level_mode=mode, **cutoffs_from_env(env),
               **risk_controls_from_env(env), **fair_value_from_env(env), **taker_filters_from_env(env))
     return Supervisor(feed_url=feed_url, registry=registry, token=token,
@@ -2483,6 +2614,9 @@ def describe_state(sup: Supervisor) -> dict:
             if sup.live else "paper execution"),
         "kalshi_socket": None if sup.kalshi is None else sup.kalshi.url,
         "prophetx": "off" if sup.prophetx is None else f"price feed (paper + research only) {sup.prophetx.url}",
+        "paper_execution": ("n/a (live)" if sup.live else
+                            f"SIMULATED: {sup.sim_latency_ms:g}ms delay, {sup.sim_depth_haircut:.0%} of remaining depth"
+                            if sup.sim else "instant (optimistic: full displayed size at the displayed price)"),
         "kalshi_rest": None if sup.kalshi_rest is None else sup.kalshi_rest.base_url,
         "dead_heat_venues": sorted(DEAD_HEAT_VENUES),
         "ledger": str(sup.ledger_path) if sup.ledger_path else None,
@@ -2516,6 +2650,7 @@ def format_state_report(sup: Supervisor) -> str:
     rows = [
         ("MODE", None),
         ("Trading mode", st["mode"]),
+        ("Paper execution", st["paper_execution"]),
         ("NOVIG", None),
         ("Socket (prices + executions)", st["novig_socket"]),
         ("Subscriptions", " + ".join(json.dumps(m) for m in st["subscriptions"])),
@@ -2671,7 +2806,8 @@ async def run_simulation(duration: float = 20.0, research_dir: Optional[str] = N
                      sharp_fetch=MockSharpSource(DEMO_SHARP_LINES, jitter_cents=3, latency=0.02),
                      sharp_poll_interval=1.0, heartbeat_interval=2.0,
                      maker_kwargs=dict(refresh_interval=0.5, quiet_seconds=1.0),
-                     research=ResearchRecorder(research_dir) if research_dir else None, depth_sample_s=2.0)
+                     research=ResearchRecorder(research_dir) if research_dir else None, depth_sample_s=2.0,
+                     paper_execution="simulated")
     sim = asyncio.create_task(_simulated_exchanges(novig, kalshi, duration))
     try:
         await sup.run(duration=duration + 1.0)

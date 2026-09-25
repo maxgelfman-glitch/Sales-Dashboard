@@ -138,7 +138,30 @@ Every game gets its scheduled start time from the Novig events data (Kalshi: `oc
   may be partial (at least 10 contracts); the rest of the first leg stays a directional position and can be
   hedged later.
 
-## Measuring the edge (research data)
+## Realistic paper execution and the size ladder
+Paper trading defaults to `PAPER_EXECUTION=simulated`. Every paper order goes through the **same order path
+as live trading** (reservations, tranches, fees, positions) against a simulated exchange (`sim_exchange.py`):
+* The book is only looked at `SIM_LATENCY_MS` (default 500) after the order is sent. Anything that moved or was
+  taken in between is missed.
+* Of the depth still there at our price or better, only `SIM_DEPTH_HAIRCUT` (default 50%) is ours. Depth we
+  already took stays taken until the venue re-quotes.
+* Kalshi fills at each level's price; Novig and ProphetX at the order's limit (conservative). Nothing rests.
+
+`research_report.py` then shows, per venue and order size: fill rate, how often we got nothing, the price paid
+versus the price seen, and speed ([EXECUTION]). It also shows how long +EV prices survived ([EDGE SURVIVAL]) and
+the **expected profit of what actually filled, per month** ([PROJECTED MONTHLY]).
+`PAPER_EXECUTION=instant` restores the old, optimistic behaviour.
+
+What no simulation can tell you is how much you really get at size: other traders' orders racing ours, and
+makers pulling quotes when hit. The live **size ladder** finds that out with little at risk:
+1. Canary: `LIVE_MAX_STAKE_USD=10`. Confirms orders, fills, settlement and real latency (LIVE rows in [EXECUTION]).
+2. Then $50, then $250, then $1,000 per order. Each step needs `LIVE_SCALE_APPROVED_BY` and at least ~50 live
+   orders at the current size.
+3. Move up only while the LIVE fill rate at the new size stays close to the simulated fill rate. If fills collapse
+   as size grows (asking for $1,000 and getting $15), stop at the last size that held: that is the strategy's
+   real capacity.
+
+
 On by default (`RESEARCH_ENABLED=1`, folder `RESEARCH_DIR=research`), in paper and live mode:
 ```bash
 python main_supervisor.py --simulate 60      # demo data -> logs/research/
