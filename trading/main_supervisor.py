@@ -320,8 +320,16 @@ def _sweep_avg(levels: list, contracts: float) -> float:
     return round(cost / done, 6) if done else 0.0
 
 
+PROPHETX_WIN_FEE = 0.02      # ProphetX: 2% of NET winnings on straights, charged only when the bet wins
+
+
+def win_payout(venue: str, price: float) -> float:
+    """What one winning contract bought at `price` pays after win-only fees (ProphetX 2% of net winnings)."""
+    return 1.0 - PROPHETX_WIN_FEE * (1.0 - price) if venue == "prophetx" else 1.0
+
+
 def arbitrage_scenarios(first: PaperOrder, hedge_venue: str, contracts: int, hedge_cost: float,
-                        league: str, market_type: str) -> dict[str, float]:
+                        league: str, market_type: str, hedge_price: Optional[float] = None) -> dict[str, float]:
     """
     Net P&L of the hedged slice under every way the game can settle: `contracts` of the first leg
     (its cost pro-rated) plus the hedge. With a partial hedge the rest of the first leg stays a plain
@@ -330,8 +338,10 @@ def arbitrage_scenarios(first: PaperOrder, hedge_venue: str, contracts: int, hed
     held = getattr(first, "contracts", 0) or 0
     first_cost = first.stake_usd * contracts / held if held > contracts else first.stake_usd
     total_cost = first_cost + hedge_cost
-    out = {"first_side_wins": contracts * 1.0 - total_cost,
-           "other_side_wins": contracts * 1.0 - total_cost}
+    first_pay = win_payout(getattr(first, "venue", "novig"), getattr(first, "price", 1.0))
+    hedge_pay = win_payout(hedge_venue, hedge_price if hedge_price is not None else 1.0)
+    out = {"first_side_wins": contracts * first_pay - total_cost,
+           "other_side_wins": contracts * hedge_pay - total_cost}
     if league == "NFL" and market_type == "moneyline":
         tie_payout = sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0 for v in (first.venue, hedge_venue))
         out["tie"] = contracts * tie_payout - total_cost
@@ -394,6 +404,7 @@ class Supervisor:
         kalshi_gateway=None,
         kalshi_positions_client=None,
         arb_pairs_enabled: bool = True,
+        prophetx_feed=None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -428,6 +439,11 @@ class Supervisor:
         self.kalshi_live = bool(live and kalshi_gateway is not None)
         self.kalshi_positions_client = kalshi_positions_client
         self.arb_pairs_enabled = arb_pairs_enabled      # buy BOTH sides when they lock a profit (no sharp needed)
+        # ProphetX: price feed for paper trading and research only (never in live_venues until verified)
+        self.prophetx = prophetx_feed
+        if self.prophetx is not None:
+            self.prophetx.on_update = self.on_market_update
+            self.prophetx.on_state_change = self.on_feed_state
         self.kalshi_fills_confirmed = False            # set by the first Kalshi fill message of the session
         self.session_tag = session_tag()
         if self.kalshi_live and self.kalshi is not None:
@@ -499,6 +515,8 @@ class Supervisor:
             "novig_feed": self.feed.run, "heartbeat": self._heartbeat_loop}
         if self.sharp_enabled:
             self._task_factories["sharp_poller"] = self.poller.run
+        if prophetx_feed is not None:
+            self._task_factories["prophetx_feed"] = prophetx_feed.run
         if self.kalshi is not None:
             self._task_factories["kalshi_feed"] = self.kalshi.run
         if self.maker is not None:
@@ -697,6 +715,9 @@ class Supervisor:
                  "none" if update.price is None else f"{update.price:.4f}", update.available_volume,
                  "none" if update.best_bid is None else f"{update.best_bid:.4f}")
 
+        if update.venue == "prophetx" and update.league in DYNAMIC_LEAGUES:
+            # college/tennis on ProphetX: only games Novig or Kalshi also list are worth matching
+            register_game(update.league, update.home_team, update.away_team, update.start_time, create=False)
         canon = self._canonical(update)
         if canon is None:
             self.stats["unmapped"] += 1
@@ -824,6 +845,10 @@ class Supervisor:
     async def _evaluate(venue: str, price: float, sharp_q: SharpQuote, line: Optional[float], label: str):
         if venue == "kalshi":
             return await evaluate_kalshi_edge(price * 100, sharp_q, line=line, label=label)
+        if venue == "prophetx":          # 2% of net winnings = a higher effective price per $1 of payout
+            effective = price / win_payout("prophetx", price)
+            return await evaluate_market_edge(NovigQuote(price=price, fee_per_contract=effective - price, line=line,
+                                                         label=label), sharp_q)
         return await evaluate_market_edge(NovigQuote(price=price, line=line, label=label), sharp_q)
 
     @staticmethod
@@ -957,10 +982,10 @@ class Supervisor:
                 continue
             if league in NO_CROSS_VENUE_HEDGE_LEAGUES and other.venue != update.venue:
                 continue
-            worst_payout = 1.0
+            worst_payout = min(win_payout(update.venue, update.price), win_payout(other.venue, other.price))
             if league == "NFL" and mtype == "moneyline":
-                worst_payout = min(1.0, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
-                                            for v in (update.venue, other.venue)))
+                worst_payout = min(worst_payout, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
+                                                     for v in (update.venue, other.venue)))
             profit = worst_payout - self._unit_cost(update.venue, update.price) - self._unit_cost(other.venue,
                                                                                                  other.price)
             if profit >= ARB_MIN_PROFIT_PER_CONTRACT - 1e-9 and (best is None or profit > best[1]):
@@ -1080,7 +1105,8 @@ class Supervisor:
             if i > 0 and (self.multi_level_mode == "off" or (self.live and not self.multi_level_live)):
                 break
             unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
-            if worst_payout - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
+            level_worst = min(worst_payout, win_payout(first.venue, first.price), win_payout(update.venue, price))
+            if level_worst - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
                 break
             n = min(int(size), remaining - sum(k for _, k in used),
                     int(math.floor((MAX_STAKE_USD - spent) / unit + 1e-9)))
@@ -1097,7 +1123,8 @@ class Supervisor:
                             f">= {MIN_PARTIAL_HEDGE_CONTRACTS} for a partial hedge)")
             costs = [order_cost(update.venue, n, p) for p, n in used]
             cost, fee = round(sum(c for c, _ in costs), 2), round(sum(f for _, f in costs), 2)
-            scenarios = arbitrage_scenarios(first, update.venue, contracts, cost, league, mtype)
+            scenarios = arbitrage_scenarios(first, update.venue, contracts, cost, league, mtype,
+                                            hedge_price=used[0][0])      # cheapest level = largest win fee
             need = round(ARB_MIN_PROFIT_PER_CONTRACT * contracts, 2)
             if min(scenarios.values()) >= need - 1e-9:
                 avg = round(sum(p * n for p, n in used) / contracts, 6)
@@ -1652,6 +1679,8 @@ class Supervisor:
         yield from self.feed.latest.values()
         if self.kalshi is not None:
             yield from self.kalshi.latest.values()
+        if self.prophetx is not None:
+            yield from self.prophetx.latest.values()
 
     def _research_gap(self, update: MarketUpdate, key: tuple, side: str) -> None:
         tie = DEAD_HEAT_PAYOUT if key[0] == "NFL" and key[3] == "moneyline" else None
@@ -2059,7 +2088,9 @@ class Supervisor:
                 log.error("SUPERVISOR task %s raised during shutdown: %r", name, result)
         closeables = {id(c): c for c in (self.poller.fetch, self.novig_rest, self.kalshi_rest, self.maker_gateway,
                                          self.order_gateway, self.positions_client, self.kalshi_gateway,
-                                         self.kalshi_positions_client) if c is not None}
+                                         self.kalshi_positions_client,
+                                         self.prophetx.client if self.prophetx is not None else None)
+                      if c is not None}
         for closeable in closeables.values():
             closer = getattr(closeable, "close", None)
             if closer is not None:
@@ -2403,6 +2434,12 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                          "immediate-or-cancel orders", "PROD" if prod else "DEMO")
     elif (env.get("KALSHI_LIVE_TRADING") or "0").strip().lower() in {"1", "true", "yes", "on"}:
         raise ConfigError("KALSHI_LIVE_TRADING=1 needs KALSHI_ENABLED=1 (the Kalshi feed carries our fills)")
+    if (env.get("PROPHETX_ENABLED") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+        from prophetx_feed import PROD_BASE, ProphetXClient, ProphetXFeed
+        if not (env.get("PROPHETX_ACCESS_KEY") and env.get("PROPHETX_SECRET_KEY")):
+            raise ConfigError("PROPHETX_ENABLED=1 needs PROPHETX_ACCESS_KEY and PROPHETX_SECRET_KEY")
+        kw["prophetx_feed"] = ProphetXFeed(ProphetXClient(env["PROPHETX_ACCESS_KEY"], env["PROPHETX_SECRET_KEY"],
+                                                          env.get("PROPHETX_API_BASE") or PROD_BASE))
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
@@ -2445,6 +2482,7 @@ def describe_state(sup: Supervisor) -> dict:
             ("LIVE execution (IOC orders, fill channel, positions sync)" if sup.kalshi_live else "data-only")
             if sup.live else "paper execution"),
         "kalshi_socket": None if sup.kalshi is None else sup.kalshi.url,
+        "prophetx": "off" if sup.prophetx is None else f"price feed (paper + research only) {sup.prophetx.url}",
         "kalshi_rest": None if sup.kalshi_rest is None else sup.kalshi_rest.base_url,
         "dead_heat_venues": sorted(DEAD_HEAT_VENUES),
         "ledger": str(sup.ledger_path) if sup.ledger_path else None,
@@ -2524,6 +2562,8 @@ def format_state_report(sup: Supervisor) -> str:
          or "every book in the feed, equally"),
         ("Per-market overrides", ", ".join(st["sharp_overrides"]) or "none"),
         ("HTTP timeout / poll / freshness", f"{st['sharp_http_timeout_s']}s / {st['sharp_poll_s']}s / {st['sharp_max_age_s']}s"),
+        ("PROPHETX", None),
+        ("Status", st["prophetx"]),
         ("KALSHI", None),
         ("Status", st["kalshi"]),
         ("Socket", st["kalshi_socket"] or "-"),

@@ -63,9 +63,21 @@ export KALSHI_ENABLED=1 KALSHI_ENV=demo KALSHI_KEY_ID=... KALSHI_PRIVATE_KEY_PAT
 python main_supervisor.py
 ```
 
-## Leagues and fair value
-* Leagues: NFL, NBA, MLB, NHL, WNBA (moneyline, spread incl. run/puck line, total). Soccer is excluded (3-way
-  moneyline); college needs a team list built from the venues' own names first.
+## Leagues, venues and fair value
+* Leagues: NFL, NBA, MLB, NHL, WNBA, **college football (NCAAF), college basketball (NCAAB)** and **tennis
+  (ATP + WTA)**. Moneyline, spread (incl. run/puck line) and total.
+  * College teams and tennis players have no fixed table. Every listed game is registered (Novig first) and
+    other venues' spellings are matched game by game, conservatively: "Georgia" never matches "Georgia
+    State/Tech"; "Miami (FL)" never matches "Miami (OH)"; "C. Alcaraz" = "Carlos Alcaraz". Ambiguous = not
+    traded. One home/away orientation per game across venues.
+  * Tennis: no cross-venue locked pairs or hedges (retirements settle differently by venue); directional only.
+  * Soccer is excluded (3-way moneyline with a draw: needs a 3-outcome model).
+* Venues from New York: **Novig** and **Kalshi** (live, gated). **ProphetX** as a price feed for paper trading
+  and research (`PROPHETX_ENABLED=1`, partner API keys). Its 2%-of-winnings fee is in every edge and pair
+  calculation. Its field names are assumed from public docs mirrored by an open-source client: run
+  `python prophetx_feed.py --probe` with your keys and share the saved file so they can be checked before any
+  live ProphetX orders are added. Polymarket US (New York sued it Sept 24, 2026) and Sporttrade (not in NY) are
+  not integrated.
 * `DEVIG_METHOD` = multiplicative (default) | power | shin. Power/Shin take more margin off longshots.
   Every DECISION research row records all three so the report can show which one holds up at the close.
 * `SHARP_BOOK_WEIGHTS=pinnacle:2,circa sports:1`: fresh books quoting the same number are blended into one
