@@ -149,6 +149,9 @@ async def test_deltas_gaps_and_own_orders():
     assert feed.latest["o-buf"].ask_levels == [(0.7, 5.0)]
     await feed._handle_raw(json.dumps({"delta": {"m-ml": {"book": {"seq": 14, "deltas": []}}}}))   # 13 missing
     assert feed.books["m-ml"].resync and "o-buf" not in feed.latest
+    feed.subscribed.update({"m-ml", "m-sp", "m-to"})
+    feed._tokens = nv.STREAM_CAPACITY
+    await feed.sync_subscriptions()                                  # maintenance retries until it goes through
     assert sent[-1]["snapshot"] == {"markets": {"m-ml": "book"}}
     await feed._handle_raw(json.dumps({"snapshot": {"m-ml": {"book": {"seq": 20, "orders": {}}}}}))
     assert not feed.books["m-ml"].resync
@@ -173,18 +176,40 @@ async def test_private_fills_become_engine_slips():
         ("x", "PARTIAL", 0.4, 66.0), ("x", "FILLED", 0.6, 66.5), ("y", "REJECTED", 0, None)]
 
 
-async def test_subscribe_on_open_and_sync_respects_throttle():
+async def test_subscribe_waits_for_a_full_throttle_and_counts_only_acked_markets():
     feed, updates, slips, life, sent = _feed()
     await feed._on_open(feed._ws)
-    assert sent[0]["nonce"] == 1 and set(sent[0]["subscribe"]["markets"]) == {"m-ml", "m-sp", "m-to"}
-    assert sent[0]["subscribe"]["private"] == ["orders"]
-    feed.subscribed.discard("m-to")
-    feed._tokens = 0                                       # throttle empty: wait for the refill
+    feed._maintenance.cancel()
+    assert sent[0]["subscribe"] == {"private": ["orders"]}          # alone, first
+    await feed._handle_raw(json.dumps({"nonce": sent[0]["nonce"], "subscribed": {"private": ["orders"]},
+                                       "snapshot": {}, "orders": {"seq": 0, "open": []}}))
+    await feed.sync_subscriptions()                                  # 3 markets x 16 = 48 tokens: fits now
+    sub = sent[-1]
+    assert set(sub["subscribe"]["markets"]) == {"m-ml", "m-sp", "m-to"} and feed.subscribed == set()
+    await feed._handle_raw(json.dumps({"nonce": sub["nonce"], "subscribed": {"markets": sub["subscribe"]["markets"]},
+                                       "snapshot": {}}))
+    assert feed.subscribed == {"m-ml", "m-sp", "m-to"}
+
+
+def test_a_subscribe_heavier_than_the_bucket_needs_a_full_bucket():
+    feed, *_ = _feed()
+    feed._tokens, feed._tokens_at = nv.STREAM_CAPACITY - 32, __import__("time").monotonic()
+    assert not feed._spend(100 * nv.BOOK_WEIGHT)                     # 1600 > 512: only on a full bucket
+    assert 7 < feed._wait_for(100 * nv.BOOK_WEIGHT) <= 8.1
+    feed._tokens = nv.STREAM_CAPACITY
+    assert feed._spend(100 * nv.BOOK_WEIGHT) and feed._tokens == 0
+
+
+async def test_rejected_request_without_nonce_is_retried():
+    feed, updates, slips, life, sent = _feed()
+    feed._ws_conn = feed._ws
     await feed.sync_subscriptions()
-    assert len(sent) == 1
+    assert feed._pending
+    await feed._handle_raw(json.dumps({"code": "RATE_LIMIT_EXCEEDED", "message": "slow down"}))   # no nonce
+    assert not feed._pending and feed.subscribed == set()
     feed._tokens = nv.STREAM_CAPACITY
     await feed.sync_subscriptions()
-    assert sent[-1]["subscribe"] == {"markets": {"m-to": "book"}} and sent[-1]["nonce"] == 2
+    assert set(sent[-1]["subscribe"]["markets"]) == {"m-ml", "m-sp", "m-to"}
 
 
 # ---------------------------------------------------------------- REST over a local server
@@ -325,19 +350,6 @@ async def test_golive_marks_the_game_live(tmp_path):
     sup.registry.replace_all(nv.build_market_infos(*_catalog()))
     await sup.on_novig_lifecycle(sup.registry.get("o-buf"), "GOLIVE")
     assert len(sup.live_games) == 1
-
-
-async def test_failed_subscribe_is_retried_and_full_bucket_takes_everything():
-    feed, updates, slips, life, sent = _feed()
-    await feed._on_open(feed._ws)
-    nonce = sent[0]["nonce"]
-    await feed._handle_raw(json.dumps({"code": "RATE_LIMIT_EXCEEDED", "message": "slow down", "nonce": nonce}))
-    assert feed.subscribed == set()                         # nothing was subscribed: not silently "connected"
-    await feed.sync_subscriptions()                         # throttle modelled as empty: waits
-    assert len(sent) == 1
-    feed._tokens = nv.STREAM_CAPACITY                       # refilled: ONE request takes every market
-    await feed.sync_subscriptions()
-    assert set(sent[-1]["subscribe"]["markets"]) == {"m-ml", "m-sp", "m-to"}
 
 
 async def test_live_start_cancels_orders_left_from_earlier_sessions(novig_server):

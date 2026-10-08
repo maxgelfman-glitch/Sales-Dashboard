@@ -63,7 +63,7 @@ SCHEME = "NOVIG-V3"
 WS_PATH = "/v3/ws"
 UNITS_PER_CONTRACT = 100                 # Novig contracts (1 cent each) per engine contract ($1)
 MAX_WATCHED_MARKETS = 2048               # Novig's cap per websocket connection
-STREAM_CAPACITY, STREAM_REFILL, BOOK_WEIGHT = 512, 4.0, 16
+STREAM_CAPACITY, STREAM_REFILL, BOOK_WEIGHT, WS_UPGRADE_COST = 512, 4.0, 16, 32
 TRACKED_MARKET_TYPES = ("MONEY", "SPREAD", "TOTAL")
 MAX_BOOK_LEVELS = 10
 DEFAULT_MAKER_TTL_MS = 5 * 60 * 1000     # resting quotes expire on their own if the engine dies
@@ -584,7 +584,9 @@ class NovigV3Feed(ResilientWebSocketFeed):
         self.slips_received = 0
         self._nonce = 0
         self._orders_seq: Optional[int] = None
-        self._pending: dict[int, list[str]] = {}            # subscribe nonce -> markets it asked for
+        self._pending: dict[int, list[str]] = {}            # request nonce -> markets it asked for (until acked)
+        self._resync: set[str] = set()                      # markets whose book had a gap: re-snapshot pending
+        self._maintenance: Optional[asyncio.Task] = None
         self._tokens, self._tokens_at = float(STREAM_CAPACITY), time.monotonic()
         self._ws_conn = None
 
@@ -608,69 +610,105 @@ class NovigV3Feed(ResilientWebSocketFeed):
                         len(ids), self.max_markets)
         return ids[:self.max_markets]
 
-    def _spend(self, cost: float) -> bool:
-        """Client-side model of the `stream` throttle. One request is charged at most the capacity, but
-        a request above the capacity passes only when the throttle is full."""
+    def _refill(self) -> None:
         now = time.monotonic()
         self._tokens = min(STREAM_CAPACITY, self._tokens + (now - self._tokens_at) * STREAM_REFILL)
         self._tokens_at = now
-        cost = min(cost, STREAM_CAPACITY)
+
+    def _spend(self, cost: float) -> bool:
+        """Client-side model of the `stream` throttle. A request is charged at most the capacity, but one whose
+        weight exceeds the capacity passes only when the throttle is FULL (and then empties it)."""
+        self._refill()
+        if cost > STREAM_CAPACITY:
+            if self._tokens < STREAM_CAPACITY - 1e-9:
+                return False
+            self._tokens = 0.0
+            return True
         if self._tokens + 1e-9 < cost:
             return False
         self._tokens -= cost
         return True
+
+    def _wait_for(self, cost: float) -> float:
+        """Seconds until _spend(cost) would pass."""
+        self._refill()
+        need = STREAM_CAPACITY if cost > STREAM_CAPACITY else cost
+        return max(0.0, (need - self._tokens) / STREAM_REFILL)
 
     async def _send(self, ws, msg: dict) -> int:
         nonce = self._next_nonce()
         await ws.send(json.dumps({"nonce": nonce, **msg}, separators=(",", ":")))
         return nonce
 
-    async def _subscribe_markets(self, ws, markets: list[str], private: bool = False) -> None:
-        sub: dict[str, Any] = {"markets": {m: "book" for m in markets}} if markets else {}
-        if private:
-            sub["private"] = ["orders"]
-        if not sub:
-            return
-        nonce = await self._send(ws, {"subscribe": sub})
+    def _in_flight(self) -> set[str]:
+        return {m for ms in self._pending.values() for m in ms}
+
+    async def _subscribe_markets(self, ws, markets: list[str]) -> bool:
+        """One book subscribe if the throttle allows it now. Markets count as subscribed only on the ack."""
+        if not markets or not self._spend(len(markets) * BOOK_WEIGHT):
+            return False
+        nonce = await self._send(ws, {"subscribe": {"markets": {m: "book" for m in markets}}})
         self._pending[nonce] = list(markets)
-        self.subscribed.update(markets)
+        return True
 
     async def _on_open(self, ws) -> None:
         self._ws_conn = ws
         self._nonce, self._orders_seq = 0, None
         self.subscribed.clear()
         self._pending.clear()
-        markets = self.wanted_markets()
-        if not markets and not self.private:
-            log.warning("NOVIG nothing to subscribe yet (empty registry)")
-            return
-        self._spend(len(markets) * BOOK_WEIGHT + (1 if self.private else 0))
-        await self._subscribe_markets(ws, markets, self.private)
-        log.info("CONN novig v3 subscribed book for %d markets%s", len(markets),
-                 " + private orders" if self.private else "")
+        self._resync.clear()
+        # the upgrade itself costs 32 tokens; assume the bucket was otherwise full (it refills in ~2 min)
+        self._tokens, self._tokens_at = float(STREAM_CAPACITY - WS_UPGRADE_COST), time.monotonic()
+        if self.private:                       # alone and first: cheap, and its heartbeat keeps the socket alive
+            self._spend(1)
+            nonce = await self._send(ws, {"subscribe": {"private": ["orders"]}})
+            self._pending[nonce] = []
+        if self._maintenance is not None:
+            self._maintenance.cancel()
+        self._maintenance = asyncio.get_running_loop().create_task(self._maintain(ws))
+
+    async def _maintain(self, ws) -> None:
+        """Keep the subscription set complete: subscribe what is missing (waiting for the throttle), and
+        re-snapshot markets whose book had a gap. Runs for the life of one connection."""
+        try:
+            while self._ws_conn is ws:
+                await self.sync_subscriptions()
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception("NOVIG subscription maintenance failed")
 
     async def sync_subscriptions(self) -> None:
-        """After a registry refresh: subscribe new markets and drop finished ones, within the stream throttle."""
+        """Subscribe new markets, drop finished ones and retry re-snapshots, within the stream throttle."""
         ws = self._ws_conn
-        if ws is None or self._ws is None:
+        if ws is None:
             return
         wanted = set(self.wanted_markets())
         gone = sorted(self.subscribed - wanted)
-        new = sorted(wanted - self.subscribed)
         if gone and self._spend(len(gone)):
             await self._send(ws, {"unsubscribe": [f"market:{m}" for m in gone]})
             self.subscribed.difference_update(gone)
             for m in gone:
                 self._drop_market(m)
+        new = sorted(wanted - self.subscribed - self._in_flight())
         if new:
-            if not self._spend(len(new) * BOOK_WEIGHT):
-                log.info("NOVIG %d new market(s) wait for the stream throttle to refill", len(new))
+            if await self._subscribe_markets(ws, new):
+                log.info("NOVIG subscribing %d market(s)", len(new))
+            else:
+                log.debug("NOVIG %d market(s) wait %.0fs for the stream throttle", len(new),
+                          self._wait_for(len(new) * BOOK_WEIGHT))
                 return
-            await self._subscribe_markets(ws, new)
-            log.info("NOVIG subscribed %d new market(s)", len(new))
+        for m in sorted(self._resync - self._in_flight()):
+            if m not in self.subscribed or not self._spend(BOOK_WEIGHT):
+                break
+            nonce = await self._send(ws, {"snapshot": {"markets": {m: "book"}}})
+            self._pending[nonce] = []
+            self._resync.discard(m)
 
     def _drop_market(self, market_id: str) -> None:
         self.books.pop(market_id, None)
+        self._resync.discard(market_id)
         for info in self.registry.all():
             if info.market_id == market_id:
                 self.latest.pop(info.outcome_id, None)
@@ -680,6 +718,9 @@ class NovigV3Feed(ResilientWebSocketFeed):
         self.latest.clear()
         self.books.clear()
         self._ws_conn = None
+        if self._maintenance is not None:
+            self._maintenance.cancel()
+            self._maintenance = None
         return counts
 
     def _heartbeat_extra(self) -> str:
@@ -695,16 +736,20 @@ class NovigV3Feed(ResilientWebSocketFeed):
         if not isinstance(msg, dict):
             return
         if "code" in msg and "message" in msg:
-            failed = self._pending.pop(msg.get("nonce"), None) if msg.get("nonce") is not None else None
-            if failed is not None:                      # that subscribe did nothing: retry at the next refresh
-                self.subscribed.difference_update(failed)
+            nonce = msg.get("nonce")
+            if nonce is None and self._pending:         # a throttled/unparsed frame has no nonce: the oldest request
+                nonce = min(self._pending)
+            failed = self._pending.pop(nonce, None) if nonce is not None else None
+            if failed is not None:                      # it did nothing: maintenance retries when the throttle allows
                 self._tokens = 0.0
             log.log(logging.ERROR if failed else logging.WARNING, "NOVIG websocket error %s: %s (nonce %s)%s",
                     msg.get("code"), msg.get("message"), msg.get("nonce"),
-                    f" — {len(failed)} market(s) not subscribed, retrying at the next refresh" if failed else "")
+                    f" — {len(failed)} market(s) not subscribed, retrying" if failed else "")
             return
-        if isinstance(msg.get("nonce"), int) and "subscribed" in msg:
-            self._pending.pop(msg["nonce"], None)
+        if isinstance(msg.get("nonce"), int) and msg["nonce"] in self._pending:
+            acked = self._pending.pop(msg["nonce"])
+            if "subscribed" in msg or "snapshot" in msg:
+                self.subscribed.update(acked)
         for mid, s in (msg.get("snapshot") or {}).items():
             if isinstance(s, dict):
                 await self._apply_snapshot(mid, s)
@@ -751,8 +796,7 @@ class NovigV3Feed(ResilientWebSocketFeed):
                 log.warning("NOVIG book gap on %s: seq %d after %d — re-snapshotting", market_id, seq, b.seq)
                 b.resync = True
                 self.latest_clear(market_id)
-                if self._spend(BOOK_WEIGHT):
-                    await self._request_snapshot({"markets": {market_id: "book"}})
+                self._resync.add(market_id)             # maintenance re-snapshots it as soon as the throttle allows
             else:
                 b.seq = seq
                 for x in book.get("deltas") or []:
@@ -856,7 +900,8 @@ def event_to_slip(ev: dict) -> Optional[FillSlip]:
     if kind == "fill":
         return FillSlip(order_id=str(oid), status="FILLED" if ev.get("remaining") == 0 else "PARTIAL",
                         filled_volume=from_novig_qty(float(ev.get("qty", 0))),
-                        price_cents=float(ev["price"]) * 100 if ev.get("price") is not None else None, venue="novig")
+                        price_cents=float(ev["price"]) * 100 if ev.get("price") is not None else None, venue="novig",
+                        price_is_bought_outcome=True)
     if kind in {"cancel", "reject"}:
         return FillSlip(order_id=str(oid), status="CANCELED" if kind == "cancel" else "REJECTED", filled_volume=0,
                         venue="novig")

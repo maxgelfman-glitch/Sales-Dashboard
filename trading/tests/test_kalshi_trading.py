@@ -261,3 +261,10 @@ def test_config_gates(tmp_path):
     sup = build_live_supervisor(live)
     assert sup.kalshi_live and sup.kalshi_positions_client is not None
     assert "LIVE execution (IOC orders" in format_state_report(sup)
+
+
+def test_signature_covers_the_path_without_the_query_string():
+    from kalshi_trading import KalshiOrderGateway
+    gw = KalshiOrderGateway("https://api.elections.kalshi.com/trade-api/v2", "kid", object())
+    assert gw._sign_path("/portfolio/settlements?limit=200&cursor=abc%2B") == "/trade-api/v2/portfolio/settlements"
+    assert gw._sign_path("/communications/rfqs?status=open") == "/trade-api/v2/communications/rfqs"

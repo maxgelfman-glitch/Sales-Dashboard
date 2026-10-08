@@ -46,6 +46,10 @@ def slip(oid, status, filled, cents=None):
     return FillSlip(order_id=oid, status=status, filled_volume=filled, price_cents=cents)
 
 
+class Refused(RuntimeError):
+    status = 400                     # a definite refusal (not a timeout or 5xx)
+
+
 class FakeGateway:
     live = True
     api_base = "fake://novig"
@@ -55,7 +59,7 @@ class FakeGateway:
 
     async def place_limit(self, outcome_id, side, price_cents, contracts, client_id):
         if self.fail:
-            raise ConnectionError("exchange rejected")
+            raise Refused("exchange rejected")
         self.n += 1
         oid = f"ex-{self.n}"
         self.placed.append(dict(order_id=oid, outcome_id=outcome_id, side=side, price_cents=price_cents,
@@ -192,7 +196,9 @@ async def test_kalshi_is_data_only_in_live_mode():
     assert sup.order_gateway.placed == [] and sup.orders == [] and sup.stats["kalshi_exec_disabled"] == 1
 
 
-async def test_unknown_order_slip_is_flagged_not_booked():
+async def test_unknown_order_slip_is_flagged_not_booked(monkeypatch):
+    import main_supervisor
+    monkeypatch.setattr(main_supervisor, "EARLY_SLIP_HOLD_SECONDS", -1)     # no claim window in this test
     sup = live_sup()
     await sup.on_fill_slip(slip("someone-elses", "FILLED", 100, 50))
     assert sup.stats["unknown_fills"] == 1 and sup.total_exposure() == 0
@@ -495,3 +501,23 @@ def test_committed_provider_schema_is_current():
     gen = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gen)
     assert open("config/sharp_provider.schema.json").read() == gen.provider_schema()
+
+
+
+async def test_a_fill_that_beats_the_order_ack_is_held_and_booked():
+    sup = live_sup()
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 2040, 49))              # arrives before place_limit returns
+    assert sup.stats["unknown_fills"] == 0 and "ex-1" in sup._early_slips
+    await sup.on_market_update(upd("O-NYK", 0.49), None)                  # the order whose id is ex-1
+    assert sup.live_orders["ex-1"].filled == 2040                          # replayed and booked
+
+
+async def test_a_timed_out_order_keeps_its_lock_and_reservation():
+    sup = live_sup()
+
+    async def timeout(*a, **k):
+        raise asyncio.TimeoutError()
+    sup.order_gateway.place_limit = timeout
+    await sup.on_market_update(upd("O-NYK", 0.49), None)
+    assert sup.total_exposure() > 0 and sup.unconfirmed_legs                # may have filled: never released blind
+    assert sup.stats["live_rejected"] == 0

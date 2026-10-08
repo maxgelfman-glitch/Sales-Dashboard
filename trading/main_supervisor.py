@@ -229,7 +229,7 @@ class PaperOrder(BaseModel):
     side: str                 # canonical team or "over"/"under" we are LONG
     line: Optional[float]
     price: float              # per-contract price paid for `side` (excl. fees)
-    contracts: int
+    contracts: float          # $1-payout contracts; fractional on Novig (one Novig contract = 0.01)
     fee_usd: float = 0.0
     stake_usd: float          # total cash out incl. fees
     edge: Optional[float]
@@ -237,7 +237,7 @@ class PaperOrder(BaseModel):
     placed_at: float
     live: bool = False                      # True = real exchange order
     pending: bool = False                   # live taker still waiting for fills
-    requested_contracts: int = 0            # live: size sent to the exchange
+    requested_contracts: float = 0          # live: size sent to the exchange
     exchange_order_id: Optional[str] = None
 
     @property
@@ -280,15 +280,46 @@ class MarketPosition(BaseModel):
     def primary(self) -> PaperOrder:
         return self.legs[0]
 
+    @staticmethod
+    def _n(leg: "PaperOrder") -> float:
+        return leg.requested_contracts if leg.pending else leg.contracts
+
+    def primary_contracts(self) -> float:
+        """Contracts held on the first leg's side, including later legs on that SAME side (e.g. a maker fill)."""
+        side = self.primary.side
+        return sum(self._n(l) for l in self.legs if l.side == side)
+
     def hedged_contracts(self) -> float:
-        """Contracts of the opposite side already bought (or being bought) against the first leg."""
-        return sum(leg.requested_contracts if leg.pending else leg.contracts for leg in self.legs[1:])
+        """Contracts of the OPPOSITE side bought (or being bought) against the first leg's side."""
+        side = self.primary.side
+        return sum(self._n(l) for l in self.legs if l.side != side)
 
     def unhedged(self) -> float:
-        return self.primary.contracts - self.hedged_contracts()
+        """> 0: that many first-side contracts are naked; < 0: over-hedged (the other side is naked)."""
+        return self.primary_contracts() - self.hedged_contracts()
 
 
 GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — venue independent
+
+
+def order_error_ambiguous(exc: BaseException) -> bool:
+    """True when an order call failed in a way that does NOT prove the exchange refused it: a timeout, a dropped
+    connection, a 5xx, or an accepted order with no id. Such an order may be live (an IOC may already have filled),
+    so its reservation and game lock must be kept until the exchange's own records resolve it."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    try:
+        import aiohttp
+        if isinstance(exc, (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError, aiohttp.ClientPayloadError)):
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    status = getattr(exc, "status", None)
+    if status is None:
+        return False
+    if status == 0:
+        return getattr(exc, "code", "") not in {"NO_KEY"}
+    return status >= 500 or status == 408
 
 
 def write_ledger_line(path: Path, event: str, **fields) -> None:
@@ -501,6 +532,7 @@ class Supervisor:
         self.processed_settlements, self.cumulative_pnl = load_ledger_settlements(self.ledger_path)
         self.synced = positions_client is None and kalshi_positions_client is None   # nothing to sync without one
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
+        self._early_slips: dict[str, list] = {}           # exchange order id -> [(received, slip)] before its ack
         # ---- pregame cutoff (never trade or quote into a live game) ----
         self.taker_cutoff_s = taker_cutoff_s
         self.maker_cutoff_s = max(maker_cutoff_s, taker_cutoff_s)
@@ -1297,23 +1329,37 @@ class Supervisor:
         results = await asyncio.gather(*(gateway.place_limit(update.outcome_id, "buy", round(p * 100, 4), n, cid)
                                          for (p, n), cid in zip(tranches, cids)), return_exceptions=True)
         acked_at = time.time()
-        placed = []
+        placed, unknown = [], []
         for (p, n), payload, res in zip(tranches, payloads, results):
-            if isinstance(res, BaseException):   # a rejected order must release everything it reserved
+            if isinstance(res, BaseException):
+                if order_error_ambiguous(res):      # may be live: keep its reservation, resolve from the exchange
+                    log.critical("LIVE_ORDER outcome UNKNOWN %s %s x%g @ %.4f (%s: %s): lock and reservation KEPT "
+                                 "until the exchange's records resolve it", update.outcome_id, side, n, p,
+                                 type(res).__name__, res)
+                    self._ledger("UNCONFIRMED", kind=kind, payload=payload, error=f"{type(res).__name__}: {res}")
+                    unknown.append((p, n))
+                    continue
                 log.error("LIVE_ORDER rejected %s %s x%d @ %.4f: %s", update.outcome_id, side, n, p, res)
                 self._ledger("REJECTED", kind=kind, payload=payload, error=f"{type(res).__name__}: {res}")
                 self.stats["live_rejected"] += 1
                 continue
             placed.append((res, p, n, payload))
-        if not placed:
+        if unknown:
+            self.stats["unconfirmed_orders"] += len(unknown)
+            self.unconfirmed_legs[leg.order_id] = time.time()   # the settlement sweep reconciles it
+        if not placed and not unknown:
             self.exposure.adjust(leg.position_id, 0)
             self._drop_leg(key, leg)
             if held is not None:
                 held.hedged = False
             return
-        if len(placed) < len(tranches):                # some tranches rejected: shrink the reservation to the rest
-            leg.requested_contracts = sum(n for _, _, n, _ in placed)
-            self.exposure.adjust(leg.position_id, round(sum(p * n for _, p, n, _ in placed), 2))
+        if len(placed) + len(unknown) < len(tranches):   # some tranches refused: shrink the reservation to the rest
+            leg.requested_contracts = sum(n for _, _, n, _ in placed) + sum(n for _, n in unknown)
+            self.exposure.adjust(leg.position_id, round(sum(p * n for _, p, n, _ in placed)
+                                                        + sum(p * n for p, n in unknown), 2))
+        if not placed:                                   # nothing known to be working: the sweep decides
+            leg.pending = False
+            return
         leg.exchange_order_id = ",".join(oid for oid, *_ in placed)
         for oid, p, n, payload in placed:
             self.live_orders[oid] = LiveOrder(exchange_order_id=oid, kind=kind, outcome_id=update.outcome_id,
@@ -1332,6 +1378,8 @@ class Supervisor:
                          expected_levels=[[p, n]] if staggered else (levels or [[p, n]]),
                          expected_avg_price=p if staggered or not levels else _sweep_avg(levels, n))
             self._spawn(self._taker_timeout(oid))
+        for oid, *_ in placed:
+            await self._replay_early_slips(oid)
         if staggered:
             self.stats["staggered_orders"] += 1
         await self._after_taker(key)
@@ -1490,10 +1538,34 @@ class Supervisor:
                      payload=order_body(q.outcome_id, q.side, q.price_cents, q.contracts, q.order_id))
         self.live_orders[q.order_id] = LiveOrder(exchange_order_id=q.order_id, kind="MAKER", outcome_id=q.outcome_id,
                                                  key=q.market_key, requested=q.contracts, limit_price=buy_price,
-                                                 maker_side=q.side, fair_prob=q.fair_prob)
+                                                 maker_side=q.side, fair_prob=q.fair_prob,
+                                                 fill_mode=self.fill_volume_mode)       # v3: incremental fills
+        if q.order_id in self._early_slips:
+            self._spawn(self._replay_early_slips(q.order_id))
+
+    async def _hold_or_drop(self, slip) -> None:
+        """An IOC fill often arrives on the socket BEFORE the order call returns its id: hold it and replay it when
+        the order is registered (_replay_early_slips). Only slips nobody claims within the hold window are
+        unknown. A held slip does not confirm the fill channel (it might not be ours)."""
+        now = time.time()
+        self._early_slips.setdefault(slip.order_id, []).append((now, slip))
+        for oid, items in list(self._early_slips.items()):
+            if now - items[0][0] > EARLY_SLIP_HOLD_SECONDS:
+                self._early_slips.pop(oid, None)
+                self.stats["unknown_fills"] += 1
+                log.critical("FILL_UNKNOWN %d slip(s) for order %s we did not place this session: %s — "
+                             "reconcile manually", len(items), oid, items[-1][1].model_dump_json())
+                self._ledger("FILL_UNKNOWN", exchange_order_id=oid, slips=[x.model_dump() for _, x in items])
+
+    async def _replay_early_slips(self, oid: str) -> None:
+        for _, slip in self._early_slips.pop(oid, []):
+            await self.on_fill_slip(slip)
 
     async def on_fill_slip(self, slip) -> None:
         """Execution slips: book real fills into positions and the exposure count."""
+        if slip.order_id not in self.live_orders:
+            await self._hold_or_drop(slip)
+            return
         if getattr(slip, "venue", "novig") == "kalshi":
             if not self.kalshi_fills_confirmed:
                 self.kalshi_fills_confirmed = True
@@ -1503,10 +1575,7 @@ class Supervisor:
             log.info("LIVE orders channel confirmed by first execution slip")
         self._ledger("SLIP", **slip.model_dump())
         lo = self.live_orders.get(slip.order_id)
-        if lo is None:
-            self.stats["unknown_fills"] += 1
-            log.critical("FILL_UNKNOWN slip for order %s we did not place this session: %s — reconcile manually",
-                         slip.order_id, slip.model_dump_json())
+        if lo is None:                       # cannot happen: on_fill_slip holds unknown slips first
             return
         if lo.fill_mode == "cumulative":
             delta = slip.filled_volume - lo.filled
@@ -1514,7 +1583,10 @@ class Supervisor:
             delta = slip.filled_volume
         if delta > 1e-9:
             if slip.price_cents is not None:
-                price = slip.price_cents / 100 if lo.maker_side != "sell" else 1 - slip.price_cents / 100
+                # a legacy sell slip carries the SOLD outcome's price; Novig v3 routes a sell as a buy of the other
+                # outcome, so its slip already carries the price of what we own
+                own = lo.maker_side != "sell" or getattr(slip, "price_is_bought_outcome", False)
+                price = slip.price_cents / 100 if own else 1 - slip.price_cents / 100
             else:
                 price = lo.limit_price
             if lo.first_fill_at is None:
@@ -1533,7 +1605,7 @@ class Supervisor:
                 if leg is not None:
                     kids = self._children(leg.order_id)       # one order, or several staggered tranches
                     filled, cost = sum(k.filled for k in kids), sum(k.fill_cost for k in kids)
-                    leg.contracts = int(round(filled))
+                    leg.contracts = round(filled, 2)
                     leg.stake_usd = round(cost, 2)
                     leg.price = round(cost / filled, 6)
                     if lo.done:   # late fill after we cancelled the remainder: still real
@@ -1548,6 +1620,11 @@ class Supervisor:
             log.debug("FILL duplicate/replayed slip for %s ignored", slip.order_id)
         if lo.kind != "MAKER" and not lo.done and (slip.terminal or lo.filled >= lo.requested - 1e-9):
             self._finalize(lo, f"status {slip.status}")
+        elif lo.kind == "MAKER" and slip.terminal and self.maker is not None:
+            # expired (GTT), voided at go-live, neutralized or fully filled: no longer resting. Leaving it in the
+            # maker's book would block re-quoting and count phantom worst-case cost against the headroom.
+            self.maker.quotes.pop(slip.order_id, None)
+            lo.done = True
 
     async def _book_maker_fill(self, lo: LiveOrder, delta: float, price: float) -> None:
         info = self.registry.get(lo.outcome_id)
@@ -1565,23 +1642,30 @@ class Supervisor:
             upd = MarketUpdate.from_info(info, price=min(max(price, 0.0001), 0.9999))
             edge = None if lo.fair_prob is None else (
                 lo.fair_prob / price - 1 if lo.maker_side == "buy" else (1 - lo.fair_prob) / price - 1)
-            leg = self._record("MAKER_FILL", upd, side, int(round(delta)), round(delta * price, 2), 0.0, edge, False,
+            leg = self._record("MAKER_FILL", upd, side, round(delta, 2), round(delta * price, 2), 0.0, edge, False,
                                price=price, force=True)
             leg.live = True
             leg.exchange_order_id = lo.exchange_order_id
             lo.leg_id = leg.order_id
-            self._schedule_markouts(key, side, info.line, price, int(round(delta)))
+            self._schedule_markouts(key, side, info.line, price, round(delta, 2))
             if key in self.positions:
                 self.positions[key].legs.append(leg)
             else:
                 self.positions[key] = MarketPosition(legs=[leg])
         else:
-            leg.contracts = int(round(lo.filled))
+            leg.contracts = round(lo.filled, 2)
             leg.stake_usd = round(lo.fill_cost, 2)
             self.exposure.adjust(leg.position_id, leg.stake_usd)
         if self.maker is not None:
+            if lo.filled < lo.requested - 1e-9:      # partly filled: the rest still rests, pull it explicitly
+                try:
+                    await self.maker_gateway.cancel_orders([lo.exchange_order_id])
+                except Exception as exc:  # noqa: BLE001
+                    log.critical("MAKER remainder of %s could not be cancelled (%s): it may still rest",
+                                 lo.exchange_order_id, exc)
             self.maker.on_fill(lo.exchange_order_id)
-            await self.maker.cancel_market(lo.key, "maker fill: position lock")
+            # every market of this game: one news item fills them all, past the per-game cap
+            await self._pull_game_quotes(tuple(lo.key)[:3], "maker fill: game lock")
 
     def _moved_first_filter(self, update: MarketUpdate, key: tuple) -> Optional[str]:
         """Optional: only take edges where the SHARP moved last (the venue is stale), and recently."""
@@ -1653,12 +1737,17 @@ class Supervisor:
     # ---------------- correlation + loss controls ----------------
     @staticmethod
     def _position_unhedged_usd(pos: MarketPosition) -> float:
-        first = pos.primary
-        n = first.requested_contracts if first.pending else first.contracts
+        """$ at risk on the naked part, whichever side is naked (an over-hedge is naked on the other side)."""
+        net = pos.unhedged()
+        if abs(net) < 1e-9:
+            return 0.0
+        naked_first = net > 0
+        legs = [l for l in pos.legs if (l.side == pos.primary.side) == naked_first]
+        n = sum(MarketPosition._n(l) for l in legs)
         if n <= 0:
             return 0.0
-        risk = first.requested_contracts * first.price if first.pending else first.stake_usd
-        return risk * max(0.0, n - pos.hedged_contracts()) / n
+        cost = sum(l.requested_contracts * l.price if l.pending else l.stake_usd for l in legs)
+        return cost * abs(net) / n
 
     def game_unhedged(self, gid: tuple) -> float:
         """Unhedged $ across every market (moneyline, spread, total) of one game."""
@@ -2015,7 +2104,7 @@ class Supervisor:
         leg = PaperOrder(order_id=len(self.orders) + 1, kind="RESTORED", venue=venue, outcome_id=pos.outcome_id,
                          event_id=(info.event_id if info else pos.event_id) or "", league=info.league if info else "",
                          market_type=info.market_type if info else "", side=side, line=info.line if info else None,
-                         price=min(max(price, 0.0001), 0.9999), contracts=int(round(pos.contracts)), stake_usd=stake,
+                         price=min(max(price, 0.0001), 0.9999), contracts=round(pos.contracts, 2), stake_usd=stake,
                          edge=None, capped=False, placed_at=time.time(), live=True)
         self.exposure.record_fill(leg.position_id, stake)
         self.orders.append(leg)
@@ -2346,6 +2435,7 @@ LIVE_ACK_VALUE = "yes"
 # $1,000 / $15,000 ceilings) or turning the maker on requires LIVE_SCALE_APPROVED_BY,
 # which is written to the log as a CRITICAL audit line on every start.
 CANARY_MAX_STAKE_USD = 10.0
+EARLY_SLIP_HOLD_SECONDS = 30.0
 CANARY_EXPOSURE_LIMIT_USD = 100.0
 CANARY_MAKER_ENABLED = False
 
@@ -2655,7 +2745,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         key_id, key_path = env.get("KALSHI_KEY_ID"), env.get("KALSHI_PRIVATE_KEY_PATH")
         pk = load_private_key(key_path) if key_path else None
         rest_base = env.get("KALSHI_REST_BASE") or (KALSHI_PROD_REST_BASE if prod else DEFAULT_KALSHI_REST_BASE)
-        kw = dict(kalshi_url=env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
+        kw.update(kalshi_url=env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
                   kalshi_auth=(key_id, pk),
                   kalshi_rest=KalshiRestClient(rest_base, key_id, pk, series_from_env(env.get("KALSHI_SERIES"))))
         if (env.get("KALSHI_LIVE_TRADING") or "0").strip().lower() in {"1", "true", "yes", "on"}:

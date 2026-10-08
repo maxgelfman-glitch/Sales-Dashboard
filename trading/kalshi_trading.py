@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import aiohttp
+from urllib.parse import quote
 from yarl import URL
 
 from kalshi_feed import auth_headers
@@ -60,7 +61,9 @@ def _cents(msg: dict, key: str) -> Optional[float]:
 
 
 class KalshiError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class KalshiOrderGateway:
@@ -82,7 +85,7 @@ class KalshiOrderGateway:
     def _sign_path(self, path: str) -> str:
         # Kalshi signs the path from /trade-api/v2 onward, without the query string
         base_path = URL(self.api_base).path.rstrip("/")
-        return (base_path if base_path.startswith(SIGN_PREFIX) else SIGN_PREFIX) + path
+        return (base_path if base_path.startswith(SIGN_PREFIX) else SIGN_PREFIX) + path.split("?", 1)[0]
 
     async def _request(self, method: str, path: str, json_body: Optional[dict] = None) -> tuple[int, Any]:
         if self._session is None or self._session.closed:
@@ -116,11 +119,11 @@ class KalshiOrderGateway:
         body = self.order_body(outcome_id, price_cents, contracts, client_id, self.time_in_force)
         status, data = await self._request("POST", "/portfolio/orders", body)
         if status >= 400 or not isinstance(data, dict):
-            raise KalshiError(f"HTTP {status}: {data}")
+            raise KalshiError(f"HTTP {status}: {data}", status=status if status >= 400 else 0)
         order = data.get("order") if isinstance(data.get("order"), dict) else data
         oid = order.get("order_id") or order.get("id")
         if not oid:
-            raise KalshiError(f"no order_id in response: {data}")
+            raise KalshiError(f"no order_id in response: {data}", status=0)
         self.last_orders[str(oid)] = order
         return str(oid)
 
@@ -184,7 +187,10 @@ class KalshiPositionsClient:
     async def _pages(self, path: str, list_key: str) -> list[dict]:
         rows, cursor = [], None
         for _ in range(50):
-            status, data = await self.gateway._request("GET", path + (f"?cursor={cursor}" if cursor else ""))
+            query = "limit=1000" if "settlements" not in path else "limit=200"
+            if cursor:
+                query += "&cursor=" + quote(str(cursor), safe="")
+            status, data = await self.gateway._request("GET", f"{path}?{query}")
             if status >= 400 or not isinstance(data, dict):
                 raise KalshiError(f"GET {path}: HTTP {status}: {data}")
             rows += data.get(list_key) or []

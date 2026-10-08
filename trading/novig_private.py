@@ -35,6 +35,7 @@ class FillSlip(BaseModel):
     filled_volume: float = Field(ge=0, validation_alias=AliasChoices("filled_volume", "filledVolume"))
     price_cents: Optional[float] = Field(default=None, validation_alias=AliasChoices("price_cents", "priceCents"))
     venue: str = "novig"            # which exchange's execution channel produced it ("kalshi" fills are incremental)
+    price_is_bought_outcome: bool = False   # Novig v3: every order buys, so the price is that of what we own
 
     @field_validator("order_id", mode="before")
     @classmethod
