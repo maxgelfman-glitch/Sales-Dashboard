@@ -180,6 +180,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         self.research = research
         self.allowed = allowed
         self.on_settled: Callable[..., None] = lambda pnl, key, **wager: None   # real P&L -> daily loss stop + tax rows
+        self.on_opened: Callable[..., None] = lambda key, **pos: None         # a real short parlay -> ledger
+        self.ledger_open: dict[str, dict] = {}       # parlays the ledger says are open (set before run)
         self.clock = clock
         self.rounds: dict[str, dict] = {}            # rfq_id -> {legs, price, wager, quoted, closed_at}
         self.positions: dict[str, dict] = {}         # rfq_id -> {price, wager, liability}
@@ -220,6 +222,11 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
             self.book.open[rid] = (legs, round(liability, 2))
             self.positions[rid] = dict(price=price, wager=wager, liability=liability, fair=None, slice=None)
             total += liability
+        # parlays the ledger holds that are no longer open settled while we were down: check_results books them
+        for rid, r in self.ledger_open.items():
+            if rid not in self.positions and r.get("wager") and r.get("price"):
+                self.positions[rid] = dict(price=float(r["price"]), wager=float(r["wager"]),
+                                           liability=float(r.get("liability") or 0), fair=None, slice=None)
         if total:
             log.warning("NOVIG_RFQ restored %d open parlay(s), $%.2f collateral", len(self.positions), total)
         return total
@@ -388,6 +395,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         self.confirmed.pop(rid, None)
         self.positions[rid] = dict(price=price, wager=wager, liability=liability,
                                    fair=None if cp is None else cp.fair, slice=None if cp is None else cp.slice)
+        self.on_opened(rid, price=price, wager=wager, liability=liability)
         self.rounds.pop(rid, None)
         self._count("executed")
         self._write("COMBO_FILL", venue="novig", rfq_id=rid, wager=wager, yes_price=price, liability=liability,

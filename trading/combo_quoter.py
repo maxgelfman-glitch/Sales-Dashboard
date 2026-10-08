@@ -559,6 +559,8 @@ class ComboQuoter:
         self.research = research
         self.allowed = allowed                           # global kill switches (daily loss stop, halts ...)
         self.on_settled: Callable[..., None] = lambda pnl, key, **wager: None   # real P&L -> daily loss stop + tax rows
+        self.on_opened: Callable[..., None] = lambda key, **pos: None         # a real short parlay -> ledger
+        self.ledger_open: dict[str, dict] = {}       # parlays the ledger says are open (set before run)
         self.clock = clock
         self.seen: set[str] = set()
         self.priced: dict[str, dict] = {}               # rfq_id -> what we priced (for the follow-up)
@@ -629,7 +631,8 @@ class ComboQuoter:
             if not ticker.startswith("KXMVE") or not held or held >= 0:
                 continue
             exposure = _num(p.get("market_exposure_dollars")) or 0.0
-            key = f"restored-{ticker}"
+            key = next((k for k, r in self.ledger_open.items() if r.get("market_ticker") == ticker),
+                       f"restored-{ticker}")                 # the ledger's key: its SETTLE row closes it
             if key in self.book.open:
                 continue
             legs: list[Leg] = []
@@ -644,6 +647,14 @@ class ComboQuoter:
                             yes_price=round(1 - no, 4), fee=0.0, slice="restored")
             self.positions[key] = dict(price=cp, ticker=ticker, at=self.clock(), creator=None)   # settles normally
             total += exposure
+        # parlays the ledger holds that are no longer open at Kalshi settled while we were down: book them too
+        for key, r in self.ledger_open.items():
+            if key in self.positions or not r.get("market_ticker") or not r.get("contracts"):
+                continue
+            cp = ComboPrice(action="QUOTE", reason="settled while down", contracts=float(r["contracts"]),
+                            no_bid=float(r.get("no_bid") or 0), yes_price=float(r.get("yes_price") or 0),
+                            fee=float(r.get("fee") or 0), slice="restored")
+            self.positions[key] = dict(price=cp, ticker=r["market_ticker"], at=self.clock(), creator=None)
         if total:
             log.warning("COMBO restored $%.2f of open short-parlay liability from Kalshi", total)
         return total
@@ -840,6 +851,8 @@ class ComboQuoter:
             self.book.add(qid, cp)
         self.positions[qid] = dict(price=cp, ticker=q["rfq"].get("market_ticker"), at=self.clock(),
                                    creator=q["rfq"].get("creator_id"))
+        self.on_opened(qid, market_ticker=q["rfq"].get("market_ticker"), contracts=cp.contracts, no_bid=cp.no_bid,
+                       yes_price=cp.yes_price, fee=cp.fee)
         self._count("executed")
         self._write("COMBO_FILL", quote_id=qid, market_ticker=q["rfq"].get("market_ticker"), yes_price=cp.yes_price,
                     no_bid=cp.no_bid, contracts=cp.contracts, fair=cp.fair, expected_profit=cp.expected_profit,
