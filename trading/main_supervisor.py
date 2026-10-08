@@ -2351,7 +2351,8 @@ class Supervisor:
             sharp_age_s=None if age is None else round(age, 3),
             moved_last=mover, sharp_move_age_s=move_age,
             minutes_to_start=self.minutes_to_start(key[:3]), blocked=blocked, fair_by_method=fair_by_method,
-            sharp_source=None if sharp is None else sharp.source)
+            sharp_source=None if sharp is None else sharp.source, start_time=self.game_start.get(key[:3]),
+            fee_per_contract=round(decision.fee_usd / decision.contracts, 6) if decision.contracts else None)
 
     def _research_execution(self, lo: LiveOrder, leg: PaperOrder, pos: Optional[MarketPosition]) -> None:
         """
@@ -2371,7 +2372,7 @@ class Supervisor:
             expected = 0.0
         ms = lambda a, b: None if a is None or b is None else round((b - a) * 1000, 1)  # noqa: E731
         self.research.write(
-            "EXECUTION", simulated=self.sim, venue=lo.venue, kind=lo.kind, outcome_id=lo.outcome_id,
+            "EXECUTION", simulated=self.sim, venue=lo.venue, order_kind=lo.kind, outcome_id=lo.outcome_id,
             game=list(lo.key), requested=lo.requested, filled=filled,
             fill_ratio=round(filled / lo.requested, 4) if lo.requested else None, requested_usd=requested_usd,
             filled_usd=round(lo.fill_cost, 2), expected_price=lo.expected_price, limit_price=lo.limit_price,
@@ -2419,7 +2420,8 @@ class Supervisor:
         self.research.write("ENTRY", order_id=leg.order_id, order_kind=leg.kind, venue=leg.venue, live=leg.live,
                             outcome_id=leg.outcome_id, game=list(canon_key) if canon_key else None, side=leg.side,
                             line=leg.line, price=leg.price, contracts=leg.contracts, stake_usd=leg.stake_usd,
-                            edge=leg.edge, minutes_to_start=self.minutes_to_start(canon_key[:3]) if canon_key else None)
+                            edge=leg.edge, minutes_to_start=self.minutes_to_start(canon_key[:3]) if canon_key else None,
+                            start_time=self.game_start.get(canon_key[:3]) if canon_key else None)
 
     def _research_close(self, gid: tuple, point: str = "cutoff") -> None:
         """Closing snapshot at the cutoff: sharp fair value and venue prices for every side of every market."""
@@ -2433,13 +2435,19 @@ class Supervisor:
                 upd.line is None or sharp.line is None or math.isclose(upd.line, sharp.line)) else None
             self.research.write("CLOSE", point=point, game=list(key), side=side, line=upd.line, venue=upd.venue,
                                 outcome_id=upd.outcome_id, close_fair_prob=fair, ask=upd.price, bid=upd.best_bid,
-                                depth=upd.available_volume, minutes_to_start=self.minutes_to_start(gid))
+                                depth=upd.available_volume, minutes_to_start=self.minutes_to_start(gid),
+                                start_time=self.game_start.get(gid), market_type=key[3],
+                                dropped=None if fair is not None else "line moved or no sharp line")
 
     def _schedule_markouts(self, key: tuple, side: str, line: Optional[float], price: float, contracts: int) -> None:
         if self.research is None:
             return
 
         minutes = self.minutes_to_start(key[:3])
+        self.stats["markout_fills"] += 1
+        fill_id = self.stats["markout_fills"]
+        at_fill = self.book.lookup(key[0], key[1], key[2], key[3], side, line=line)
+        fair0 = self._fair(at_fill) if at_fill is not None else None      # what the sharp said AT the fill
 
         async def markouts() -> None:
             start = time.time()
@@ -2448,7 +2456,7 @@ class Supervisor:
                 sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=line)
                 fair = self._fair(sharp) if sharp is not None else None
                 self.research.write("MARKOUT", game=list(key), side=side, line=line, fill_price=price,
-                                    minutes_to_start=minutes,
+                                    minutes_to_start=minutes, fill_id=fill_id, fair_at_fill=fair0,
                                     contracts=contracts, delay_s=delay, fair_prob=fair,
                                     markout_per_contract=None if fair is None else round(fair - price, 5))
         self._spawn(markouts())
@@ -3489,6 +3497,7 @@ def parlay_config(env, mode: str, plan, venue: str):
         base_margin=num("COMBO_BASE_MARGIN", 0.04, 0, 1), per_leg_margin=num("COMBO_PER_LEG_MARGIN", 0.02, 0, 1),
         min_roc=num("COMBO_MIN_ROC", 0.01, 0, 1),
         requester_unknown_margin=num("COMBO_UNKNOWN_REQUESTER_MARGIN", 0.0, 0, 0.2),
+        price_tick=0.01 if venue == "kalshi" else 0.001,   # Kalshi quotes must sit on its whole-cent grid
         max_loss_per_combo=cap("max_loss_per_combo", "COMBO_MAX_LOSS_PER_COMBO", 25),
         max_leg_exposure=cap("max_leg_exposure", "COMBO_MAX_LEG_EXPOSURE", 150),
         max_game_exposure=cap("max_game_exposure", "COMBO_MAX_GAME_EXPOSURE", 300),

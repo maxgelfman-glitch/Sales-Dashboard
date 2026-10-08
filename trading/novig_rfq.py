@@ -171,7 +171,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
             raise ValueError("NOVIG_RFQ mode must be shadow, qa or live")
         super().__init__(host.replace("https://", "wss://").rstrip("/") + "/rfq/ws", on_state_change,
                          logger=log, **{"stale_after": 120.0, **kw})
-        self.cfg = dataclasses.replace(cfg, maker_fee_rate=0.0)      # Novig quoters pay no fee
+        self.cfg = dataclasses.replace(cfg, maker_fee_rate=0.0, price_tick=0.001)   # no quoter fee; 0.001 grid
         self.auth = auth
         self.rest = NovigRfqRest(auth, host)
         self.leg_lookup = leg_lookup                                  # outcome id -> (event id, LegFair)
@@ -341,11 +341,11 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         if r is None or traded is None:
             return
         cp: ComboPrice = r["price"]
-        if cp.yes_price is None or cp.fair is None:
-            return
+        if cp.yes_price is None or cp.fair is None or cp.action != "QUOTE":
+            return                         # a round we did not quote is not a lost auction (same base as Kalshi)
         self._write("COMBO_TRADE", venue="novig", rfq_id=rid, mode=self.cfg.mode, traded_yes_price=traded,
                     our_yes_price=cp.yes_price, fair=cp.fair, wager=_num(d.get("wager")), slice=cp.slice,
-                    would_win=cp.action == "QUOTE" and cp.yes_price <= traded + 1e-9,
+                    would_win=cp.yes_price <= traded + 1e-9, our_margin=round(cp.yes_price / cp.fair - 1, 4),
                     margin_vs_winner=round(traded / cp.fair - 1, 4))
 
     async def on_quote_accepted(self, d: dict) -> None:
@@ -448,8 +448,11 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
             pnl = settlement_pnl(row)
             if pos is None or pnl is None:
                 continue
+            res = str(row.get("result") or "").lower()
             self._write("COMBO_RESULT", venue="novig", key=rid, position_type="position", result=row.get("result"),
-                        pnl=pnl, slice=pos.get("slice"),
+                        pnl=pnl, slice=pos.get("slice"), fair=pos.get("fair"),
+                        hit=1 if res == "win" else 0 if res == "loss" else None,   # the bettor's parlay hit
+                        collateral=round(pos.get("liability") or 0.0, 2),
                         expected_profit=None if pos.get("fair") is None else
                         round(pos["wager"] / pos["price"] * (pos["price"] - pos["fair"]), 4))
             self.positions.pop(rid, None)

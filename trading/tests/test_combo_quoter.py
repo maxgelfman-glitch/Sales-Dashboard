@@ -560,16 +560,27 @@ async def test_websocket_pushes_rfqs_wins_and_executions_without_polling(tmp_pat
 
 
 def test_slice_verdicts_need_statistical_evidence():
-    from research_report import slice_verdict, wilson
+    from research_report import bootstrap_mean_lower, calibration_z, settled_needed, slice_verdict, wilson
     lo, hi = wilson(12, 200)
     assert lo < 0.06 < hi                                             # 6% of 200 is not "confidently above 5%"
-    base = dict(traded=1000, wins=120, win_ci=wilson(120, 1000), median_margin=0.10, settled=150, pnl=500.0,
-                pnl_t=1.8, below=5)
+    base = dict(traded=1000, wins=120, win_ci=wilson(120, 1000), median_margin=0.10, settled=2000, pnl=500.0,
+                calibration_z=-0.5, roc_lower95=0.01, settled_needed=1500, below=5)
     assert slice_verdict(base) == "PASS"
     assert slice_verdict({**base, "traded": 150}) == "WAIT"
+    assert slice_verdict({**base, "settled": 1000}) == "WAIT"           # under the power-based sample size
     assert slice_verdict({**base, "below": 60}) == "FAIL"              # winning mostly by underpricing
-    assert slice_verdict({**base, "pnl": -900.0, "pnl_t": -2.5}) == "FAIL"
-    assert slice_verdict({**base, "settled": 40}) == "WATCH"
+    assert slice_verdict({**base, "calibration_z": 2.5}) == "FAIL"     # parlays hit more often than we priced
+    assert slice_verdict({**base, "roc_lower95": -0.02, "pnl": -50.0}) == "FAIL"
+    assert slice_verdict({**base, "roc_lower95": -0.001}) == "WATCH"   # positive so far, not conclusive
+    # the pieces: a fair model is calibrated; one that is 20% too cheap is caught
+    import random
+    rng = random.Random(1)
+    fair = [(0.25, int(rng.random() < 0.25)) for _ in range(4000)]
+    cheap = [(0.25, int(rng.random() < 0.30)) for _ in range(4000)]
+    assert abs(calibration_z(fair)) < 2 and calibration_z(cheap) > 4
+    assert settled_needed(fair, 0.10) > 1000                           # parlays need thousands, not 100
+    assert bootstrap_mean_lower([0.05] * 50 + [-0.9] * 2) < 0             # 52 lopsided parlays prove nothing
+    assert bootstrap_mean_lower([0.05] * 1000 + [-0.9] * 20) > 0 > bootstrap_mean_lower([0.05] * 1000 + [-0.9] * 60)
 
 
 def test_unknown_requesters_can_carry_an_extra_cushion():
@@ -588,3 +599,13 @@ def test_unknown_requester_margin_is_bounded():
         .requester_unknown_margin == 0.02
     with pytest.raises(ConfigError):
         parlay_config({"COMBO_UNKNOWN_REQUESTER_MARGIN": "0.5"}, "shadow", None, "kalshi")
+
+
+def test_kalshi_quotes_sit_on_the_cent_grid_rounded_against_the_requester():
+    from main_supervisor import parlay_config
+    cfg = parlay_config({}, "shadow", None, "kalshi")
+    assert cfg.price_tick == 0.01
+    cp = ComboPricer(cfg, leg_fair).price(rfq())
+    assert cp.action == "QUOTE" and abs(cp.yes_price * 100 - round(cp.yes_price * 100)) < 1e-9
+    fine = ComboPricer(ComboConfig(), leg_fair).price(rfq())
+    assert cp.yes_price >= fine.yes_price                              # rounding only ever moves it up

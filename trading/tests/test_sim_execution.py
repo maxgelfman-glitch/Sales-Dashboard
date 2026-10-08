@@ -170,9 +170,9 @@ def test_report_sections(tmp_path):
     sv = survival_summary(data)
     assert sv["over_500ms"] == 0.5 and sv["over_5000ms"] == 0.5
     pm = projected_monthly(data)
-    assert pm["days"] == 1.0 and pm["per_month"] == 150.0
+    assert pm["days"] == 2.0 and pm["per_month"] == 75.0              # rows on two calendar days
     text = build_report(data)
-    for section in ("[EXECUTION]", "[EDGE SURVIVAL]", "[PROJECTED MONTHLY]", "$150/month"):
+    for section in ("[EXECUTION]", "[EDGE SURVIVAL]", "[PROJECTED MONTHLY]", "$75/month"):
         assert section in text
 
 

@@ -149,6 +149,7 @@ class ComboConfig:
     requester_widen_margin: float = 0.04
     requester_block_roi: float = 0.15        # ... above this -> decline
     requester_unknown_margin: float = 0.0    # extra margin while a requester has no record yet (or is anonymous)
+    price_tick: float = 0.0001               # the venue's price grid (production Kalshi: 0.01, Novig: 0.001)
     max_book_spread: float = 0.03
     min_book_size: float = 100.0             # contracts on BOTH sides of a Kalshi book before its mid is used
     live_book_legs: bool = False             # legs priced only from Kalshi's own book: shadow-only by default
@@ -356,7 +357,8 @@ class ComboPricer:
                             sportsbook_yes=sb)
             if same_game or uncertainty >= cfg.sportsbook_when_uncertain:
                 yes_price = max(yes_price, sb * (1 - cfg.sportsbook_discount))
-        yes_price = min(math.ceil(yes_price * 10_000 - 1e-6) / 10_000, 0.99)   # round UP: never the user's way
+        ticks = round(1 / cfg.price_tick)
+        yes_price = min(math.ceil(round(yes_price * ticks, 6)) / ticks, 1 - cfg.price_tick)   # UP to the grid
         no_bid = round(1 - yes_price, 4)
         span = max(cfg.uncertainty_full_cut, 1e-9)
         size_factor = round(max(cfg.min_size_factor, 1 - (1 - cfg.min_size_factor) * min(1.0, uncertainty / span)), 3)
@@ -886,6 +888,7 @@ class ComboQuoter:
             self._write("COMBO_TRADE", rfq_id=rid, market_ticker=ticker, mode=self.cfg.mode, traded_yes_price=traded,
                         our_yes_price=cp.yes_price, fair=cp.fair, n_trades=len(prices), slice=cp.slice,
                         would_win=None if traded is None else cp.yes_price <= traded + 1e-9,
+                        our_margin=None if not cp.fair else round(cp.yes_price / cp.fair - 1, 4),   # what we'd earn
                         margin_vs_winner=None if traded is None or not cp.fair else round(traded / cp.fair - 1, 4))
             if traded is None or cp.yes_price > traded + 1e-9 or p.get("sent"):
                 self.priced.pop(rid, None)            # nothing to settle in shadow (a real quote settles as a position)
@@ -918,7 +921,9 @@ class ComboQuoter:
             self.requesters.add(creator, -pnl, cp.contracts * cp.yes_price)       # their gain is our loss
             self._write("COMBO_RESULT", key=key, position_type=kind, market_ticker=ticker, result=result, pnl=round(pnl, 2),
                         expected_profit=cp.expected_profit, contracts=cp.contracts, yes_price=cp.yes_price, fair=cp.fair,
-                        slice=cp.slice, creator_id=creator)
+                        slice=cp.slice, creator_id=creator,
+                        hit=None if result not in {"yes", "no"} else int(result == "yes"),      # the parlay hit
+                        collateral=round(cp.contracts * cp.no_bid + cp.fee, 2))
             if kind == "shadow":
                 self.priced.pop(key, None)
             else:

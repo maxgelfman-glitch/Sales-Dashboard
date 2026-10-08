@@ -107,7 +107,7 @@ def test_kalshi_start_time_parsed():
 def test_supervisor_learns_start_times_from_registries(tmp_path):
     sup = paper_sup(tmp_path)
     assert sup.game_start[NYK_GAME] == pytest.approx(main_supervisor.DEMO_START)
-    assert 1430 < sup.minutes_to_start(NYK_GAME) <= 1440
+    assert sup.minutes_to_start(NYK_GAME) == pytest.approx((main_supervisor.DEMO_START - time.time()) / 60, abs=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -521,10 +521,11 @@ def test_recorder_uses_utc_day_files_and_never_raises(tmp_path):
 # ---------------------------------------------------------------------------
 async def test_decision_entry_close_give_closing_line_value(tmp_path):
     sup = paper_sup(tmp_path)
+    starts_in(sup, NYK_GAME, 3)                       # the bet's game starts in 3 minutes ...
     await sup.on_market_update(upd("O-NYK", 0.49), None)
     [dec] = rows_of(tmp_path / "research", "DECISION")
     assert (dec["action"], dec["venue"], dec["game"][:3]) == ("BET", "novig", list(NYK_GAME))
-    assert dec["edge"] > 0.025 and dec["minutes_to_start"] > 1400 and dec["moved_last"] in ("novig", "sharp")
+    assert dec["edge"] > 0.025 and 2 < dec["minutes_to_start"] <= 3 and dec["moved_last"] in ("novig", "sharp")
     [entry] = rows_of(tmp_path / "research", "ENTRY")
     assert (entry["order_kind"], entry["price"], entry["side"]) == ("DIRECTIONAL", 0.49, "New York Knicks")
     sup.feed.latest["O-NYK"] = upd("O-NYK", 0.53)
@@ -789,3 +790,36 @@ def test_multi_level_mode_from_env_and_report(tmp_path, monkeypatch):
     assert sup.multi_level_mode == "single" and "single order limited" in format_state_report(sup)
     with pytest.raises(ConfigError):
         build_live_supervisor({**base, "NOVIG_MULTI_LEVEL_MODE": "sideways"})
+
+
+def test_clv_matches_each_bet_to_its_own_games_close():
+    """A series: the same matchup three days running. Each bet is scored against ITS game's close."""
+    from research_report import clv_summary
+    game = ["MLB", "New York Yankees", "Boston Red Sox", "moneyline"]
+    rows, day = [], 86400
+    for i, (price, close) in enumerate([(0.48, 0.50), (0.60, 0.62), (0.40, 0.42)]):   # +2c every game
+        t0, start = 1_790_000_000 + i * day, 1_790_000_000 + i * day + 3600
+        rows.append(dict(ts=t0, kind="ENTRY", venue="novig", game=game, side="New York Yankees", line=None,
+                         price=price, contracts=100, stake_usd=price * 100, start_time=start))
+        rows.append(dict(ts=start - 60, kind="CLOSE", game=game, side="New York Yankees", line=None,
+                         close_fair_prob=close, start_time=start))
+    clv = clv_summary(rows)
+    assert clv["entries_with_close"] == 3 and clv["beat_close"] == 3
+    assert clv["mean_clv_cents"] == pytest.approx(2.0)
+
+
+def test_kalshi_clv_is_net_of_the_taker_fee():
+    from research_report import clv_summary
+    game = ["NBA", "New York Knicks", "Boston Celtics", "moneyline"]
+    rows = [dict(ts=1, kind="ENTRY", venue="kalshi", game=game, side="Boston Celtics", line=None, price=0.44,
+                 contracts=100, stake_usd=45.73),
+            dict(ts=2, kind="CLOSE", game=game, side="Boston Celtics", line=None, close_fair_prob=0.47826)]
+    fee = 0.07 * 0.44 * 0.56
+    assert clv_summary(rows)["mean_clv_cents"] == pytest.approx(100 * (0.47826 - 0.44 - fee))
+
+
+def test_a_decision_without_an_edge_never_crashes_the_report():
+    from research_report import build_report
+    rows = [dict(ts=1, kind="DECISION", venue="novig", action="PASS", edge=None, reason="line mismatch",
+                 price=0.48, game=["NFL", "a", "b", "spread"], side="a", line=-3.5)]
+    assert "RESEARCH REPORT" in build_report(rows)

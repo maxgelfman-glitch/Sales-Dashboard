@@ -132,10 +132,16 @@ def projected_monthly(rows: list[dict]) -> dict:
     ex = [r for r in rows if r["kind"] == "EXECUTION"]
     if not ex:
         return {"days": 0}
-    days = max(1.0, (max(r["ts"] for r in ex) - min(r["ts"] for r in ex)) / 86400)
+    # per day the engine RAN (any research row), not the span of fills: fills bunched into one afternoon of a
+    # three-day run must not be read as one day's income
+    # calendar days (UTC) on which the engine wrote anything: a partial day counts as a whole one, so the
+    # projection errs LOW (a span of fill times read three days of running as one)
+    days = max(1.0, float(len({datetime.fromtimestamp(r["ts"], timezone.utc).date() for r in rows if r.get("ts")})))
     by_kind = defaultdict(float)
     for r in ex:
-        by_kind["pairs_and_hedges" if r.get("kind") == "ARB_HEDGE" else "directional"] += r.get("expected_profit_usd") or 0
+        k = r.get("order_kind") or r.get("kind")
+        by_kind["pairs_and_hedges" if k in {"ARB_HEDGE", "ARB_PAIR"} else "directional"] += \
+            r.get("expected_profit_usd") or 0
     total = sum(by_kind.values())
     return {"days": round(days, 2), "expected_profit_usd": round(total, 2), "per_day": round(total / days, 2),
             "per_month": round(total / days * 30, 2), "by_kind": dict(by_kind),
@@ -196,10 +202,15 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
         d["traded"] += 1
         if r.get("would_win"):
             d["wins"] += 1
-            if r.get("margin_vs_winner") is not None:
-                d["margins"].append(r["margin_vs_winner"])
+            # OUR margin (our price vs fair) is what a win earns; the winner's price only says what was left
+            m = r.get("our_margin")
+            if m is None and r.get("fair"):
+                m = r["our_yes_price"] / r["fair"] - 1
+            if m is not None:
+                d["margins"].append(m)
         d["below"] += r["our_yes_price"] < r["traded_yes_price"] * (1 - FAR_BELOW)
-    pnls: dict[str, list[float]] = {}
+    roc: dict[str, list[float]] = {}
+    calib: dict[str, list[tuple[float, int]]] = {}
     for r in results:
         d = out.get(_slice_key(r))
         if d is None:
@@ -207,12 +218,17 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
         d["settled"] += 1
         d["pnl"] += r.get("pnl") or 0
         d["expected"] += r.get("expected_profit") or 0
-        pnls.setdefault(_slice_key(r), []).append(float(r.get("pnl") or 0))
+        if r.get("collateral"):
+            roc.setdefault(_slice_key(r), []).append(float(r.get("pnl") or 0) / float(r["collateral"]))
+        if r.get("fair") is not None and r.get("hit") in (0, 1):
+            calib.setdefault(_slice_key(r), []).append((float(r["fair"]), int(r["hit"])))
     for name, d in out.items():
         d["win_rate"] = d["wins"] / d["traded"] if d["traded"] else None
         d["median_margin"] = _median(d.pop("margins"))
         d["win_ci"] = wilson(d["wins"], d["traded"])
-        d["pnl_t"] = t_stat(pnls.get(name, []))
+        d["roc_lower95"] = bootstrap_mean_lower(roc.get(name, []))
+        d["calibration_z"] = calibration_z(calib.get(name, []))
+        d["settled_needed"] = settled_needed(calib.get(name, []), d["median_margin"])
         d["verdict"] = slice_verdict(d)
     return dict(sorted(out.items(), key=lambda kv: -kv[1]["rfqs"]))
 
@@ -227,6 +243,36 @@ def wilson(k: int, n: int, z: float = 1.96) -> Optional[tuple[float, float]]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+def bootstrap_mean_lower(xs: list[float], level: float = 0.95, n_boot: int = 4000, seed: int = 7) -> Optional[float]:
+    """One-sided lower confidence bound on the MEAN (percentile bootstrap, fixed seed so a report is reproducible).
+    Short-parlay P&L is lopsided (many small wins, rare large losses): a t-test on it is not trustworthy."""
+    if len(xs) < 30:
+        return None
+    import random as _random
+    rng, n = _random.Random(seed), len(xs)
+    means = sorted(sum(xs[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
+    return means[int((1 - level) * n_boot)]
+
+
+def calibration_z(pairs: list[tuple[float, int]]) -> Optional[float]:
+    """Z = (parlays that hit - parlays our fair said would hit) / sd. Positive = they hit MORE than we priced:
+    our fair is too low (we sell too cheap). Tests the model itself, not the noisy P&L."""
+    if len(pairs) < 30:
+        return None
+    var = sum(f * (1 - f) for f, _ in pairs)
+    return None if var <= 0 else sum(h - f for f, h in pairs) / math.sqrt(var)
+
+
+def settled_needed(pairs: list[tuple[float, int]], margin: Optional[float]) -> Optional[int]:
+    """Settled parlays needed to tell this margin from zero (80% power, one-sided 5%):
+    n = (2.49 * sqrt(mean f(1-f)) / (margin * mean f))^2."""
+    if not pairs or not margin or margin <= 0:
+        return None
+    mf = sum(f for f, _ in pairs) / len(pairs)
+    mv = sum(f * (1 - f) for f, _ in pairs) / len(pairs)
+    return None if mf <= 0 else int(math.ceil((2.49 * math.sqrt(mv) / (margin * mf)) ** 2))
+
+
 def t_stat(xs: list[float]) -> Optional[float]:
     """Mean / standard error: how many standard errors the average P&L is from zero."""
     if len(xs) < 2:
@@ -236,26 +282,35 @@ def t_stat(xs: list[float]) -> Optional[float]:
     return None if var <= 0 else mean / math.sqrt(var / len(xs))
 
 
-GATE_MIN_TRADED, GATE_MIN_SETTLED = 200, 100      # parlay outcomes are noisy: below these, nothing is decided
+GATE_MIN_TRADED, GATE_MIN_SETTLED = 200, 300      # parlay outcomes are noisy: below these, nothing is decided
 
 
 def slice_verdict(d: dict) -> str:
     """
-    PASS  the win rate is confidently >= 5% (lower 95% bound), the median margin when winning >= 8%, at least 100
-          settled with positive P&L (t >= 1), and fewer than 20% of wins came from quotes 10%+ under the market
-          (winning mostly by underpricing is the winner's curse, not edge).
-    FAIL  confidently < 5% wins, settled P&L confidently negative (t <= -2), or mostly suspiciously cheap wins.
+    The win rate (how often our price would have won the auction) is a CAPACITY gate, not evidence of edge: a
+    model that is too cheap wins more. Edge is judged on the model and on realised return, with a sample size
+    fixed by statistical power (not "100"), evaluated only once it is reached.
+    PASS  traded >= 200 with a win rate confidently >= 5%; OUR median margin >= 8%; settled >= max(300, the
+          power-based number needed); calibration Z <= 0 (parlays did not hit more often than we priced); the 95%
+          lower bound of return on collateral > 0; fewer than 20% of wins came 10%+ under the market.
+    FAIL  confidently < 5% wins; calibration Z >= 2 (we price too cheap); return-on-collateral bound < 0 at the
+          required sample; or mostly suspiciously cheap wins.
     WAIT  not enough data yet. WATCH  enough data, not conclusive.
     """
     ci, wins = d.get("win_ci"), d.get("wins", 0)
     cheap = d.get("below", 0) / wins if wins else 0.0
     if d.get("traded", 0) < GATE_MIN_TRADED:
         return "WAIT"
-    if (ci and ci[1] < 0.05) or (d.get("pnl_t") is not None and d["pnl_t"] <= -2 and d["settled"] >= 30) \
-            or (wins >= 20 and cheap > 0.2):
+    z, lower = d.get("calibration_z"), d.get("roc_lower95")
+    need = max(GATE_MIN_SETTLED, d.get("settled_needed") or 0)
+    if (ci and ci[1] < 0.05) or (z is not None and z >= 2) or (wins >= 20 and cheap > 0.2):
         return "FAIL"
-    if (ci and ci[0] >= 0.05 and (d.get("median_margin") or 0) >= 0.08 and d.get("settled", 0) >= GATE_MIN_SETTLED
-            and d["pnl"] > 0 and (d.get("pnl_t") or 0) >= 1 and cheap <= 0.2):
+    if d.get("settled", 0) < need:
+        return "WAIT"
+    if lower is not None and lower < 0 and d.get("pnl", 0) < 0:
+        return "FAIL"
+    if (ci and ci[0] >= 0.05 and (d.get("median_margin") or 0) >= 0.08 and z is not None and z <= 0
+            and lower is not None and lower > 0 and cheap <= 0.2):
         return "PASS"
     return "WATCH"
 
@@ -269,18 +324,48 @@ def decisions_summary(rows: list[dict]) -> dict:
         "edge_over_2_5pct": sum(e > 0.025 for e in edges),
         "median_edge": _median(edges),
         "by_venue": dict(Counter(r.get("venue") for r in dec)),
-        "moved_last": dict(Counter(r.get("moved_last") or "unknown" for r in dec if r.get("edge", 0) > 0.025)),
+        "moved_last": dict(Counter(r.get("moved_last") or "unknown" for r in dec if (r.get("edge") or 0) > 0.025)),
         "median_sharp_age_s": _median(r.get("sharp_age_s") for r in dec),
     }
 
 
-def _closes(rows: list[dict]) -> dict[tuple, float]:
-    """Latest pregame closing fair value per (game, side, line): the scheduled-start snapshot beats the cutoff one."""
-    closes: dict[tuple, float] = {}
-    for r in rows:                                    # rows are time-ordered: later snapshots overwrite
-        if r["kind"] == "CLOSE" and r.get("close_fair_prob") is not None:
-            closes[_key(r)] = r["close_fair_prob"]
-    return closes
+SAME_GAME_CLOSE_S = 3 * 3600      # snapshots of one game's close (cutoff, scheduled start) fall within this
+
+
+class _Closes:
+    """Closing fair values per (game, side, line), matched to THE game of each bet. A matchup repeats (series,
+    rematches): the close of a bet is the first close written AFTER it (and the latest snapshot of that same
+    game), with matching start times when both rows carry one. Never the last close of the whole dataset."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.by_key: dict[tuple, list[tuple[float, Optional[float], float]]] = defaultdict(list)
+        for r in rows:                                # rows are time-ordered
+            if r["kind"] == "CLOSE" and r.get("close_fair_prob") is not None:
+                self.by_key[_key(r)].append((r.get("ts", 0), r.get("start_time"), r["close_fair_prob"]))
+
+    def get(self, row: dict) -> Optional[float]:
+        ts, start = row.get("ts", 0), row.get("start_time")
+        after = [c for c in self.by_key.get(_key(row), ()) if c[0] >= ts
+                 and (start is None or c[1] is None or abs(c[1] - start) <= 2 * 3600)]
+        if not after:
+            return None
+        first = after[0][0]
+        return [c for c in after if c[0] <= first + SAME_GAME_CLOSE_S][-1][2]
+
+
+def _closes(rows: list[dict]) -> _Closes:
+    return _Closes(rows)
+
+
+def _clv(row: dict, close_fair: float) -> float:
+    """$ per contract: what the contract was worth at the close (after any win-only fee) minus what it cost,
+    fees included. Ignoring fees overstated Kalshi CLV by up to 1.75c a contract."""
+    from research import upfront_fee, win_fee
+    venue, price = row.get("venue") or "", row["price"]
+    fee = row.get("fee_per_contract")
+    if fee is None:
+        fee = upfront_fee(venue, price)
+    return close_fair * (1 - win_fee(venue, price)) - (price + fee)
 
 
 def clv_by_time(rows: list[dict]) -> dict:
@@ -290,9 +375,9 @@ def clv_by_time(rows: list[dict]) -> dict:
     for r in rows:
         if r["kind"] != "DECISION" or r.get("action") != "BET" or r.get("price") is None:
             continue
-        fair = closes.get(_key(r))
+        fair = closes.get(r)
         if fair is not None:
-            cells[(bucket(r.get("minutes_to_start")), bool(r.get("blocked")))].append(100 * (fair - r["price"]))
+            cells[(bucket(r.get("minutes_to_start")), bool(r.get("blocked")))].append(100 * _clv(r, fair))
     return {k: {"decisions": len(v), "mean_clv_cents": _mean(v), "beat_close": sum(x > 0 for x in v) / len(v)}
             for k, v in cells.items()}
 
@@ -313,11 +398,11 @@ def clv_by_mover(rows: list[dict]) -> dict:
     for r in rows:
         if r["kind"] != "DECISION" or r.get("action") != "BET" or r.get("price") is None:
             continue
-        fair = closes.get(_key(r))
+        fair = closes.get(r)
         if fair is None:
             continue
         mover = "sharp" if r.get("moved_last") == "sharp" else "venue" if r.get("moved_last") else "unknown"
-        cells[(mover, move_bucket(r.get("sharp_move_age_s")))].append(100 * (fair - r["price"]))
+        cells[(mover, move_bucket(r.get("sharp_move_age_s")))].append(100 * _clv(r, fair))
     return {k: {"decisions": len(v), "mean_clv_cents": _mean(v), "beat_close": sum(x > 0 for x in v) / len(v)}
             for k, v in cells.items()}
 
@@ -329,12 +414,12 @@ def clv_by_method(rows: list[dict]) -> dict:
     for r in rows:
         if r["kind"] != "DECISION" or r.get("price") is None or not r.get("fair_by_method"):
             continue
-        fair_close = closes.get(_key(r))
+        fair_close = closes.get(r)
         if fair_close is None:
             continue
         for method, fair in r["fair_by_method"].items():
             if fair and fair / r["price"] - 1 > 0.025:              # would have been a bet under this method
-                cells[method].append(100 * (fair_close - r["price"]))
+                cells[method].append(100 * _clv(r, fair_close))
     return {m: {"would_bet": len(v), "mean_clv_cents": _mean(v)} for m, v in cells.items()}
 
 
@@ -348,15 +433,17 @@ def clv_summary(rows: list[dict]) -> dict:
     for r in rows:
         if r["kind"] != "ENTRY":
             continue
-        fair = closes.get(_key(r))
+        fair = closes.get(r)
         if fair is None:
             continue
-        clv = fair - r["price"]
+        clv = _clv(r, fair)
         per_entry.append({"order_id": r.get("order_id"), "kind": r.get("order_kind"), "venue": r.get("venue"),
                           "clv_per_contract": clv, "clv_pct": clv / r["price"] if r["price"] else None,
                           "clv_usd": clv * r.get("contracts", 0), "stake_usd": r.get("stake_usd", 0.0)})
     entries = sum(r["kind"] == "ENTRY" for r in rows)
     stake = sum(e["stake_usd"] for e in per_entry)
+    # entries with no close (the number moved, no sharp line): often the biggest movers, so CLV is biased
+    dropped = Counter((r.get("game") or [None] * 4)[3] for r in rows if r["kind"] == "ENTRY" and closes.get(r) is None)
     return {
         "entries": entries,
         "entries_with_close": len(per_entry),
@@ -365,16 +452,29 @@ def clv_summary(rows: list[dict]) -> dict:
         "total_clv_usd": sum(e["clv_usd"] for e in per_entry),
         "clv_return_on_stake": None if not stake else sum(e["clv_usd"] for e in per_entry) / stake,
         "per_entry": per_entry,
+        "dropped_by_market": dict(dropped),
     }
 
 
 def markout_summary(rows: list[dict]) -> dict:
+    """Per delay: mean markout (fair later - fill price), contract-weighted too (a 1-lot must not outweigh a
+    1,000-lot), and the share of fills where fair value then MOVED AGAINST us (fair later < fair at the fill:
+    adverse selection), which a positive markout from a big entry edge would otherwise hide."""
     by_delay = defaultdict(list)
     for r in rows:
         if r["kind"] == "MARKOUT" and r.get("markout_per_contract") is not None:
-            by_delay[r["delay_s"]].append(r["markout_per_contract"])
-    return {delay: {"fills": len(v), "mean_cents": 100 * _mean(v), "adverse_share": sum(x < 0 for x in v) / len(v)}
-            for delay, v in sorted(by_delay.items())}
+            by_delay[r["delay_s"]].append(r)
+    out = {}
+    for delay, rs in sorted(by_delay.items()):
+        v = [r["markout_per_contract"] for r in rs]
+        w = [max(r.get("contracts") or 0, 0) for r in rs]
+        moves = [r["fair_prob"] - r["fair_at_fill"] for r in rs
+                 if r.get("fair_at_fill") is not None and r.get("fair_prob") is not None]
+        out[delay] = {"fills": len(v), "mean_cents": 100 * _mean(v),
+                      "weighted_mean_cents": 100 * sum(x * c for x, c in zip(v, w)) / sum(w) if sum(w) else None,
+                      "adverse_share": sum(x < 0 for x in v) / len(v),
+                      "moved_against_share": sum(m < -1e-9 for m in moves) / len(moves) if moves else None}
+    return out
 
 
 def markout_by_time(rows: list[dict], delay: float = 60.0) -> dict:
@@ -494,8 +594,10 @@ def build_report(rows: list[dict]) -> str:
 
     m = markout_summary(rows)
     out += ["", "[MAKER MARKOUTS]  (fair value after each maker fill minus our fill price)"]
-    out += [f"  +{delay:>5.0f}s  fills {v['fills']:>5}   mean {v['mean_cents']:+.2f}c   "
-            f"moved against us {v['adverse_share']:.0%}" for delay, v in m.items()] or ["  no maker fills yet"]
+    out += [f"  +{delay:>5.0f}s  fills {v['fills']:>5}   mean {v['mean_cents']:+.2f}c "
+            f"(per contract {_fmt(v['weighted_mean_cents'], '+.2f')}c)   below our price {v['adverse_share']:.0%}   "
+            f"fair moved against us {_fmt(v['moved_against_share'] and v['moved_against_share'] * 100, '.0f')}%"
+            for delay, v in m.items()] or ["  no maker fills yet"]
     mt = markout_by_time(rows)
     if mt:
         out.append("  +60s by time to start: " + "   ".join(
@@ -555,21 +657,26 @@ def build_report(rows: list[dict]) -> str:
         out.append(f"  winning price vs our fair value: median "
                    f"{_fmt(c['median_margin_when_winning'] and c['median_margin_when_winning'] * 100, '+.1f')}%   "
                    f"expected profit of would-win quotes ${c['expected_profit_of_wins']:,.2f}")
-        out.append(f"  settled {c['settled']:,}: P&L ${c['settled_pnl']:,.2f} vs expected ${c['settled_expected']:,.2f}"
+        out.append(f"  settled {c['settled']:,}: P&L ${c['settled_pnl']:,.2f} vs MODEL expected "
+                   f"${c['settled_expected']:,.2f} (the model's figure is biased high on won auctions: we win when "
+                   f"our fair is too low)"
                    f"   live last look: {c['confirms']} confirmed, {c['declines']} declined")
         out.append(f"  top skip reasons: {c['skip_reasons']}")
         if c["far_below_market"]:
             out.append(f"  WARNING {c['far_below_market']} quote(s) were 10%+ cheaper than where the parlay traded: "
                        "usually our model, not a gift")
         out.append(f"  {'venue slice':<28}{'rfqs':>7}{'quote':>7}{'traded':>7}{'win%':>7}{'margin':>8}{'settled':>8}"
-                   f"{'P&L':>10}{'expected':>10}  verdict")
+                   f"{'needed':>8}{'calib z':>8}{'ROC lo95':>9}{'P&L':>10}  verdict")
         for name, d in list(c["by_slice"].items())[:15]:
             out.append(f"  {name:<28}{d['rfqs']:>7,}{d['quotable']:>7,}{d['traded']:>7,}"
                        f"{_fmt(d['win_rate'] and d['win_rate'] * 100, '.1f'):>7}"
                        f"{_fmt(d['median_margin'] and d['median_margin'] * 100, '+.1f'):>8}{d['settled']:>8,}"
-                       f"{d['pnl']:>10,.2f}{d['expected']:>10,.2f}  {d['verdict']}")
-        out.append("  (a slice goes live only on PASS: win rate >= 5% at 95% confidence, median margin >= 8%, 100+ "
-                   "settled with positive P&L, wins not mostly from underpricing; WAIT = under 200 traded)")
+                       f"{_fmt(d.get('settled_needed'), 'd'):>8}{_fmt(d.get('calibration_z'), '+.2f'):>8}"
+                       f"{_fmt(None if d.get('roc_lower95') is None else d['roc_lower95'] * 100, '+.2f'):>9}"
+                       f"{d['pnl']:>10,.2f}  {d['verdict']}")
+        out.append("  (a slice goes live only on PASS: enough auctions won (capacity), our margin >= 8%, the "
+                   "power-based number of settled parlays, parlays hitting no more often than priced, and a 95% "
+                   "lower bound on return on collateral above 0; WAIT = not enough data)")
     else:
         out.append("  no RFQs seen (COMBO_QUOTER=shadow with Kalshi keys)")
 
