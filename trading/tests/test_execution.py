@@ -440,3 +440,10 @@ def test_record_fill_never_refuses():
     m = ExposureMonitor(limit_usd=100)
     m.record_fill("f1", 150)                                  # a fill already happened: record it
     assert m.open_exposure == 150 and m.taker_halted
+
+
+@pytest.mark.parametrize("odds", [float("inf"), float("-inf"), -1e300, float("nan")])
+async def test_non_finite_sharp_odds_are_a_pass_never_a_crash(odds):
+    from execution import evaluate_market_edge
+    d = await evaluate_market_edge({"price": 0.45}, {"odds_for": odds, "odds_against": -110})
+    assert d.action == "PASS"

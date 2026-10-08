@@ -207,7 +207,7 @@ def test_a_connected_but_frozen_feed_is_withheld():
     assert s.frozen()
 
 
-def test_websocket_and_rest_lines_share_keys_and_a_moved_main_line_demotes_the_old_one():
+def test_websocket_and_rest_lines_share_keys_and_a_moved_main_line_removes_the_old_price():
     from therundown_feed import _lk
     assert _lk("-3.0") == _lk(-3) == _lk("-3")
     s = source()
@@ -215,4 +215,20 @@ def test_websocket_and_rest_lines_share_keys_and_a_moved_main_line_demotes_the_o
     key = next(k for k in s.prices if k[1] == 2)
     s.apply_row({"event_id": key[0], "market_id": 2, "participant_id": key[2], "affiliate_id": 3,
                  "line": float(key[3]) - 0.5, "price": -105, "is_main_line": True})
-    assert s.prices[key][3]["main"] is False                            # the old number is no longer main
+    # the old number's price is the pre-move price, which Pinnacle no longer offers: it must not be served
+    assert 3 not in s.prices.get(key, {})
+    assert not any(l["line"] == float(key[3]) for l in s.lines() if l["market_type"] == "spread")
+
+
+def test_a_one_sided_update_waits_for_the_other_side():
+    s = source()
+    s.load_events([EVENT])
+    key = next(k for k in s.prices if k[1] == 1)
+    before = [l for l in s.lines() if l["market_type"] == "moneyline"]
+    s.clock.t += 60                                                     # a minute after the snapshot
+    s.apply_row({"event_id": key[0], "market_id": 1, "participant_id": key[2], "affiliate_id": 3,
+                 "line": key[3], "price": -300, "is_main_line": True})
+    assert by(before, "moneyline") and not by(s.lines(), "moneyline")   # Pinnacle: new price, old other side
+    assert by(s.lines(), "moneyline", "draftkings")                     # another book is unaffected
+    s.clock.t += 2.0                                                    # the other side never moved: now pair
+    assert by(s.lines(), "moneyline")

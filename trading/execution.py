@@ -102,7 +102,9 @@ class EdgeDecision(BaseModel):
 # Pure math helpers
 # --------------------------------------------------------------------------
 def american_to_decimal(odds: float) -> float:
-    """Convert American odds to decimal odds. Valid American odds are >= +100 or <= -100."""
+    """Convert American odds to decimal odds. Valid American odds are >= +100 or <= -100 (finite)."""
+    if not isinstance(odds, (int, float)) or not math.isfinite(odds) or abs(odds) > 1e6:
+        raise ValueError(f"invalid American odds {odds!r}: not a finite price")
     if odds >= 100:
         return 1.0 + odds / 100.0
     if odds <= -100:
@@ -182,7 +184,10 @@ async def evaluate_market_edge(
             novig.line is not None and not math.isclose(novig.line, sharp.line)):
         return EdgeDecision(action="PASS", reason=f"line mismatch novig={novig.line} sharp={sharp.line}")
 
-    (fair_prob, _), overround = fair_devig([dec_for, dec_against])
+    try:
+        (fair_prob, _), overround = fair_devig([dec_for, dec_against])
+    except (ValueError, ZeroDivisionError) as exc:          # never raises: bad sharp data is a PASS
+        return EdgeDecision(action="PASS", reason=f"invalid sharp prices: {exc}")
     if not MIN_OVERROUND <= overround <= MAX_OVERROUND:     # e.g. -1000/-1000 or +150/+150: not a real market
         return EdgeDecision(action="PASS", reason=f"sharp overround {overround:.3f} outside "
                                                   f"[{MIN_OVERROUND}, {MAX_OVERROUND}]: bad data")

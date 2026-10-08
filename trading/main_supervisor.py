@@ -1013,6 +1013,12 @@ class Supervisor:
                  decision.fee_usd, decision.reason)
         if decision.action != "BET":
             return
+        if key[3] in {"spread", "total"} and not _is_half_point(update.line):
+            # A whole number can push: the de-vigged price is P(win | no push), not what the contract pays, and
+            # the venues' push rules are unconfirmed (a push settled as a loss turns +4% into -5%).
+            self.stats["whole_number_blocked"] += 1
+            log.info("EV_TRIGGER not executed: whole-number line %s can push", update.line)
+            return
         log.info("EV_TRIGGER %s %s %s ask=%.4f fair=%.4f edge=%+.4f%% kelly=$%.2f stake=$%.2f capped=%s%s",
                  update.venue, key, side, update.price, decision.fair_prob, decision.edge * 100,
                  decision.kelly_stake_usd, decision.stake_usd, decision.capped,
@@ -2044,7 +2050,8 @@ class Supervisor:
         """Spreads and totals must be priced at their own number; a missing line on either side is refused."""
         if market_type not in {"spread", "total"}:
             return True
-        return venue_line is not None and sharp_line is not None and math.isclose(venue_line, sharp_line)
+        return venue_line is not None and sharp_line is not None and math.isclose(venue_line, sharp_line) \
+            and _is_half_point(venue_line)                 # a whole number can push: never a parlay leg
 
     def parlay_liability(self) -> float:
         books = [q.book for q in (self.combo, getattr(self, "novig_rfq", None)) if q is not None]
@@ -2728,6 +2735,8 @@ class Supervisor:
             if (key in self.positions or self._trade_blocked(key[:3], "maker") or self._loss_halted()
                     or self.game_unhedged(key[:3]) > 0):      # correlated: only quote games we hold nothing in
                 continue
+            if key[3] in {"spread", "total"} and not _is_half_point(info.line):
+                continue                                       # a whole number can push: fair is not p
             sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line, start=info.start_time)
             if sharp is None or (info.line is not None and sharp.line is not None
                                  and not math.isclose(info.line, sharp.line)):

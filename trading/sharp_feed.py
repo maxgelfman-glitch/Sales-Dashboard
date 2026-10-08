@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -53,6 +54,7 @@ from team_normalizer import DYNAMIC_LEAGUES, canonical_league, names_match, norm
 
 SHARP_MAX_AGE_SECONDS = 30.0      # the freshness rule
 CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
+CONSENSUS_MAX_SPREAD = 0.03      # books disagreeing by more than 3 points of probability: no consensus line
 
 bridge_log = logging.getLogger("trading.bridge")
 sharp_log = logging.getLogger("trading.sharp")
@@ -172,6 +174,7 @@ class SharpBook:
                                   observed_at - now)
                 rejected += 1
                 continue
+            observed_at = min(observed_at, now)        # a few seconds ahead (clock skew) never buys extra life
             if now - observed_at > self.max_age:
                 stale += 1
                 rejected += 1
@@ -348,19 +351,30 @@ class SharpBook:
         return self.weights.get(book, 1.0 if not self.weights else self.weights.get("*", 0.0))
 
     def _consensus(self, pool: dict[str, tuple[SharpLine, float]]) -> Optional[SharpLine]:
-        """Weighted average of each book's de-vigged probability, returned as a zero-margin line."""
-        from execution import american_to_decimal, fair_devig   # local: execution does not import this module
+        """Weighted average of each book's de-vigged probability, returned as a zero-margin line.
+        A book with a broken market (overround outside the sane range, e.g. teams swapped or -1000/-1000) is left
+        out, and books that disagree by more than CONSENSUS_MAX_SPREAD give NO line: averaging a bad book in
+        hides it (the blended line always looks clean) and creates edges that are not there."""
+        from execution import MAX_OVERROUND, MIN_OVERROUND, american_to_decimal, fair_devig   # local: no cycle
         num = den = 0.0
+        probs = []
         for book, (ln, _) in pool.items():
             try:
-                (p, _), _ = fair_devig([american_to_decimal(ln.odds_for), american_to_decimal(ln.odds_against)])
-            except ValueError:
+                d = [american_to_decimal(ln.odds_for), american_to_decimal(ln.odds_against)]
+                if not all(math.isfinite(x) and x > 1 for x in d) \
+                        or not MIN_OVERROUND <= 1 / d[0] + 1 / d[1] <= MAX_OVERROUND:
+                    continue
+                (p, _), _ = fair_devig(d)
+            except (ValueError, ZeroDivisionError):
                 continue
             w = self._weight(book)
+            probs.append(p)
             num, den = num + w * p, den + w
-        if den <= 0:
+        if den <= 0 or max(probs) - min(probs) > CONSENSUS_MAX_SPREAD:
             return None
-        p = min(max(num / den, 0.005), 0.995)
+        p = num / den
+        if not 0.01 <= p <= 0.99:                  # never clamp: a clamped longshot is an invented edge
+            return None
         first = next(iter(pool.values()))[0]
         return first.model_copy(update=dict(
             odds_for=decimal_to_american(1 / p), odds_against=decimal_to_american(1 / (1 - p)),

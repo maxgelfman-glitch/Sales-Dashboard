@@ -89,9 +89,9 @@ def test_single_book_returns_its_raw_line():
 
 def test_two_books_blend_by_weight():
     book = SharpBook(weights={"pinnacle": 3, "circa": 1})
-    book.ingest([line("Pinnacle", -120, 100), line("Circa", -140, 120)])
+    book.ingest([line("Pinnacle", -120, 100), line("Circa", -130, 110)])
     p_pin = devig_multiplicative([american_to_decimal(-120), american_to_decimal(100)])[0][0]
-    p_cir = devig_multiplicative([american_to_decimal(-140), american_to_decimal(120)])[0][0]
+    p_cir = devig_multiplicative([american_to_decimal(-130), american_to_decimal(110)])[0][0]
     got = book.lookup(*KEY)
     assert got.source == "consensus:circa+pinnacle"
     assert fair_of(got) == pytest.approx((3 * p_pin + p_cir) / 4, abs=1e-4)
@@ -104,14 +104,14 @@ def test_unlisted_books_are_ignored_when_weights_are_set():
     book.ingest([line("Pinnacle", -120, 100), line("SoftBook", -300, 250)])
     assert book.lookup(*KEY).source == "Pinnacle"
     book = SharpBook(weights={"pinnacle": 1, "*": 1})
-    book.ingest([line("Pinnacle", -120, 100), line("SoftBook", -300, 250)])
+    book.ingest([line("Pinnacle", -120, 100), line("SoftBook", -125, 105)])
     assert book.lookup(*KEY).source.startswith("consensus:")
 
 
 def test_a_stale_book_drops_out_of_the_blend():
     clock = Clock()
     book = SharpBook(clock=clock, max_age_seconds=30)
-    book.ingest([line("Circa", -140, 120)])
+    book.ingest([line("Circa", -130, 110)])
     clock.t += 25
     book.ingest([line("Pinnacle", -120, 100)])
     assert book.lookup(*KEY).source.startswith("consensus:")
@@ -190,3 +190,22 @@ def test_pairs_and_hedges_never_join_two_games():
     from main_supervisor import same_game_time
     assert same_game_time(1000.0, 1000.0 + 3600) and same_game_time(None, 5.0)
     assert not same_game_time(1000.0, 1000.0 + 24 * 3600)
+
+
+def test_a_broken_or_disagreeing_book_never_creates_a_consensus_edge():
+    # Bovada with the teams swapped: averaging it in made a -6.6% bet look like +4.6%
+    book = SharpBook(weights={"*": 1})
+    book.ingest([line("Pinnacle", -150, 130), line("DraftKings", -155, 135), line("Bovada", 130, -150)])
+    assert book.lookup(*KEY) is None
+    # a -1000/-1000 book (overround 1.82) is left out instead of being blended into a clean-looking line
+    book = SharpBook(weights={"*": 1})
+    book.ingest([line("Pinnacle", -150, 130), line("Junk", -1000, -1000)])
+    assert book.lookup(*KEY).source == "consensus:junk+pinnacle"
+    assert fair_of(book.lookup(*KEY)) == pytest.approx(
+        devig_multiplicative([american_to_decimal(-150), american_to_decimal(130)])[0][0], abs=1e-4)
+
+
+def test_an_extreme_longshot_consensus_is_refused_not_clamped():
+    book = SharpBook(weights={"*": 1})
+    book.ingest([line("Pinnacle", -40000, 29000), line("Circa", -42000, 29500)])
+    assert book.lookup(*KEY) is None

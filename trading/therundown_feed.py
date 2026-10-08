@@ -54,6 +54,7 @@ LEAGUE_BY_SPORT = {v: ("TENNIS" if k in {"ATP", "WTA"} else k) for k, v in SPORT
 MARKETS = {1: "moneyline", 2: "spread", 3: "total"}
 AFFILIATE_NAMES = {3: "pinnacle", 19: "draftkings", 23: "fanduel", 22: "betmgm", 2: "bovada"}
 OFF_BOARD = 0.0001
+PAIR_WAIT_S = 2.0            # a one-sided price update waits this long for the other side before pairing
 PREGAME_STATUSES = {"STATUS_SCHEDULED"}
 WS_ALIVE_SECONDS = 30.0            # heartbeat every 15s: two missed = dead
 REST_REFRESH_WS_SECONDS = 300.0    # with the WebSocket: full snapshot (new games, statuses) every 5 minutes
@@ -201,7 +202,7 @@ class TheRundownSource:
                             if price is None or abs(price - OFF_BOARD) < 1e-9 or (pr or {}).get("closed_at"):
                                 continue
                             books[int(aff)] = dict(price=price, main=bool(pr.get("is_main_line", True)),
-                                                   name=part.get("name"))
+                                                   name=part.get("name"), at=self.clock())
                         if books:
                             new_prices[key] = books
         if new_prices != self.prices and new_prices:
@@ -226,11 +227,16 @@ class TheRundownSource:
             return removed
         prev = books.get(int(aff))
         main = bool(row.get("is_main_line", prev["main"] if prev else True))
-        books[int(aff)] = dict(price=price, main=main, name=row.get("participant_name") or (prev or {}).get("name"))
-        if main:                                 # the main line moved: the old number is no longer the main line
-            for k, other in self.prices.items():
-                if k[:3] == key[:3] and k != key and int(aff) in other and other[int(aff)]["main"]:
-                    other[int(aff)]["main"] = False
+        books[int(aff)] = dict(price=price, main=main, name=row.get("participant_name") or (prev or {}).get("name"),
+                               at=self.clock())
+        if main:
+            # The main line moved: the old main number's price is the PRE-move price, which the book no longer
+            # offers. Keeping it (even as an "alternate") would serve it as fresh until the next snapshot.
+            for k in [k for k, other in self.prices.items()
+                      if k[:3] == key[:3] and k != key and int(aff) in other and other[int(aff)]["main"]]:
+                del self.prices[k][int(aff)]
+                if not self.prices[k]:
+                    del self.prices[k]
         if prev is None or prev["price"] != price:
             self.last_change = self.clock()
         return True
@@ -293,6 +299,14 @@ class TheRundownSource:
             team = ev["home"] if want_home else ev["away"]
             return bool(name) and (str(name).lower() in team.lower() or team.lower() in str(name).lower())
 
+        now = self.clock()
+
+        def settled(a: dict, b: dict) -> bool:
+            # a one-sided update (home moved, away not yet) would pair a new price with an old one: wait up to
+            # PAIR_WAIT_S for the other side before pairing them
+            ta, tb = a.get("at"), b.get("at")
+            return ta is None or tb is None or abs(ta - tb) <= PAIR_WAIT_S or now - max(ta, tb) >= PAIR_WAIT_S
+
         quotes = [(pid, line, books[aff]) for pid, line, books in rows if aff in books]
         out = []
         if mid == 3:
@@ -300,7 +314,7 @@ class TheRundownSource:
             unders = {line: q for pid, line, q in quotes if str(q.get("name") or "").lower().startswith("u")}
             for line, q in overs:
                 u = unders.get(line)
-                if u is not None and _num(line) is not None:
+                if u is not None and _num(line) is not None and settled(q, u):
                     out.append(dict(base, side="Over", line=_num(line), odds_for=q["price"], odds_against=u["price"],
                                     source=src, is_main=q["main"] and u["main"]))
             return out
@@ -313,7 +327,7 @@ class TheRundownSource:
                 else:
                     h, a = _num(hline), _num(aline)
                     ok, value = h is not None and a is not None and abs(h + a) < 1e-9, h
-                if ok:
+                if ok and settled(hq, aq):
                     out.append(dict(base, side=ev["home"], line=value, odds_for=hq["price"],
                                     odds_against=aq["price"], source=src, is_main=hq["main"] and aq["main"]))
         return out
