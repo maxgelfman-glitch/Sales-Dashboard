@@ -340,7 +340,7 @@ async def test_walk_is_capped_by_kelly_of_the_worst_level(tmp_path):
     await sup.on_market_update(book_upd("O-NYK", [(0.49, 100), (0.50, 100_000)]), None)
     [order] = sup.orders
     fair = 0.5217391
-    worst = await Supervisor._evaluate("novig", 0.50, sup_quote(sup), None, "t")
+    worst = await sup._evaluate("novig", 0.50, sup_quote(sup), None, "t")
     assert order.stake_usd <= worst.stake_usd + 0.5 and order.contracts > 100
     assert order.stake_usd <= 1000.0 and fair > order.price
 

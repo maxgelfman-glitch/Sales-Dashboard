@@ -73,7 +73,7 @@ import random
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Optional
@@ -309,6 +309,7 @@ GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — ve
 
 
 SAME_GAME_WINDOW_SECONDS = 6 * 3600
+DEFAULT_LEAGUE_MIN_EDGE = {"NCAAF": 0.045, "NCAAB": 0.045, "WNBA": 0.04, "TENNIS": 0.045}   # vs 2.5% elsewhere
 
 
 def same_game_time(a: Optional[float], b: Optional[float]) -> bool:
@@ -336,14 +337,16 @@ def order_error_ambiguous(exc: BaseException) -> bool:
     return status >= 500 or status == 408
 
 
-def write_ledger_line(path: Path, event: str, **fields) -> None:
-    """Append-only JSON line (opened in "a" mode, flushed per line). Never raises."""
+def write_ledger_line(path: Path, event: str, **fields) -> bool:
+    """Append-only JSON line (opened in "a" mode, flushed per line). Never raises; False if it could not write."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"ts": round(time.time(), 3), "event": event, **fields}, default=str) + "\n")
+        return True
     except OSError as exc:
-        log.error("LEDGER write failed (%s): %s", path, exc)
+        log.critical("LEDGER write failed (%s): %s — new risk halted until it writes again", path, exc)
+        return False
 
 
 def _floor_cents(x: float) -> float:
@@ -463,6 +466,8 @@ class Supervisor:
         sim_depth_haircut: float = 0.5,
         combo_quoter=None,
         novig_feed=None,
+        league_min_edge: Optional[dict[str, float]] = None,
+        heartbeat_url: Optional[str] = None,
         novig_rfq=None,
     ) -> None:
         if live and order_gateway is None:
@@ -549,6 +554,13 @@ class Supervisor:
         self.synced = positions_client is None and kalshi_positions_client is None   # nothing to sync without one
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         self._early_slips: dict[str, list] = {}           # exchange order id -> [(received, slip)] before its ack
+        self.venue_halts: dict[str, tuple[float, str]] = {}   # venue -> (halted until, reason)
+        self.league_min_edge = dict(DEFAULT_LEAGUE_MIN_EDGE if league_min_edge is None else league_min_edge)
+        self.heartbeat_url = heartbeat_url                  # dead-man switch (e.g. healthchecks.io): pinged while healthy
+        self._last_ping = 0.0
+        self._lock_fh = None
+        self._venue_errors: dict[str, list[float]] = {}
+        self.ledger_ok = True
         # ---- pregame cutoff (never trade or quote into a live game) ----
         self.taker_cutoff_s = taker_cutoff_s
         self.maker_cutoff_s = max(maker_cutoff_s, taker_cutoff_s)
@@ -581,6 +593,10 @@ class Supervisor:
         mk = dict(maker_kwargs or {})
         mk.setdefault("max_stake", self.max_stake)
         if live:
+            mk.update(still_eligible=self._maker_target_ok,
+                      on_post_error=lambda exc: self.note_order_error("novig", exc))
+            if hasattr(self.maker_gateway, "ttl_for"):
+                self.maker_gateway.ttl_for = self._maker_ttl_ms
             mk.update(on_posted=self._register_quote, can_quote=self._live_ready,
                       on_cancelled=lambda ids, reason: self._ledger("CANCEL", exchange_order_ids=ids, reason=reason,
                                                                     source="maker"))
@@ -737,8 +753,70 @@ class Supervisor:
         feed = {"novig": self.feed, "kalshi": self.kalshi, "prophetx": self.prophetx}.get(venue)
         return None if feed is None else feed.latest.get(outcome_id)
 
+    def _maker_target_ok(self, t) -> Optional[str]:
+        """Re-checked right before each maker post: the refresh awaits between posts, and a fill or a taker
+        order in that gap must stop further quotes on the game."""
+        key = tuple(t.market_key)
+        if key in self.positions:
+            return "position opened on this market during the refresh"
+        if self.game_unhedged(key[:3]) > 0:
+            return "game now holds an unhedged position"
+        return self._trade_blocked(key[:3], "maker") or self.venue_halted("novig")
+
+    def _maker_ttl_ms(self, outcome_id: str) -> Optional[int]:
+        info = self.registry.get(outcome_id)
+        if info is None:
+            return None
+        canon = self._canonical(MarketUpdate.from_info(info))
+        start = self.game_start.get(canon[0][:3]) if canon else None
+        start = start or info.start_time
+        if start is None:
+            return None
+        _, maker_s = self.cutoffs_for(info.league)
+        return int(max(0.0, start - maker_s - time.time()) * 1000)
+
+    def halt_venue(self, venue: str, reason: str, seconds: Optional[float] = None) -> None:
+        """Exit mode for one venue: no new orders or quotes there; open positions simply run to settlement.
+        `seconds` None = until a human restarts the engine (location refused, key rejected, account locked)."""
+        until = math.inf if seconds is None else time.time() + seconds
+        if self.venue_halts.get(venue, (0.0, ""))[0] >= until:
+            return
+        self.venue_halts[venue] = (until, reason)
+        log.critical("VENUE_HALT %s: %s — no new %s orders or quotes%s", venue, reason, venue,
+                     "" if seconds is None else f" for {seconds:.0f}s")
+        self._ledger("VENUE_HALT", venue=venue, reason=reason, seconds=seconds)
+        if self.maker is not None and self.maker.quotes and venue == "novig":
+            self._spawn(self.maker.cancel_all(f"venue halted: {reason}"))
+
+    def venue_halted(self, venue: str) -> Optional[str]:
+        until, reason = self.venue_halts.get(venue, (0.0, ""))
+        return reason if time.time() < until else None
+
+    def note_order_error(self, venue: str, exc: BaseException) -> None:
+        """Classify a refused order: location / auth / account problems stop the venue; repeated server or rate
+        errors pause it."""
+        status, code = getattr(exc, "status", None), str(getattr(exc, "code", "") or "")
+        if status == 451 or code in {"GEOLOCATION_EXPIRED", "GEOLOCATION_NOT_FOUND", "GEOLOCATION_FAILED",
+                                     "RESTRICTED_GEOLOCATION_REGION", "INVALID_GEOLOCATION_REGION",
+                                     "ANONYMIZED_NETWORK", "RESTRICTED_NETWORK_REGION"}:
+            self.halt_venue(venue, f"location refused ({code or status}): open the {venue.capitalize()} app on "
+                                   "your phone (no VPN), then restart the engine")
+        elif status in {401, 403} or code in {"KYC_REQUIRED", "SCOPE_INSUFFICIENT", "ACCOUNT_LOCKED",
+                                              "SELF_EXCLUDED", "ACCOUNT_EXCLUDED", "SYSTEM_LOCKED"}:
+            self.halt_venue(venue, f"account or key refused ({code or status})")
+        elif status == 429 or (status is not None and status >= 500) or order_error_ambiguous(exc):
+            now = time.time()
+            recent = [t for t in self._venue_errors.get(venue, []) if now - t < 60] + [now]
+            self._venue_errors[venue] = recent
+            if len(recent) >= 3:
+                self.halt_venue(venue, f"{len(recent)} server/rate errors in a minute", seconds=300)
+
     def _live_ready(self, venue: str = "novig") -> bool:
         """Live orders only while that venue's socket (prices + our executions) is connected."""
+        if not self.ledger_ok and self.live:
+            return False
+        if self.venue_halted(venue):
+            return False
         if self.sim:
             return True
         if venue == "kalshi":
@@ -770,7 +848,7 @@ class Supervisor:
     def _ledger(self, event: str, **fields) -> None:
         """Append one line per live order / cancel / slip / fill for reconciliation with Novig's order history."""
         if self.ledger_path is not None:
-            write_ledger_line(self.ledger_path, event, **fields)
+            self.ledger_ok = write_ledger_line(self.ledger_path, event, **fields)   # no audit trail = no new risk
 
     def _on_sharp_move(self, key, old: SharpLine, new: SharpLine) -> None:
         """Called synchronously by SharpBook when a stored sharp line changes."""
@@ -906,7 +984,7 @@ class Supervisor:
         sharp_q = SharpQuote(odds_for=sharp.odds_for, odds_against=sharp.odds_against, line=sharp.line,
                              source=sharp.source)
         label = f"{update.venue}/{update.event_id}/{update.market_type}/{side}"
-        decision = await self._evaluate(update.venue, update.price, sharp_q, update.line, label)
+        decision = await self._evaluate(update.venue, update.price, sharp_q, update.line, label, league=key[0])
         if self.research is not None:
             self._research_decision(update, key, side, decision, blocked=blocked if shadow else None)
             if decision.action == "BET":
@@ -969,15 +1047,22 @@ class Supervisor:
         self.positions[key] = MarketPosition(legs=[self.orders[-1]])
         await self._after_taker(key)
 
-    @staticmethod
-    async def _evaluate(venue: str, price: float, sharp_q: SharpQuote, line: Optional[float], label: str):
+    async def _evaluate(self, venue: str, price: float, sharp_q: SharpQuote, line: Optional[float], label: str,
+                        league: Optional[str] = None):
         if venue == "kalshi":
-            return await evaluate_kalshi_edge(price * 100, sharp_q, line=line, label=label)
-        if venue == "prophetx":          # 2% of net winnings = a higher effective price per $1 of payout
+            d = await evaluate_kalshi_edge(price * 100, sharp_q, line=line, label=label)
+        elif venue == "prophetx":        # 2% of net winnings = a higher effective price per $1 of payout
             effective = price / win_payout("prophetx", price)
-            return await evaluate_market_edge(NovigQuote(price=price, fee_per_contract=effective - price, line=line,
-                                                         label=label), sharp_q)
-        return await evaluate_market_edge(NovigQuote(price=price, line=line, label=label), sharp_q)
+            d = await evaluate_market_edge(NovigQuote(price=price, fee_per_contract=effective - price, line=line,
+                                                      label=label), sharp_q)
+        else:
+            d = await evaluate_market_edge(NovigQuote(price=price, line=line, label=label), sharp_q)
+        floor = self.league_min_edge.get(league or "")
+        if d.action == "BET" and floor is not None and (d.edge or 0.0) <= floor:
+            # Pinnacle is less sharp in thinner leagues (college, WNBA, tennis): demand a bigger edge there
+            return d.model_copy(update=dict(action="PASS", reason=f"edge {d.edge:+.2%} not above the {league} "
+                                                                  f"minimum {floor:.1%}"))
+        return d
 
     @staticmethod
     def _ask_levels(update: MarketUpdate) -> list[tuple[float, float]]:
@@ -1032,7 +1117,7 @@ class Supervisor:
             elif self.multi_level_mode == "off" or (self.live and not self.multi_level_live):
                 break
             else:
-                level = await self._evaluate(update.venue, price, sharp_q, update.line, label)
+                level = await self._evaluate(update.venue, price, sharp_q, update.line, label, league=update.league)
                 if level.action != "BET":
                     break
                 cap = min(cap, level.stake_usd)
@@ -1155,8 +1240,14 @@ class Supervisor:
             if held is None:                              # first leg rejected / not sent: nothing to pair
                 return True
             held.hedged = True                            # the second leg is on its way
-            await self._send_live_taker("ARB_HEDGE", other, key, other_side, n, cost_b, None, False, held=held,
-                                        locked_per_contract=locked / n)
+            try:
+                await self._send_live_taker("ARB_HEDGE", other, key, other_side, n, cost_b, None, False, held=held,
+                                            locked_per_contract=locked / n)
+            except Exception as exc:  # noqa: BLE001 — never leave the first leg marked as hedged
+                held.hedged = held.unhedged() <= 0 and len(held.legs) > 1
+                log.critical("ARB_PAIR second leg on %s failed (%s: %s): first leg is NAKED; normal hedging "
+                             "will keep trying", other.venue, type(exc).__name__, exc)
+                self._ledger("PAIR_LEG_FAILED", game=list(key), venue=other.venue, error=str(exc))
             return True
         leg_a = self._record("ARB_PAIR", update, side, n, cost_a, fee_a, None, False)
         leg_b = self._record("ARB_PAIR", other, other_side, n, cost_b, fee_b, None, False)
@@ -1191,8 +1282,8 @@ class Supervisor:
                  f" (PARTIAL: {held.unhedged() - contracts:g} stay unhedged)" if partial else "", cost, fee,
                  json.dumps(scenarios), min(scenarios.values()))
         reserve = round(contracts * limit_price + fee, 2) if self._single_limit(self._last_hedge_levels) else cost
-        if not self._kill_switch_allows(reserve, update.outcome_id):
-            return
+        # no kill-switch check here: a hedge LOCKS a profit and removes the open risk of the first leg. Blocking
+        # it when exposure is high (the canary's $100 is reached fast) would leave every position naked.
         if self.executing:
             held.hedged = True        # blocks further hedges while this one fills
             await self._send_live_taker("ARB_HEDGE", update, key, side, contracts, reserve, None, False, held=held,
@@ -1244,13 +1335,13 @@ class Supervisor:
             if level_worst - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
                 break
             n = min(int(size), remaining - sum(k for _, k in used),
-                    int(math.floor((MAX_STAKE_USD - spent) / unit + 1e-9)))
+                    int(math.floor((min(MAX_STAKE_USD, self.max_stake) - spent) / unit + 1e-9)))   # canary too
             if n <= 0:
                 break
             used.append((price, n))
             spent += n * unit
         if self.multi_level_mode == "single":
-            used = self._fit_worst_case(update.venue, used, MAX_STAKE_USD)
+            used = self._fit_worst_case(update.venue, used, min(MAX_STAKE_USD, self.max_stake))
         while used:
             contracts = sum(n for _, n in used)
             if contracts < remaining and contracts < MIN_PARTIAL_HEDGE_CONTRACTS:
@@ -1296,7 +1387,7 @@ class Supervisor:
             line=update.line, price=update.price if price is None else price, contracts=contracts, fee_usd=fee,
             stake_usd=stake, edge=edge, capped=capped, placed_at=time.time(), start_time=update.start_time,
         )
-        if force:
+        if force or kind == "ARB_HEDGE":                # a hedge reduces risk: never refused by the exposure cap
             self.exposure.record_fill(order.position_id, stake)
         else:
             self.exposure.record_open(order.position_id, stake)
@@ -1339,7 +1430,10 @@ class Supervisor:
                          event_id=update.event_id, league=update.league, market_type=update.market_type, side=side,
                          line=update.line, price=price, contracts=0, stake_usd=0.0, edge=edge, capped=capped,
                          placed_at=time.time(), live=True, pending=True, requested_contracts=contracts)
-        self.exposure.record_open(leg.position_id, stake)               # reservation (re-checks the limit)
+        if kind == "ARB_HEDGE":                                         # risk-reducing: always allowed
+            self.exposure.record_fill(leg.position_id, stake)
+        else:
+            self.exposure.record_open(leg.position_id, stake)           # reservation (re-checks the limit)
         self.orders.append(leg)
         if held is None:
             self.positions[key] = MarketPosition(legs=[leg])
@@ -1361,6 +1455,7 @@ class Supervisor:
         placed, unknown = [], []
         for (p, n), payload, res in zip(tranches, payloads, results):
             if isinstance(res, BaseException):
+                self.note_order_error(venue, res)
                 if order_error_ambiguous(res):      # may be live: keep its reservation, resolve from the exchange
                     log.critical("LIVE_ORDER outcome UNKNOWN %s %s x%g @ %.4f (%s: %s): lock and reservation KEPT "
                                  "until the exchange's records resolve it", update.outcome_id, side, n, p,
@@ -1822,6 +1917,8 @@ class Supervisor:
         return round(sum(b.total() for b in books), 2)
 
     def _combo_block_reason(self) -> Optional[str]:
+        if self.live and not self.ledger_ok:
+            return "ledger not writable"
         if self._loss_halted():
             return "daily loss stop"
         if self.exposure.taker_halted:
@@ -1854,7 +1951,11 @@ class Supervisor:
 
     @staticmethod
     def _utc_day(ts: Optional[float] = None) -> str:
-        return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).strftime("%Y-%m-%d")
+        """The TRADING day: New York time, rolling over at 06:00 (an evening slate settling after midnight
+        counts toward the day it was played, not the next one)."""
+        from zoneinfo import ZoneInfo
+        local = datetime.fromtimestamp(time.time() if ts is None else ts, ZoneInfo("America/New_York"))
+        return (local - timedelta(hours=6)).strftime("%Y-%m-%d")
 
     def _loss_halted(self) -> bool:
         return self.loss_halted_day is not None and self.loss_halted_day == self._utc_day()
@@ -2489,9 +2590,46 @@ class Supervisor:
             await self.maker.cancel_market(key, "maker fill: position lock")
 
     # ---------------- lifecycle ----------------
+    def healthy(self) -> bool:
+        """What the dead-man ping vouches for: prices flowing, fair values present, an audit trail."""
+        return self.feed.connected.is_set() and self.ledger_ok and (len(self.book) > 0 or not self.sharp_enabled)
+
+    async def _ping_dead_man(self) -> None:
+        if not self.heartbeat_url or time.time() - self._last_ping < 60 or not self.healthy():
+            return
+        self._last_ping = time.time()
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(self.heartbeat_url) as resp:
+                    await resp.read()
+        except Exception as exc:  # noqa: BLE001 — the missing ping IS the alert
+            log.warning("HEARTBEAT ping failed: %s", exc)
+
+    def acquire_instance_lock(self) -> bool:
+        """Only ONE engine may trade an account: a second copy would double every position and cancel the
+        other's orders at start. An exclusive lock on a file next to the ledger enforces it (released on exit,
+        even on a crash)."""
+        import fcntl
+        lock_dir = self.ledger_path.parent if self.ledger_path is not None else Path("logs")
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_dir / "engine.lock", "a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid {os.getpid()} since {datetime.now(timezone.utc).isoformat()}\n")
+        fh.flush()
+        self._lock_fh = fh
+        return True
+
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.heartbeat_interval)
+            await self._ping_dead_man()
             log.info("HEARTBEAT uptime=%.1fs novig=%s kalshi=%s sharp_lines=%d updates=%d open_games=%d "
                      "resting_quotes=%d exposure=$%.2f/$%.0f taker_halted=%s",
                      time.monotonic() - self.started_at, self.feed.connected.is_set(),
@@ -2506,6 +2644,11 @@ class Supervisor:
         log.info("SUPERVISOR starting (novig=%s, kalshi=%s, maker=%s, paper trading only)", self.feed.url,
                  "off" if self.kalshi is None else self.kalshi.url, self.maker is not None)
         if self.live:
+            if not self.acquire_instance_lock():
+                log.critical("SUPERVISOR refusing to start: another engine already holds %s — two copies would "
+                             "double every position", (self.ledger_path.parent if self.ledger_path else
+                                                       Path("logs")) / "engine.lock")
+                return
             self.record_live_plan()
             self._ledger("SESSION_START", novig_socket=self.feed.url, max_stake_usd=self.max_stake,
                          exposure_limit_usd=self.exposure.limit, maker=self.maker is not None,
@@ -2746,7 +2889,19 @@ def taker_filters_from_env(env: dict) -> dict:
             raise ConfigError(f"TAKER_MAX_SHARP_MOVE_AGE_SECONDS={raw!r} is not a number") from None
         if not 0 < age <= 3600:
             raise ConfigError("TAKER_MAX_SHARP_MOVE_AGE_SECONDS must be > 0 and <= 3600")
-    return dict(taker_require_sharp_moved_last=moved, taker_max_sharp_move_age_s=age,
+    league_edges = dict(DEFAULT_LEAGUE_MIN_EDGE)
+    for part in (env.get("TAKER_MIN_EDGE_BY_LEAGUE") or "").split(","):
+        if not part.strip():
+            continue
+        lg, _, val = part.partition("=")
+        try:
+            v = float(val)
+        except ValueError:
+            raise ConfigError(f"TAKER_MIN_EDGE_BY_LEAGUE entry {part!r} must look like NCAAB=0.045") from None
+        if not 0 <= v < 0.5:
+            raise ConfigError("TAKER_MIN_EDGE_BY_LEAGUE values must be between 0 and 0.5")
+        league_edges[canonical_league(lg.strip())] = v
+    return dict(taker_require_sharp_moved_last=moved, taker_max_sharp_move_age_s=age, league_min_edge=league_edges,
                 arb_pairs_enabled=(env.get("ARB_PAIRS_ENABLED") or "1").strip().lower() not in {"0", "false", "off"})
 
 
@@ -2990,6 +3145,10 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     if kw.get("novig_rfq") is not None:
         kw["novig_rfq"].research = kw["research"]
     kw.setdefault("novig_rest", None if registry is not None else NovigRestClient(events_url, token))
+    kw["heartbeat_url"] = (env.get("HEARTBEAT_URL") or "").strip() or None
+    if live and not (env.get("ALERT_WEBHOOK_URL") or "").strip():
+        log.critical("LIVE without ALERT_WEBHOOK_URL: CRITICAL problems (venue halts, unknown fills, loss stop) "
+                     "will reach the log file only. Set it (see README: Alerts).")
     sup = Supervisor(feed_url=feed_url, registry=registry, token=token,
                       sharp_fetch=sharp_source_from_env(env),
                      maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,

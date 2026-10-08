@@ -498,12 +498,16 @@ class MakerEngine:
                  max_stake: float = MAX_STAKE_USD,
                  on_posted: Optional[Callable[["RestingQuote"], None]] = None,
                  on_cancelled: Optional[Callable[[list, str], None]] = None,
-                 can_quote: Optional[Callable[[], bool]] = None) -> None:
+                 can_quote: Optional[Callable[[], bool]] = None,
+                 still_eligible: Optional[Callable[["MakerTarget"], Optional[str]]] = None,
+                 on_post_error: Optional[Callable[[BaseException], None]] = None) -> None:
         self.gateway = gateway
         self.max_stake = min(max_stake, MAX_STAKE_USD)   # may only LOWER the ceiling
         self.on_posted = on_posted                        # live mode: register the order for fill tracking
         self.on_cancelled = on_cancelled                  # live mode: ledger every cancellation
         self.can_quote = can_quote                        # live mode: False while the private channel is down
+        self.still_eligible = still_eligible              # re-checked right before EACH post (refresh awaits)
+        self.on_post_error = on_post_error
         self.exposure = exposure
         self.targets = targets
         self.refresh_interval = refresh_interval
@@ -614,11 +618,17 @@ class MakerEngine:
                         log.info("MAKER_SKIP %s %s %dc: worst case $%.2f exceeds exposure headroom $%.2f",
                                  t.outcome_id, side, price, self.resting_worst_case() + cost, self.exposure.headroom)
                         continue
+                    why = self.still_eligible(t) if self.still_eligible is not None else None
+                    if why:                                # a fill or a taker order happened during this refresh
+                        log.info("MAKER_SKIP %s: %s", t.outcome_id, why)
+                        break
                     self._client_ids += 1
                     try:
                         oid = await self.gateway.place_limit(t.outcome_id, side, price, n, f"mk-{self._client_ids}")
                     except Exception as exc:  # noqa: BLE001
                         log.error("MAKER_POST failed %s %s %dc: %s", t.outcome_id, side, price, exc)
+                        if self.on_post_error is not None:
+                            self.on_post_error(exc)
                         continue
                     self.quotes[oid] = RestingQuote(order_id=oid, outcome_id=t.outcome_id, market_key=t.market_key,
                                                     side=side, price_cents=price, contracts=n,

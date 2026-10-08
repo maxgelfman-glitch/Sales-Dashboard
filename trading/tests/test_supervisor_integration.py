@@ -356,11 +356,11 @@ async def test_kill_switch_halts_new_takers_until_settlement():
     assert len(sup.orders) == 2
 
 
-async def test_arbitrage_hedge_also_respects_kill_switch():
+async def test_a_profit_locking_hedge_is_never_blocked_by_the_exposure_cap():
     sup = make_sup(limit=1500)
-    await sup.on_market_update(upd("O-NYK", 0.49), None)
-    await sup.on_market_update(upd("O-BOS", 0.478), None)
-    assert sup.stats["arbs"] == 0 and sup.stats["kill_switch_blocked"] == 1
+    await sup.on_market_update(upd("O-NYK", 0.49), None)                 # ~$1,000 of the $1,500 cap
+    await sup.on_market_update(upd("O-BOS", 0.478), None)                # hedge would lift cost past the cap
+    assert sup.stats["arbs"] == 1                                         # still hedged: risk goes DOWN
 
 
 # ---------------- maker integration

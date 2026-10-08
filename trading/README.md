@@ -121,10 +121,26 @@ path keeps trying to complete it.
 ## Risk controls
 * `GAME_EXPOSURE_LIMIT_USD` (default $1,000): unhedged money per game across its moneyline, spread and total
   (they are correlated). Hedges are always allowed and free room. Maker quotes only on games we hold nothing in.
-* `DAILY_LOSS_LIMIT_USD` (default $2,000): settled loss per UTC day that stops new positions and quotes until
-  00:00 UTC. Survives restarts.
-* `ALERT_WEBHOOK_URL`: every CRITICAL event goes to Slack/Discord/ntfy (see `docs/deploy.md`).
+* `DAILY_LOSS_LIMIT_USD` (default $2,000): settled loss (straights AND parlays) per trading day that stops new
+  positions and quotes. The trading day is New York time and rolls over at 06:00, so an evening slate settling
+  after midnight counts toward the day it was played. Survives restarts.
+* `ALERT_WEBHOOK_URL`: every CRITICAL event goes to Slack/Discord/ntfy (see `docs/deploy.md`). Live mode without
+  it logs a CRITICAL warning at start. Use a private ntfy topic or Slack: alerts include positions.
+* `HEARTBEAT_URL` (optional, recommended): a dead-man switch such as healthchecks.io, pinged every minute only
+  while the engine is healthy (prices flowing, fair values present, ledger writable). If the process dies, hangs
+  or loses its feeds, the pings stop and the service alerts you.
+* **Venue halt (exit mode):** a location refusal (HTTP 451: open the venue's app on your phone, no VPN) or a
+  rejected key/account stops all new orders and quotes on that venue until a restart; open positions simply run
+  to settlement. Three server or rate-limit errors in a minute pause the venue for 5 minutes.
+* **Ledger:** if the ledger cannot be written (disk full, permissions), no new risk is taken until it can.
+* **One engine per account:** live mode takes an exclusive lock on `engine.lock` next to the ledger. A second copy
+  refuses to start (two copies would double every position and cancel each other's orders).
+* **Edges:** above 20% is treated as bad data and refused (CRITICAL alert). Thinner leagues need a bigger edge:
+  `TAKER_MIN_EDGE_BY_LEAGUE` (default `NCAAF=0.045,NCAAB=0.045,WNBA=0.04,TENNIS=0.045`; 2.5% elsewhere).
+* **Parlays** start at the canary caps ($10 per parlay, $100 total) until `LIVE_SCALE_APPROVED_BY`, count toward
+  the global exposure limit, and have hard ceilings; `COMBO_QUOTER=live` also needs `KALSHI_LIVE_TRADING=1`.
 * Plus: $1,000 per position, $15,000 total exposure, live canary $10/$100, pregame cutoffs, live-game stop.
+  Hedges that lock a profit are never blocked by the exposure cap (blocking them would leave positions naked).
 
 ## Pregame cutoffs and the live-game stop (never trade into a live game)
 Every game gets its scheduled start time from the Novig events data (Kalshi: `occurrence_datetime`).

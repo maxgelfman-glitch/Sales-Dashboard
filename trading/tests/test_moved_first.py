@@ -72,11 +72,15 @@ async def test_freshness_window(tmp_path):
 
 
 def test_filters_env():
+    from main_supervisor import DEFAULT_LEAGUE_MIN_EDGE
     assert taker_filters_from_env({}) == dict(taker_require_sharp_moved_last=False, taker_max_sharp_move_age_s=None,
-                                              arb_pairs_enabled=True)
+                                              arb_pairs_enabled=True, league_min_edge=DEFAULT_LEAGUE_MIN_EDGE)
     assert taker_filters_from_env({"TAKER_REQUIRE_SHARP_MOVED_LAST": "1", "TAKER_MAX_SHARP_MOVE_AGE_SECONDS": "4",
                                    "ARB_PAIRS_ENABLED": "0"}) \
-        == dict(taker_require_sharp_moved_last=True, taker_max_sharp_move_age_s=4.0, arb_pairs_enabled=False)
+        == dict(taker_require_sharp_moved_last=True, taker_max_sharp_move_age_s=4.0, arb_pairs_enabled=False,
+                league_min_edge=DEFAULT_LEAGUE_MIN_EDGE)
+    assert taker_filters_from_env({"TAKER_MIN_EDGE_BY_LEAGUE": "WNBA=0.06,cfb=0.05"})["league_min_edge"] == {
+        **DEFAULT_LEAGUE_MIN_EDGE, "WNBA": 0.06, "NCAAF": 0.05}
     for bad in ({"TAKER_MAX_SHARP_MOVE_AGE_SECONDS": "x"}, {"TAKER_MAX_SHARP_MOVE_AGE_SECONDS": "0"}):
         with pytest.raises(ConfigError):
             taker_filters_from_env(bad)

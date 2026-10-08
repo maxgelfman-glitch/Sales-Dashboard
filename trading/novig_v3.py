@@ -413,6 +413,7 @@ class NovigV3OrderGateway:
         self.ttl_ms = ttl_ms if tif == "GTT" else None
         self.on_order = on_order
         self.client_ids: dict[str, str] = {}             # engine client id -> the UUID Novig requires
+        self.ttl_for: Optional[Callable[[str], Optional[int]]] = None   # ms until this outcome's quoting cutoff
 
     def _route(self, outcome_id: str, side: str, price_cents: float) -> tuple[str, Optional[float]]:
         price = price_cents / 100.0
@@ -432,7 +433,13 @@ class NovigV3OrderGateway:
         body = {"outcomeId": target, "price": price_str(price), "qty": to_novig_qty(contracts),
                 "tif": time_in_force or self.time_in_force, "clientId": cid}
         if body["tif"] == "GTT":
-            body["ttl"] = int(self.ttl_ms or DEFAULT_MAKER_TTL_MS)
+            ttl = int(self.ttl_ms or DEFAULT_MAKER_TTL_MS)
+            limit = self.ttl_for(outcome_id) if self.ttl_for is not None else None
+            if limit is not None:
+                ttl = min(ttl, int(limit))            # never rest past the maker cutoff, even if the engine dies
+            if ttl < 2000:
+                raise ValueError("too close to the maker cutoff to post a quote")
+            body["ttl"] = ttl
         return body
 
     async def place_limit(self, outcome_id: str, side: str, price_cents: float, contracts: int,
