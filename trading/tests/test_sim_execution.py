@@ -87,7 +87,7 @@ async def test_haircut_consumption_and_level_pricing():
     assert b.fills[2].filled_volume == 10 and b.fills[2].status == "FILLED"
 
 
-async def test_novig_fills_at_the_limit_and_price_moves_mean_misses():
+async def test_novig_fills_at_resting_prices_prophetx_at_limit_and_moves_mean_misses():
     b = Book()
     oid = DEMO_MARKETS[0]["outcome_id"]
     book = MarketUpdate(**DEMO_MARKETS[0], price=0.49, available_volume=400, ask_levels=[(0.49, 400)])
@@ -95,7 +95,12 @@ async def test_novig_fills_at_the_limit_and_price_moves_mean_misses():
     gw = SimulatedGateway("novig", b.get, b.on_fill, latency_ms=30, depth_haircut=1.0)
     await gw.place_limit(oid, "buy", 50.0, 100, "c1")
     await asyncio.sleep(0.05)
-    assert b.fills[0].price_cents == pytest.approx(50.0)                     # limit, not 49 (conservative)
+    assert b.fills[0].price_cents == pytest.approx(49.0)                     # resting price (Novig v3 docs)
+    px = SimulatedGateway("prophetx", b.get, b.on_fill, latency_ms=30, depth_haircut=1.0)
+    b.u[oid] = book.model_copy(update={"received_at": time.time() + 0.5})
+    await px.place_limit(oid, "buy", 50.0, 100, "p1")
+    await asyncio.sleep(0.05)
+    assert b.fills[-1].price_cents == pytest.approx(50.0)                    # ProphetX: limit (conservative)
     b.u[oid] = book.model_copy(update={"received_at": time.time() + 1})
     await gw.place_limit(oid, "buy", 49.0, 100, "c2")
     b.u[oid] = book.model_copy(update={"price": 0.52, "ask_levels": [(0.52, 400)],

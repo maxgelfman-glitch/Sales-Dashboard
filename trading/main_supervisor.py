@@ -118,6 +118,7 @@ from novig_feed import (
     NOVIG_PROD_WS_URL,
     ORDERS_SUBSCRIBE,
     TAPE_SUBSCRIBE,
+    MarketInfo,
     MarketRegistry,
     MarketUpdate,
     NovigFeed,
@@ -415,6 +416,7 @@ class Supervisor:
         sim_latency_ms: float = 500.0,
         sim_depth_haircut: float = 0.5,
         combo_quoter=None,
+        novig_feed=None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -434,9 +436,17 @@ class Supervisor:
         self.book = SharpBook(max_age_seconds=sharp_max_age, on_move=self._on_sharp_move,
                               on_live=self._on_sharp_live, weights=sharp_weights)
         self.registry = registry if registry is not None else MarketRegistry()
-        self.feed = NovigFeed(url=feed_url, token=token, registry=self.registry, on_update=self.on_market_update,
-                              on_state_change=self.on_feed_state, subscribe_messages=subscribe_messages,
-                              on_slip=self.on_fill_slip if live else None, **(feed_kwargs or {}))
+        if novig_feed is not None:                      # Novig v3 (novig_v3.NovigV3Feed): signed socket
+            self.feed = novig_feed
+            self.feed.registry, self.feed.on_update = self.registry, self.on_market_update
+            self.feed.on_state_change = self.on_feed_state
+            self.feed.on_slip = self.on_fill_slip if live else None
+            self.feed.on_lifecycle = self.on_novig_lifecycle
+        else:
+            self.feed = NovigFeed(url=feed_url, token=token, registry=self.registry,
+                                  on_update=self.on_market_update, on_state_change=self.on_feed_state,
+                                  subscribe_messages=subscribe_messages,
+                                  on_slip=self.on_fill_slip if live else None, **(feed_kwargs or {}))
         self.kalshi_registry = kalshi_registry if kalshi_registry is not None else MarketRegistry()
         self.kalshi: Optional[KalshiFeed] = None
         if kalshi_url or kalshi_rest or len(self.kalshi_registry):
@@ -517,7 +527,7 @@ class Supervisor:
         self.daily_pnl: dict[str, float] = {}               # "YYYY-MM-DD" (UTC) -> settled net P&L
         self.loss_halted_day: Optional[str] = None
         self._last_hedge_levels: list[tuple[float, int]] = []
-        self.maker_gateway = order_gateway if live else (maker_gateway or PaperOrderGateway())
+        self.maker_gateway = (maker_gateway or order_gateway) if live else (maker_gateway or PaperOrderGateway())
         mk = dict(maker_kwargs or {})
         mk.setdefault("max_stake", self.max_stake)
         if live:
@@ -579,6 +589,8 @@ class Supervisor:
                 log.info("BOOTSTRAP novig registry now holds %d outcomes", n)
                 self._index_start_times()
                 self._check_vanished_games(n)
+                if hasattr(self.feed, "sync_subscriptions"):
+                    await self.feed.sync_subscriptions()
             except Exception as exc:  # noqa: BLE001 — retried by the refresh loop
                 log.error("BOOTSTRAP novig failed (%s: %s); keeping previous registry", type(exc).__name__, exc)
         if self.kalshi_rest is not None and self.kalshi is not None:
@@ -1264,7 +1276,7 @@ class Supervisor:
         prefix = f"tk-{self.session_tag}-" if venue == "kalshi" else "tk-"     # Kalshi ids must never repeat
         cids = [f"{prefix}{leg.order_id}" if len(tranches) == 1 else f"{prefix}{leg.order_id}-{i + 1}"
                 for i in range(len(tranches))]
-        if venue == "kalshi":
+        if hasattr(gateway, "order_body"):
             payloads = [gateway.order_body(update.outcome_id, round(p * 100, 4), n, cid, gateway.time_in_force)
                         for (p, n), cid in zip(tranches, cids)]
         else:
@@ -1337,7 +1349,7 @@ class Supervisor:
             log.critical("LIVE_ORDER could not cancel remainder of %s (%s); reservation KEPT", oid, exc)
             self._ledger("CANCEL_FAILED", exchange_order_ids=[oid], error=str(exc))
             return
-        if lo.venue == "kalshi" and hasattr(gateway, "get_order"):
+        if (lo.venue == "kalshi" or getattr(gateway, "reconciles", False)) and hasattr(gateway, "get_order"):
             await self._reconcile_kalshi_order(lo, gateway)
         if not lo.done:
             self._finalize(lo, reason)
@@ -1354,10 +1366,11 @@ class Supervisor:
             return
         if filled > lo.filled + 1e-9:
             missed = filled - lo.filled
-            log.critical("KALSHI order %s: exchange reports %g filled, fill channel showed %g — booking %g at the "
-                         "limit %.4f", lo.exchange_order_id, filled, lo.filled, missed, lo.limit_price)
+            log.critical("%s order %s: exchange reports %g filled, fill channel showed %g — booking %g at the "
+                         "limit %.4f", lo.venue.upper(), lo.exchange_order_id, filled, lo.filled, missed,
+                         lo.limit_price)
             await self.on_fill_slip(FillSlip(order_id=lo.exchange_order_id, status="PARTIAL", filled_volume=missed,
-                                             price_cents=lo.limit_price * 100, venue="kalshi"))
+                                             price_cents=lo.limit_price * 100, venue=lo.venue))
         lo.exchange_confirmed_zero = filled <= 1e-9
 
     def _leg(self, leg_id: Optional[int]) -> Optional[PaperOrder]:
@@ -1707,6 +1720,17 @@ class Supervisor:
         log.warning("GAME_LIVE %s: %s -> no orders, quotes pulled", gid, reason)
         self._ledger("GAME_LIVE", game=list(gid), reason=reason, minutes_to_start=self.minutes_to_start(gid))
         self._spawn(self._pull_game_quotes(gid, f"game live: {reason}"))
+
+    async def on_novig_lifecycle(self, info: MarketInfo, transition: str) -> None:
+        """Novig v3 lifecycle: GOLIVE / START mean in play; CLOSE near the start means the same."""
+        canon = self._canonical(MarketUpdate.from_info(info))
+        if canon is None:
+            return
+        gid = canon[0][:3]
+        start = self.game_start.get(gid) or info.start_time
+        if transition in {"GOLIVE", "START"} or (
+                transition == "CLOSE" and (start is None or start - time.time() <= VANISHED_FLAG_WINDOW_SECONDS)):
+            self.mark_game_live(gid, f"Novig market {transition}")
 
     def _on_sharp_live(self, league: str, home: str, away: str) -> None:
         self.mark_game_live((league, home, away), "sharp feed reports it in play")
@@ -2202,6 +2226,14 @@ class Supervisor:
             log.warning("LIVE TRADING ENABLED: real orders will be sent to %s. Orders resting from earlier sessions "
                         "are unknown to this engine — cancel them in the Novig UI first.",
                         self.order_gateway.api_base if hasattr(self.order_gateway, "api_base") else "the gateway")
+            if hasattr(self.order_gateway, "cancel_all"):     # Novig v3: the engine owns its subaccount
+                try:
+                    await self.order_gateway.cancel_all()
+                    log.warning("LIVE cancelled every order resting in the engine's Novig subaccount from earlier "
+                                "sessions")
+                except Exception as exc:  # noqa: BLE001
+                    log.critical("LIVE could not cancel earlier resting Novig orders (%s): cancel them in the app",
+                                 exc)
         await self.bootstrap()
         if self.live and self._position_clients() and not await self.startup_sync():
             log.critical("SUPERVISOR stopping: startup position sync failed, refusing to trade blind")
@@ -2503,6 +2535,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
     if not env.get("SHARP_PROVIDER_CONFIG") and (env.get("SHARP_PROVIDER") or "").lower() != "therundown":
         log.warning("SUPERVISOR no SHARP_PROVIDER_CONFIG: MEASUREMENT mode — venue prices, cross-venue gaps and "
                     "liquidity are recorded; nothing that needs a fair value (directional takers, maker quotes) runs")
+    v3 = novig_v3_from_env(env)
     token = env.get("NOVIG_BEARER_TOKEN")
     api_base = (env.get("NOVIG_API_BASE") or NOVIG_PROD_API_BASE).rstrip("/")
     events_url = env.get("NOVIG_EVENTS_URL") or api_base + NOVIG_EVENTS_PATH
@@ -2528,12 +2561,13 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         problems = []
         if env.get("LIVE_TRADING_ACKNOWLEDGED", "").lower() != LIVE_ACK_VALUE:
             problems.append("LIVE_TRADING_ACKNOWLEDGED=yes (explicit sign-off that real money will trade)")
-        if not token:
-            problems.append("NOVIG_BEARER_TOKEN")
-        try:
-            validate_ws_url(feed_url, "NOVIG_WS_URL")
-        except ConfigError as exc:
-            problems.append(str(exc))
+        if v3 is None and not token:
+            problems.append("NOVIG_KEY_ID + NOVIG_PRIVATE_KEY_PATH (Novig v3 trading key; legacy: NOVIG_BEARER_TOKEN)")
+        if v3 is None:
+            try:
+                validate_ws_url(feed_url, "NOVIG_WS_URL")
+            except ConfigError as exc:
+                problems.append(str(exc))
         try:
             plan = resolve_live_plan(env)
         except ConfigError as exc:
@@ -2557,13 +2591,23 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
             api_base, token, path=env.get("NOVIG_POSITIONS_PATH", DEFAULT_POSITIONS_PATH),
             status_param=env.get("NOVIG_POSITIONS_STATUS_PARAM", "status"),
             open_status=env.get("NOVIG_OPEN_STATUS", "OPEN"), settled_status=env.get("NOVIG_SETTLED_STATUS", "SETTLED"))
-        live_kw = dict(live=True, order_gateway=NovigOrderGateway(api_base, token), fill_volume_mode=fill_mode,
+        gateway = NovigOrderGateway(api_base, token) if v3 is None else v3["order_gateway"]
+        if v3 is not None:
+            positions, fill_mode = v3["positions"], "incremental"     # v3 fill events carry each fill's own size
+        live_kw = dict(live=True, order_gateway=gateway, fill_volume_mode=fill_mode,
                        max_stake=plan.max_stake, ledger_path=ledger, live_plan=plan, positions_client=positions,
                        settlement_interval=float(env.get("SETTLEMENT_SWEEP_SECONDS", SETTLEMENT_SWEEP_SECONDS)))
-    else:
+        if v3 is not None:
+            live_kw["maker_gateway"] = v3["maker_gateway"]
+    elif v3 is None:
         validate_ws_url(feed_url, "NOVIG_WS_URL")
     registry = MarketRegistry.from_json_file(env["NOVIG_MARKETS_FILE"]) if env.get("NOVIG_MARKETS_FILE") else None
     kw: dict = {}
+    if v3 is not None:
+        kw["novig_feed"] = v3["feed"]
+        if registry is None:
+            registry = v3["registry"]
+            kw["novig_rest"] = v3["client"]
     if env.get("KALSHI_ENABLED", "0") == "1":
         prod = env.get("KALSHI_ENV", "demo").lower() == "prod"
         key_id, key_path = env.get("KALSHI_KEY_ID"), env.get("KALSHI_PRIVATE_KEY_PATH")
@@ -2639,11 +2683,71 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
               **risk_controls_from_env(env), **fair_value_from_env(env), **taker_filters_from_env(env))
     if kw.get("combo_quoter") is not None:
         kw["combo_quoter"].research = kw["research"]
-    return Supervisor(feed_url=feed_url, registry=registry, token=token,
-                      novig_rest=None if registry is not None else NovigRestClient(events_url, token),
+    kw.setdefault("novig_rest", None if registry is not None else NovigRestClient(events_url, token))
+    sup = Supervisor(feed_url=feed_url, registry=registry, token=token,
                       sharp_fetch=sharp_source_from_env(env),
-                      maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,
-                      **kw, **live_kw)
+                     maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,
+                     **kw, **live_kw)
+    if v3 is not None:
+        v3["positions"].watch = lambda: [leg.outcome_id for pos in sup.positions.values() for leg in pos.legs
+                                         if leg.venue == "novig"]
+    return sup
+
+
+def novig_v3_from_env(env) -> Optional[dict]:
+    """
+    Novig's real API (v3, self-serve beta). Used when NOVIG_KEY_ID is set (or NOVIG_API=v3).
+    NOVIG_KEY_ID + NOVIG_PRIVATE_KEY_PATH: a subaccount TRADING key (`python novig_v3.py setup` makes one).
+    NOVIG_ENV=prod (default) | qa, or NOVIG_HOST. NOVIG_MAKER_TTL_SECONDS (default 300): resting quotes expire.
+    NOVIG_API=legacy keeps the old, pre-docs guesses (bearer token, /tape) — they do not match Novig's API.
+    """
+    choice = (env.get("NOVIG_API") or ("v3" if env.get("NOVIG_KEY_ID") else "legacy")).strip().lower()
+    if choice not in {"v3", "legacy"}:
+        raise ConfigError("NOVIG_API must be v3 or legacy")
+    if choice == "legacy":
+        if not env.get("NOVIG_MARKETS_FILE"):
+            log.warning("NOVIG legacy mode: no NOVIG_KEY_ID set. The legacy endpoints were guesses made before "
+                        "Novig published its API and will not work against Novig. Create a v3 key: "
+                        "python novig_v3.py setup (see README)")
+        return None
+    from novig_v3 import (PROD_HOST, QA_HOST, NovigSigner, NovigV3Client, NovigV3Feed, NovigV3OrderGateway,
+                          NovigV3PositionsClient)
+    key_id, key_path = env.get("NOVIG_KEY_ID"), env.get("NOVIG_PRIVATE_KEY_PATH")
+    if not (key_id and key_path):
+        raise ConfigError("Novig v3 needs NOVIG_KEY_ID and NOVIG_PRIVATE_KEY_PATH (a subaccount trading key; "
+                          "create one with: python novig_v3.py setup)")
+    nenv = (env.get("NOVIG_ENV") or "prod").strip().lower()
+    if nenv not in {"prod", "qa"}:
+        raise ConfigError("NOVIG_ENV must be prod or qa")
+    host = (env.get("NOVIG_HOST") or (PROD_HOST if nenv == "prod" else QA_HOST)).rstrip("/")
+    if not host.startswith("https://") and "localhost" not in host and "127.0.0.1" not in host:
+        raise ConfigError("NOVIG_HOST must be an https:// URL")
+    try:
+        signer = NovigSigner.from_pem(key_id, key_path)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ConfigError(f"NOVIG_PRIVATE_KEY_PATH could not be loaded: {exc}") from None
+    try:
+        ttl = int(float(env.get("NOVIG_MAKER_TTL_SECONDS") or 300) * 1000)
+    except ValueError:
+        raise ConfigError("NOVIG_MAKER_TTL_SECONDS must be a number") from None
+    registry = MarketRegistry()
+    client = NovigV3Client(host, signer)
+    feed = NovigV3Feed(NovigV3Client(host, signer), registry=registry)
+
+    def sibling(oid: str) -> Optional[str]:
+        info = registry.get(oid)
+        return info.sibling_outcome_id if info else None
+
+    def market_of(oid: str) -> Optional[str]:
+        info = registry.get(oid)
+        return info.market_id if info else None
+
+    return dict(client=client, feed=feed, registry=registry,
+                order_gateway=NovigV3OrderGateway(NovigV3Client(host, signer), sibling, "IOC",
+                                                  on_order=feed.own_orders.add),
+                maker_gateway=NovigV3OrderGateway(NovigV3Client(host, signer), sibling, "GTT", ttl_ms=ttl,
+                                                  on_order=feed.own_orders.add),
+                positions=NovigV3PositionsClient(NovigV3Client(host, signer), market_of=market_of))
 
 
 def describe_state(sup: Supervisor) -> dict:
@@ -2656,7 +2760,8 @@ def describe_state(sup: Supervisor) -> dict:
         "fill_volume_mode": sup.fill_volume_mode if sup.live else "n/a (paper)",
         "bootstrap_url": sup.novig_rest.events_url if sup.novig_rest else "NOVIG_MARKETS_FILE",
         "bootstrap_refresh_s": sup.bootstrap_refresh,
-        "orders_endpoint": f"{sup.order_gateway.api_base}/v1/orders" if sup.live else "paper (nothing sent)",
+        "orders_endpoint": (f"{sup.order_gateway.api_base}{'/v3/orders' if hasattr(sup.order_gateway, 'client') else '/v1/orders'}"
+                            if sup.live else "paper (nothing sent)"),
         "positions_endpoint": (f"{sup.positions_client.url}?{sup.positions_client.status_param}="
                                f"{sup.positions_client.open_status}|{sup.positions_client.settled_status}"
                                if sup.positions_client else "n/a (paper)"),
@@ -2781,12 +2886,11 @@ def format_state_report(sup: Supervisor) -> str:
         else:
             lines.append(f"  {label:<38} {value}")
     lines.append("\n[UNVERIFIED AGAINST A LIVE EXCHANGE]")
-    for item in ("Novig order body keys + DELETE body key (novig_rest.ORDER_BODY_KEYS / BULK_CANCEL_KEY)",
-                 "Novig 'orders' channel slip shape (confirmed only once the first slip arrives)",
-                 "Novig REST host api.novig.us for /v1/orders; whether events embed markets; pagination",
-                 "Novig positions endpoint path, status values and field names (settlement.py)",
-                 "Novig event start-time field name (novig_rest.START_TIME_KEYS; no start = no live trading)",
-                 "OpticOdds record paths in the sharp provider config"):
+    novig = (("Novig v3 home/away from event descriptions and spread outcome names (python novig_v3.py probe)",
+              "Novig v3 first canary order and fill, reconciled against the app")
+             if hasattr(sup.feed, "sync_subscriptions") else
+             ("Novig LEGACY settings are pre-docs guesses: set NOVIG_KEY_ID to use the v3 API",))
+    for item in (*novig, "OpticOdds record paths in the sharp provider config"):
         lines.append(f"  - {item}")
     lines.append("=" * 78)
     return "\n".join(lines)

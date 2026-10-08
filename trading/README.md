@@ -39,6 +39,28 @@ python -m pytest -v                          # full self-test suite
 python main_supervisor.py --simulate 30      # offline dual-venue simulation -> logs/trading_engine.log
 ```
 
+## Novig (v3 API)
+Novig's real API (self-serve beta, docs.novig.com) is in `novig_v3.py`, written against its published docs
+and OpenAPI document, with the signer checked against Novig's 30 official test signatures.
+* **Keys:** a management key from the Novig app opens a subaccount for the engine;
+  `python novig_v3.py setup` does it and writes the subaccount's trading key (Ed25519) to `keys/`. Put
+  `NOVIG_KEY_ID` and `NOVIG_PRIVATE_KEY_PATH` in `live.env` (template in `config/live.env.example`). Then
+  `python novig_v3.py echo` proves the key, clock and signature. `python novig_v3.py probe` prints leagues,
+  sample events, outcome names and a book, and what the engine would track (no secrets in it).
+* **Location:** orders need the Novig app to have geolocated you in a legal state within 3 days (HTTP
+  451 otherwise: open the app on your phone). No VPN. A normal cloud server is fine.
+* **Units:** one Novig contract pays 1c; the engine's pays $1. `novig_v3.py` converts (x100) everywhere.
+* **Book:** every Novig order is a buy. A bid at 0.665 on one team is the other team's ask at 0.335, so
+  each outcome's asks are built from the other outcome's bids. Our own resting orders are left out.
+* **Fills** happen at the resting order's price, which can be better than our limit (Novig's docs). The
+  paper simulator now fills Novig the same way.
+* **Fees:** game markets charge takers only while the game is live. Pregame is free; the engine never
+  trades live, and Novig voids every resting order at go-live anyway.
+* **Socket:** one signed socket carries the `book` of every tracked market (up to 2,048) and our private
+  `orders`. Takers are IOC; maker quotes are GTT (they expire after `NOVIG_MAKER_TTL_SECONDS`). Live start
+  cancels anything left resting in the engine's subaccount. GOLIVE / START / CLOSE near the start mark
+  the game live.
+
 ## Paper mode against real feeds
 All settings can live in one file: `python main_supervisor.py --env-file live.env` (template:
 `config/live.env.example`; the real environment wins over the file).
@@ -54,8 +76,7 @@ it set `THERUNDOWN_WEBSOCKET=0` (REST snapshots every 15s).
 
 Generic JSON-mapped provider (OpticOdds/OddsJam):
 ```bash
-export NOVIG_BEARER_TOKEN=...  SHARP_API_KEY=...
-export NOVIG_EVENTS_URL=https://...           # Novig events endpoint (confirm path in Novig docs)
+export NOVIG_KEY_ID=...  NOVIG_PRIVATE_KEY_PATH=keys/novig-trading-engine.pem  SHARP_API_KEY=...
 cp config/sharp_provider.opticodds.example.json config/sharp_provider.json   # or the oddsjam example
 export SHARP_PROVIDER_CONFIG=config/sharp_provider.json
 # optional Kalshi:
@@ -124,10 +145,9 @@ Every game gets its scheduled start time from the Novig events data (Kalshi: `oc
 * Takers buy through several ask levels while **each** level still clears the 2.5% edge, capped by the
   1/4-Kelly stake of the worst level used, $1,000 per position and the live canary.
 * `NOVIG_MULTI_LEVEL_MODE` decides how that goes to Novig:
-  * `staggered` (default): one order per level, each priced at that level, all sent at once. Novig is
-    believed to fill a taker at its limit price rather than at each resting price, so a single order at the
-    worst level would pay the worst price for everything. With staggered orders no contract can cost more
-    than its own level. If a level vanishes first, its tranche rests at its (still profitable) price until
+  * `staggered` (default): one order per level, each priced at that level, all sent at once. No contract
+    can cost more than its own level. (Novig's v3 docs say a fill happens at the resting price, so `single`
+    would also be safe there; staggered stays the default because it does not depend on it.) If a level vanishes first, its tranche rests at its (still profitable) price until
     the 2s fill timeout cancels it. All tranches feed one position leg; ledger rows `ORDER` (one per
     tranche), `TRANCHE_DONE` and one `DONE`.
   * `single`: one order limited at the worst level, sized so that even a fill entirely at that limit fits
@@ -213,10 +233,9 @@ Template: `config/live.env.example`. Always run the offline report first:
 ```bash
 python main_supervisor.py --check-config      # plain-text report; opens no connections, writes no ledger
 ```
-Minimum for `TRADING_MODE=live`: `LIVE_TRADING_ACKNOWLEDGED=yes`, `NOVIG_BEARER_TOKEN`, a valid
-`NOVIG_WS_URL` (default `wss://api.novig.com/tape`). Prices and our executions share that ONE socket:
-the engine sends `{"event":"subscribe","channel":"tape"}` and `{"event":"subscribe","channel":"orders"}`.
-`filled_volume` is treated as a cumulative total per order id (`NOVIG_FILL_VOLUME_MODE=cumulative`).
+Minimum for `TRADING_MODE=live`: `LIVE_TRADING_ACKNOWLEDGED=yes` and a Novig v3 trading key
+(`NOVIG_KEY_ID`, `NOVIG_PRIVATE_KEY_PATH`; see "Novig (v3 API)"). Prices and our executions share one
+signed socket; each fill event carries its own quantity.
 
 **Canary lock:** live always starts at **$10 max stake, $100 exposure, maker off**. Raising any of these
 (up to the hard $1,000 / $15,000 ceilings) is refused unless `LIVE_SCALE_APPROVED_BY` is set; the
@@ -235,8 +254,8 @@ first execution slip proves the orders channel, a no-fill order KEEPS its lock a
 (`RESTORE` rows) and refuses to trade if that fails. Every 15 minutes (`SETTLEMENT_SWEEP_SECONDS`) it fetches
 SETTLED positions, releases their exposure and writes one `SETTLE` row each (idempotent across sweeps and
 restarts). The same sweep resolves `UNCONFIRMED` orders against the exchange and restores untracked
-positions (e.g. manual trades). Endpoint settings: `NOVIG_POSITIONS_PATH` (default `/v1/positions`),
-`NOVIG_POSITIONS_STATUS_PARAM` (`status`), `NOVIG_OPEN_STATUS` (`OPEN`), `NOVIG_SETTLED_STATUS` (`SETTLED`).
+positions (e.g. manual trades). Novig v3: open positions from `GET /v3/account/positions`; a settled one
+is read from its market's grade (WIN / LOSS / PUSH, or a fair-value price that pays that fraction).
 
 ### Rollout
 1. Paper mode against real feeds; compare decisions with the Novig UI.
@@ -258,11 +277,8 @@ Needs `TRADING_MODE=live`, `KALSHI_ENABLED=1`, `KALSHI_KEY_ID`, `KALSHI_PRIVATE_
   (Novig ↔ Kalshi) are allowed in live mode once this gate is on.
 
 ## Still to confirm before real money
-* Novig `orders` channel slip shape and order body keys (first canary order proves or disproves them).
-* Novig matching: whether a buy limit above the best ask fills cheaper levels at their own prices. The
-  default `staggered` mode does not depend on it.
-* Novig positions endpoint: path, status filter values, field names, pagination (`settlement.py`).
-* Novig REST host `api.novig.us` for `/v1/orders`; whether events embed markets; pagination beyond
-  `limit=100` (the bootstrap logs a warning for both).
+* Novig v3 event descriptions ("Away at Home") and spread outcome names containing the team name: run
+  `python novig_v3.py probe` once and check the parsed home/away. Everything else follows Novig's docs.
+* The first canary order on Novig: reconcile it against the app.
 * OpticOdds record paths in `config/sharp_provider.opticodds.example.json`.
 * Kalshi order routing + fills (not built: Kalshi is data-only in live mode).

@@ -11,8 +11,8 @@ moment someone trades into it. This gateway makes paper trading pay those costs:
                   Other takers hit the same levels, and makers pull quotes as soon as they are hit.
     3. CONSUMED   depth we already took in simulation stays taken until the venue's book next updates, so two
                   of our orders never both fill against the same offers.
-    4. PRICE      Kalshi fills at each resting level's price (standard matching); Novig and ProphetX are
-                  assumed to fill at the order's limit (conservative; the trader believes Novig works that way).
+    4. PRICE      Kalshi and Novig fill at each resting level's price (Novig's v3 docs: a fill's price "can be
+                  better than your limit"). ProphetX is assumed to fill at the order's limit (conservative).
     5. IOC        whatever cannot be filled at that moment is cancelled; nothing rests.
 
 Everything downstream (reservations, tranches, fees, positions, the execution report) is the live code.
@@ -34,7 +34,7 @@ log = logging.getLogger("trading.sim")
 
 DEFAULT_LATENCY_MS = 500.0
 DEFAULT_DEPTH_HAIRCUT = 0.5
-LEVEL_PRICED_VENUES = {"kalshi"}          # fills at each resting level's own price; others fill at the limit
+LEVEL_PRICED_VENUES = {"kalshi", "novig"}  # fills at each resting level's own price; others at the limit
 
 
 class SimulatedGateway:

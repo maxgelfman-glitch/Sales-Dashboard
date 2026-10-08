@@ -74,7 +74,7 @@ MARKET_TYPE_ALIASES = {
     "spread": "spread", "point_spread": "spread", "pointspread": "spread", "handicap": "spread", "ats": "spread",
     "run_line": "spread", "runline": "spread", "puck_line": "spread", "puckline": "spread", "spreads": "spread",
     "moneyline": "moneyline", "money_line": "moneyline", "ml": "moneyline", "h2h": "moneyline",
-    "winner": "moneyline", "game_winner": "moneyline",
+    "winner": "moneyline", "game_winner": "moneyline", "money": "moneyline",
     "total": "total", "totals": "total", "game_total": "total", "over_under": "total", "ou": "total",
 }
 

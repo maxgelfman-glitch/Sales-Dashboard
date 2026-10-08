@@ -24,3 +24,4 @@ htmlcov/
 live.env
 *.env
 !*.env.example
+trading/keys/
