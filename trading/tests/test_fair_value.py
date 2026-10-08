@@ -158,3 +158,35 @@ def test_supervisor_applies_method_and_reports_it():
         assert "power" in report and "pinnacle:2" in report
     finally:
         execution.set_devig_method("multiplicative")
+
+
+def test_the_same_matchup_on_another_day_is_a_different_game():
+    import time as _t
+    from sharp_feed import SharpBook
+    now = _t.time()
+    book = SharpBook()
+    today = dict(league="MLB", home_team="New York Yankees", away_team="Boston Red Sox", market_type="moneyline",
+                 side="New York Yankees", odds_for=-200, odds_against=170, start_time=now + 3 * 3600)
+    tomorrow = {**today, "odds_for": 130, "odds_against": -150, "start_time": now + 27 * 3600}
+    book.ingest([today, tomorrow])                                       # the later game is not stored over it
+    hit = book.lookup("MLB", "New York Yankees", "Boston Red Sox", "moneyline", "New York Yankees",
+                      start=now + 3 * 3600)
+    assert hit is not None and hit.odds_for == -200
+    assert book.lookup("MLB", "New York Yankees", "Boston Red Sox", "moneyline", "New York Yankees",
+                       start=now + 27 * 3600) is None                    # tomorrow's market is never priced by it
+
+
+def test_lines_for_a_team_not_in_the_game_or_without_a_number_are_refused():
+    from sharp_feed import SharpBook
+    book = SharpBook()
+    base = dict(league="NBA", home_team="Los Angeles Lakers", away_team="Boston Celtics", odds_for=300,
+                odds_against=-400)
+    assert book.ingest([{**base, "market_type": "moneyline", "side": "Los Angeles Clippers"}]) == (0, 1)
+    assert book.ingest([{**base, "market_type": "spread", "side": "Los Angeles Lakers", "line": None}]) == (0, 1)
+    assert book.ingest([{**base, "market_type": "moneyline", "side": "Over"}]) == (0, 1)
+
+
+def test_pairs_and_hedges_never_join_two_games():
+    from main_supervisor import same_game_time
+    assert same_game_time(1000.0, 1000.0 + 3600) and same_game_time(None, 5.0)
+    assert not same_game_time(1000.0, 1000.0 + 24 * 3600)

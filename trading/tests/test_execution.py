@@ -80,15 +80,24 @@ async def test_five_percent_edge_at_even_money_is_capped():
     assert d.stake_usd == 1000.00 and d.capped is True
 
 
-async def test_massive_edge_is_limited_to_exactly_1000():
-    """Price 0.30 vs fair 0.50 -> +66.7% edge; full Kelly 28.6% of bankroll ($7,142 at 1/4). Must be $1,000."""
-    d = await evaluate_market_edge({"price": 0.30}, {"odds_for": -110, "odds_against": -110})
+async def test_large_edge_is_limited_to_exactly_1000():
+    """Price 0.43 vs fair 0.50 -> +16.3% edge; quarter Kelly is ~$3,070. Must be $1,000."""
+    d = await evaluate_market_edge({"price": 0.43}, {"odds_for": -110, "odds_against": -110})
     assert d.action == "BET"
-    assert d.edge == pytest.approx(0.6666667)
-    assert d.kelly_stake_usd == pytest.approx(7142.86, abs=0.01)
-    assert d.stake_usd == 1000.00
-    assert d.capped is True
-    assert d.suspicious is True  # 66% edge is flagged as probable bad data
+    assert d.edge == pytest.approx(0.5 / 0.43 - 1)
+    assert d.kelly_stake_usd > 1000 and d.stake_usd == 1000.00 and d.capped is True
+
+
+async def test_an_implausible_edge_is_refused_as_bad_data():
+    d = await evaluate_market_edge({"price": 0.30}, {"odds_for": -110, "odds_against": -110})   # +66.7%
+    assert d.action == "PASS" and d.suspicious is True and "suspicious" in d.reason
+
+
+async def test_a_spread_without_its_number_or_a_broken_market_is_refused():
+    d = await evaluate_market_edge({"price": 0.30, "line": -12.5}, {"odds_for": -110, "odds_against": -110})
+    assert d.action == "PASS" and "line mismatch" in d.reason
+    d = await evaluate_market_edge({"price": 0.45}, {"odds_for": -1000, "odds_against": -1000})
+    assert d.action == "PASS" and "overround" in d.reason
 
 
 async def test_zero_edge_passes_completely():

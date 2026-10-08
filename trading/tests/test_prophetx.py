@@ -163,3 +163,13 @@ async def test_locked_pair_with_prophetx_when_the_gap_clears_its_fee():
     n = pair[0].contracts
     worst = min(n * win_payout("prophetx", pair[1].price if pair[1].venue == "prophetx" else pair[0].price), n)
     assert worst - sum(o.stake_usd for o in pair) >= 0.01 * n - 0.01
+
+
+def test_a_container_strike_never_gives_both_spread_sides_the_same_sign():
+    mk = {"id": 9, "type": "spread", "status": "active", "market_strikes": [
+        {"strike": -4.5, "selections": [[lvl(-110, 550, "New York Knicks", 11)],      # names carry no number
+                                        [lvl(-110, 550, "Boston Celtics", 12)]]}]}
+    assert parse_markets(EVENT, "NBA", [mk], START) == []                          # refused, not both at -4.5
+    rows = parse_markets(EVENT, "NBA", MARKETS, START)
+    spreads = sorted(info.line for info, _ in rows if info.market_type == "spread")
+    assert spreads == [-4.5, 4.5]

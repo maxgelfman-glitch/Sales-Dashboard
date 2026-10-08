@@ -144,8 +144,9 @@ def parse_markets(event: dict, league: str, markets: list[dict], start: Optional
                 m_line = _LINE_RX.search(name)
                 if line is None and m_line and mtype != "moneyline":
                     line = float(m_line.group(1))
-                if line is None and strike is not None and mtype != "moneyline":
-                    line = float(strike)
+                if line is None and strike is not None and mtype == "total":
+                    line = float(strike)                # a total's number is the same for both sides; a spread's
+                                                        # container strike is one side's: never apply it to both
                 outcome = _LINE_RX.sub("", name).strip() if mtype != "moneyline" else name
                 if mtype == "total":
                     canon = normalize_outcome(outcome, league)
@@ -168,6 +169,14 @@ def parse_markets(event: dict, league: str, markets: list[dict], start: Optional
                 rows.append((canon, outcome, None if line is None else float(line), oid, asks,
                              _first(first, "strike_id")))
             if any(r[0] is None for r in rows):
+                continue
+            if mtype != "total" and {r[0] for r in rows} != {home, away}:
+                continue                                # both teams of THIS game, one each
+            if mtype == "spread" and (rows[0][2] is None or rows[1][2] is None
+                                      or abs(rows[0][2] + rows[1][2]) > 1e-9):
+                continue                                # spread lines must be +x / -x
+            if mtype == "total" and (rows[0][2] is None or rows[0][2] != rows[1][2]
+                                     or {r[0] for r in rows} != {"over", "under"}):
                 continue
             for i, (canon, outcome, line, oid, asks, strike_id) in enumerate(rows):
                 sib = rows[1 - i][3]

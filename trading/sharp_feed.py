@@ -75,6 +75,7 @@ class SharpLine(BaseModel):
     updated_at: Optional[float] = None # provider timestamp, epoch seconds (UTC)
     is_main: bool = True               # False = alternate line (stored by its exact number only)
     is_live: bool = False              # True = in-play price: never used as fair value; the game stops trading
+    start_time: Optional[float] = None # scheduled start (epoch s): tells two games of the same matchup apart
 
     @field_validator("is_live", mode="before")
     @classmethod
@@ -128,6 +129,10 @@ class SharpBook:
         self._lines: dict[BookKey, tuple[SharpLine, float]] = {}   # MAIN line per side: (line, observed_at)
         self._by_line: dict[tuple[BookKey, Optional[float]], tuple[SharpLine, float]] = {}  # every line incl. alts
         self._seen: set[tuple[str, str]] = set()
+        # (league, home, away) -> start of the game whose lines we hold. The same matchup on another day (MLB
+        # series, doubleheaders) is a DIFFERENT game: only the nearest one is kept, and a venue market is only
+        # priced against it when their start times agree.
+        self._game_start: dict[tuple[str, str, str], float] = {}
 
     def __len__(self) -> int:
         return len(self._lines)
@@ -158,10 +163,14 @@ class SharpBook:
                 continue
 
             observed_at = now if line.updated_at is None else line.updated_at
+            if observed_at > 1e11:                      # milliseconds sent as seconds
+                observed_at /= 1000.0
             if observed_at > now + CLOCK_SKEW_TOLERANCE_SECONDS:
-                sharp_log.warning("SHARP_POLL provider timestamp %.0fs in the future; using receipt time",
+                # never "fresh forever": a timestamp from the future means a broken clock or unit at the source
+                sharp_log.warning("SHARP_POLL provider timestamp %.0fs in the future: line rejected",
                                   observed_at - now)
-                observed_at = now
+                rejected += 1
+                continue
             if now - observed_at > self.max_age:
                 stale += 1
                 rejected += 1
@@ -175,6 +184,17 @@ class SharpBook:
                 rejected += 1
                 continue
             home, away = orient(league, home, away)
+            if line.market_type in {"spread", "total"} and line.line is None:
+                rejected += 1                           # a spread or total without its number is unpriceable
+                continue
+            if (line.market_type == "total") != (side in {"over", "under"}) or (
+                    line.market_type != "total" and side not in {home, away}):
+                rejected += 1                           # a side that is not in this game/market
+                continue
+            gk = (league, home, away)
+            if line.start_time is not None and not self._accept_game(gk, line.start_time, now):
+                rejected += 1                           # the same matchup on another day: not this game
+                continue
             canon = line.model_copy(update=dict(league=league, home_team=home, away_team=away, side=side))
             if canon.is_live:
                 # An in-play price must never be compared with a pregame venue price. Drop every stored
@@ -218,13 +238,43 @@ class SharpBook:
                               stale, self.max_age)
         return stored, rejected
 
+    GAME_WINDOW_SECONDS = 6 * 3600
+
+    def _accept_game(self, gk: tuple, start: float, now: float) -> bool:
+        """Keep lines of the NEAREST upcoming game of a matchup. A nearer game replaces a later one; a game
+        that ended long ago is replaced by the next."""
+        held = self._game_start.get(gk)
+        if held is None or abs(held - start) <= self.GAME_WINDOW_SECONDS:
+            self._game_start[gk] = start if held is None else min(held, start)
+            return True
+        if held < now - self.GAME_WINDOW_SECONDS or start < held:
+            self._forget_game(gk)
+            self._game_start[gk] = start
+            return True
+        return False
+
+    def _forget_game(self, gk: tuple) -> None:
+        for store in (self._lines, self._main_src):
+            for k in [k for k in store if k[:3] == gk]:
+                del store[k]
+        for store in (self._by_line, self._src):
+            for k in [k for k in store if k[0][:3] == gk]:
+                del store[k]
+
+    def same_game(self, league: str, home: str, away: str, start: Optional[float]) -> bool:
+        """False when the venue market's start time says it is a different game from the one we hold."""
+        held = self._game_start.get((league, home, away))
+        return start is None or held is None or abs(held - start) <= self.GAME_WINDOW_SECONDS
+
     def lookup(self, league: str, home: str, away: str, market_type: str, side: str,
-               line: Optional[float] = None) -> Optional[SharpLine]:
+               line: Optional[float] = None, start: Optional[float] = None) -> Optional[SharpLine]:
         """
         The fresh sharp line for this side, or None if missing or older than max_age.
         With `line`, an exact-number match (main OR alternate) is preferred, so a Novig
         total of 223.5 is compared with the sharp 223.5 alternate, not the 221.5 main.
         """
+        if not self.same_game(league, home, away, start):
+            return None
         key = (league, home, away, market_type, side)
         now = self.clock()
 
@@ -243,9 +293,11 @@ class SharpBook:
         return self._consensus(pool)
 
     def dispersion(self, league: str, home: str, away: str, market_type: str, side: str,
-                   line: Optional[float] = None) -> tuple[Optional[float], int]:
+                   line: Optional[float] = None, start: Optional[float] = None) -> tuple[Optional[float], int]:
         """(max - min de-vigged probability across the fresh books behind lookup(), number of books)."""
         from execution import american_to_decimal, fair_devig
+        if not self.same_game(league, home, away, start):
+            return None, 0
         key = (league, home, away, market_type, side)
         now = self.clock()
         fresh = lambda books: {b: v for b, v in books.items()  # noqa: E731

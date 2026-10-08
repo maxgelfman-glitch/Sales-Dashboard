@@ -31,7 +31,8 @@ def clean_teams():
     ("Texas", "Texas Longhorns", True), ("Texas", "Texas A&M Aggies", False), ("Texas A&M", "Texas A&M Aggies", True),
     ("Georgia", "Georgia Tech Yellow Jackets", False), ("Georgia", "Georgia State Panthers", False),
     ("Georgia", "Georgia Bulldogs", True), ("Ohio St.", "Ohio State Buckeyes", True),
-    ("Miami (FL)", "Miami (OH)", False), ("Miami (FL)", "Miami Hurricanes", True),
+    ("Miami (FL)", "Miami (OH)", False), ("Miami (FL)", "Miami Hurricanes", False),   # one-sided qualifier: refused (could be Miami OH)
+    ("Miami (FL)", "Miami (FL) Hurricanes", True),
     ("Ole Miss", "Mississippi Rebels", True), ("UConn", "Connecticut Huskies", True), ("LSU", "LSU Tigers", True),
     ("USC", "Southern California Trojans", True), ("North Carolina", "North Carolina State", False),
     ("Kentucky", "Western Kentucky", False), ("St. John's", "St. John's Red Storm", True),
@@ -99,3 +100,21 @@ async def test_college_game_trades_end_to_end_across_venues():
     assert [o.side for o in sup.orders] == ["Texas Longhorns"]
     await sup.on_market_update(upd("K-TAM", 0.40), None)                                 # hedge on Kalshi
     assert [o.kind for o in sup.orders] == ["DIRECTIONAL", "ARB_HEDGE"]
+
+
+@pytest.mark.parametrize("a,b", [
+    ("Texas", "UTEP"), ("Texas", "UTSA"), ("Tennessee", "Middle Tennessee"), ("Nevada", "UNLV"),
+    ("Alabama", "UAB"), ("Virginia", "VCU"), ("North Carolina", "UNC Wilmington"), ("Louisiana", "Louisiana Monroe"),
+    ("Arkansas", "Arkansas Pine Bluff"), ("Nebraska", "Nebraska Omaha"), ("Loyola", "Loyola Chicago"),
+    ("Texas A&M", "Texas A&M Corpus Christi"), ("Miami (OH)", "Miami Hurricanes"), ("Miami (FL)", "Miami RedHawks"),
+])
+def test_different_schools_never_match(a, b):
+    from team_normalizer import college_names_match
+    assert not college_names_match(a, b)
+
+
+@pytest.mark.parametrize("a,b", [("Texas", "Texas Longhorns"), ("Ohio St.", "Ohio State Buckeyes"),
+                                 ("UConn", "Connecticut Huskies"), ("Miami (FL)", "Miami (FL) Hurricanes")])
+def test_same_school_spellings_still_match(a, b):
+    from team_normalizer import college_names_match
+    assert college_names_match(a, b)

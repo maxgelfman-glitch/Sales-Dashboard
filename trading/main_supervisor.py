@@ -239,6 +239,7 @@ class PaperOrder(BaseModel):
     pending: bool = False                   # live taker still waiting for fills
     requested_contracts: float = 0          # live: size sent to the exchange
     exchange_order_id: Optional[str] = None
+    start_time: Optional[float] = None      # the game's scheduled start: tells the same matchup on two days apart
 
     @property
     def position_id(self) -> str:
@@ -300,6 +301,14 @@ class MarketPosition(BaseModel):
 
 
 GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — venue independent
+
+
+SAME_GAME_WINDOW_SECONDS = 6 * 3600
+
+
+def same_game_time(a: Optional[float], b: Optional[float]) -> bool:
+    """Two markets of one matchup are the same game only if their start times agree (unknown = trust the key)."""
+    return a is None or b is None or abs(a - b) <= SAME_GAME_WINDOW_SECONDS
 
 
 def order_error_ambiguous(exc: BaseException) -> bool:
@@ -873,7 +882,7 @@ class Supervisor:
         if self.arb_pairs_enabled and not shadow and await self._try_locked_pair(update, key, side):
             return
 
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line)
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line, start=update.start_time)
         if sharp is None:
             self.stats["no_sharp"] += 1
             log.info("DECISION PASS %s %s %s: no fresh sharp line (<=%.0fs)", update.venue, key, side,
@@ -1057,6 +1066,8 @@ class Supervisor:
             canon = self._canonical(other)
             if canon is None or canon[0] != key or canon[1] == side:
                 continue
+            if not same_game_time(update.start_time, other.start_time):
+                continue                                   # same teams, another day: two bets, not a lock
             if mtype == "spread" and (other.line is None or update.line is None
                                       or not math.isclose(other.line, -update.line)):
                 continue
@@ -1190,6 +1201,8 @@ class Supervisor:
         first = held.primary
         league, _, _, mtype = key
         fail = lambda why: (False, why, 0, 0.0, 0.0, {}, 0.0, 0.0)  # noqa: E731
+        if not same_game_time(first.start_time, update.start_time):
+            return fail("a different game of the same matchup (start times differ)")
         if mtype == "spread":
             if first.line is None or update.line is None or not math.isclose(update.line, -first.line):
                 return fail(f"lines not complementary ({first.line} vs {update.line})")
@@ -1266,7 +1279,7 @@ class Supervisor:
             order_id=len(self.orders) + 1, kind=kind, venue=update.venue, outcome_id=update.outcome_id,
             event_id=update.event_id, league=update.league, market_type=update.market_type, side=side,
             line=update.line, price=update.price if price is None else price, contracts=contracts, fee_usd=fee,
-            stake_usd=stake, edge=edge, capped=capped, placed_at=time.time(),
+            stake_usd=stake, edge=edge, capped=capped, placed_at=time.time(), start_time=update.start_time,
         )
         if force:
             self.exposure.record_fill(order.position_id, stake)
@@ -1693,14 +1706,14 @@ class Supervisor:
         key, side = canon
         if self._trade_blocked(key[:3], "maker"):          # live, started or about to: a pregame price is wrong
             return LEG_BLOCKED
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line, start=info.start_time)
         if sharp is None or not self._same_line(info.line, sharp.line, key[3]):
             return LEG_BLOCKED                             # an alternate line is never priced as the main line
         fair = self._fair(sharp)
         if fair is None:
             return LEG_BLOCKED
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
-        spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
+        spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line, start=info.start_time)
         return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread, books=books or None,
                        start=self.game_start.get(key[:3]) or info.start_time)
 
@@ -1716,14 +1729,14 @@ class Supervisor:
         key, side = canon
         if self._trade_blocked(key[:3], "maker"):             # live, started or about to: never a leg
             return None
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line, start=info.start_time)
         if sharp is None or not self._same_line(info.line, sharp.line, key[3]):
             return None                                       # an alternate line is never priced as the main line
         fair = self._fair(sharp)
         if fair is None:
             return None
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
-        spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
+        spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line, start=info.start_time)
         return info.event_id, LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread,
                                       books=books or None, start=self.game_start.get(key[:3]) or info.start_time)
 
@@ -1983,7 +1996,7 @@ class Supervisor:
         age = self.book.age_of(key[0], key[1], key[2], key[3], side)
         mover, move_age = self.moved_last(update, tuple(key))
         fair_by_method = {}
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line)
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line, start=update.start_time)
         if sharp is not None:
             try:
                 odds = [american_to_decimal(sharp.odds_for), american_to_decimal(sharp.odds_against)]
@@ -2074,7 +2087,7 @@ class Supervisor:
             if canon is None or canon[0][:3] != gid:
                 continue
             key, side = canon
-            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=upd.line)
+            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=upd.line, start=upd.start_time)
             fair = self._fair(sharp) if sharp is not None and (
                 upd.line is None or sharp.line is None or math.isclose(upd.line, sharp.line)) else None
             self.research.write("CLOSE", point=point, game=list(key), side=side, line=upd.line, venue=upd.venue,
@@ -2336,7 +2349,7 @@ class Supervisor:
             if (key in self.positions or self._trade_blocked(key[:3], "maker") or self._loss_halted()
                     or self.game_unhedged(key[:3]) > 0):      # correlated: only quote games we hold nothing in
                 continue
-            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+            sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line, start=info.start_time)
             if sharp is None or (info.line is not None and sharp.line is not None
                                  and not math.isclose(info.line, sharp.line)):
                 continue

@@ -654,7 +654,7 @@ async def test_never_buys_a_level_without_edge_and_never_more_than_shown(tmp_pat
 
 async def test_single_mode_hedge_worst_case_fits_the_cap(tmp_path):
     sup = paper_sup(tmp_path, multi_level_mode="single")
-    await sup.on_market_update(upd("O-NYK", 0.30, volume=3000), None)          # big cheap first leg
+    await sup.on_market_update(upd("O-NYK", 0.45, volume=3000), None)          # big cheap first leg (+16%)
     first = sup.orders[0]
     await sup.on_market_update(book_upd("O-BOS", [(0.40, 1000), (0.60, 5000)]), None)
     hedge = sup.orders[1]

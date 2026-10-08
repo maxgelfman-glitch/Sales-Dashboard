@@ -20,7 +20,7 @@ def price(p, main=True):
 
 
 EVENT = {
-    "event_id": "ev1", "sport_id": 4, "event_date": "2026-01-15T00:00:00Z",
+    "event_id": "ev1", "sport_id": 4, "event_date": "2027-01-15T00:00:00Z",
     "score": {"event_status": "STATUS_SCHEDULED"},
     "teams": [{"team_id": 145, "name": "Los Angeles", "mascot": "Lakers", "is_away": True, "is_home": False},
               {"team_id": 153, "name": "Boston", "mascot": "Celtics", "is_away": False, "is_home": True}],
@@ -189,3 +189,30 @@ def test_env_selection():
 def test_supervisor_accepts_the_source():
     sup = Supervisor(sharp_fetch=source())
     assert sup.sharp_enabled
+
+
+def test_a_started_game_is_live_even_before_the_status_refresh():
+    clock = Clock()
+    s = source(clock=clock)
+    s.load_events([{**EVENT, "event_date": "2026-01-15T00:00:00Z"}])   # start == now
+    assert all(l["is_live"] for l in s.lines())
+
+
+def test_a_connected_but_frozen_feed_is_withheld():
+    clock = Clock()
+    s = source(clock=clock)
+    s.load_events([{**EVENT, "event_date": "2026-01-15T06:00:00Z"}])   # a game 6 hours away
+    assert not s.frozen()
+    clock.t += 901                                                     # nothing changed for 15 minutes
+    assert s.frozen()
+
+
+def test_websocket_and_rest_lines_share_keys_and_a_moved_main_line_demotes_the_old_one():
+    from therundown_feed import _lk
+    assert _lk("-3.0") == _lk(-3) == _lk("-3")
+    s = source()
+    s.load_events([EVENT])
+    key = next(k for k in s.prices if k[1] == 2)
+    s.apply_row({"event_id": key[0], "market_id": 2, "participant_id": key[2], "affiliate_id": 3,
+                 "line": float(key[3]) - 0.5, "price": -105, "is_main_line": True})
+    assert s.prices[key][3]["main"] is False                            # the old number is no longer main

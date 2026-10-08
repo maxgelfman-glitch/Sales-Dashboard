@@ -58,6 +58,14 @@ PREGAME_STATUSES = {"STATUS_SCHEDULED"}
 WS_ALIVE_SECONDS = 30.0            # heartbeat every 15s: two missed = dead
 REST_REFRESH_WS_SECONDS = 300.0    # with the WebSocket: full snapshot (new games, statuses) every 5 minutes
 REST_REFRESH_POLL_SECONDS = 15.0   # REST only: snapshot this often (each snapshot = 1 request per sport per date)
+FROZEN_AFTER_SECONDS = 900.0       # no price changed at all for this long while games are near: feed is frozen
+NEAR_GAME_SECONDS = 12 * 3600      # ... "near" = a game starting within this window
+
+
+def _lk(v: Any) -> str:
+    """Line key: REST '-3.0' and WebSocket '-3' must be the same row."""
+    n = _num(v)
+    return "" if n is None else repr(round(n, 2))
 
 
 def _num(v: Any) -> Optional[float]:
@@ -100,6 +108,7 @@ class TheRundownSource:
         self.prices: dict[tuple, dict] = {}      # (event_id, market_id, participant_id, line) -> {aff: {price, main}}
         self.last_snapshot = 0.0
         self.last_ws_signal = 0.0
+        self.last_change = 0.0                   # last time ANY price actually changed (not just a heartbeat)
         self.ws_messages = 0
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws_task: Optional[asyncio.Task] = None
@@ -121,7 +130,17 @@ class TheRundownSource:
         if not self.alive():
             raise RuntimeError("TheRundown data not confirmed recently (no WS heartbeat / snapshot): "
                                "withholding prices so the engine's freshness rule expires them")
+        if self.frozen():
+            raise RuntimeError(f"TheRundown connected but no price has changed for {FROZEN_AFTER_SECONDS / 60:.0f} "
+                               "minutes while games are near: the source looks frozen; withholding prices")
         return self.lines()
+
+    def frozen(self) -> bool:
+        """Heartbeats prove the pipe is open, not that prices flow. On a live slate Pinnacle prices change every
+        few minutes; none changing for 15 minutes with games within 12 hours means the data is stuck."""
+        now = self.clock()
+        near = any(ev.get("start") and 0 <= ev["start"] - now <= NEAR_GAME_SECONDS for ev in self.events.values())
+        return near and self.last_change > 0 and now - self.last_change > FROZEN_AFTER_SECONDS
 
     def alive(self) -> bool:
         now = self.clock()
@@ -175,7 +194,7 @@ class TheRundownSource:
                     continue
                 for part in m.get("participants") or []:
                     for ln in part.get("lines") or []:
-                        key = (eid, m["market_id"], part.get("id"), str(ln.get("value") or ""))
+                        key = (eid, m["market_id"], part.get("id"), _lk(ln.get("value")))
                         books = {}
                         for aff, pr in (ln.get("prices") or {}).items():
                             price = _num((pr or {}).get("price"))
@@ -185,6 +204,8 @@ class TheRundownSource:
                                                    name=part.get("name"))
                         if books:
                             new_prices[key] = books
+        if new_prices != self.prices and new_prices:
+            self.last_change = self.clock()
         self.events, self.prices = new_events, new_prices
 
     # ------------------------------------------------------------------ WebSocket deltas
@@ -195,7 +216,7 @@ class TheRundownSource:
             return False
         if self.affiliate_ids and int(aff) not in self.affiliate_ids:
             return False
-        key = (eid, mid, row.get("participant_id"), str(row.get("line") or ""))
+        key = (eid, mid, row.get("participant_id"), _lk(row.get("line")))
         books = self.prices.setdefault(key, {})
         price = _num(row.get("price"))
         if str(row.get("change_type", "")).lower() == "close" or price is None or abs(price - OFF_BOARD) < 1e-9:
@@ -204,8 +225,14 @@ class TheRundownSource:
                 self.prices.pop(key, None)
             return removed
         prev = books.get(int(aff))
-        books[int(aff)] = dict(price=price, main=row.get("is_main_line", prev["main"] if prev else True),
-                               name=row.get("participant_name") or (prev or {}).get("name"))
+        main = bool(row.get("is_main_line", prev["main"] if prev else True))
+        books[int(aff)] = dict(price=price, main=main, name=row.get("participant_name") or (prev or {}).get("name"))
+        if main:                                 # the main line moved: the old number is no longer the main line
+            for k, other in self.prices.items():
+                if k[:3] == key[:3] and k != key and int(aff) in other and other[int(aff)]["main"]:
+                    other[int(aff)]["main"] = False
+        if prev is None or prev["price"] != price:
+            self.last_change = self.clock()
         return True
 
     def handle_message(self, raw: str | bytes) -> int:
@@ -249,9 +276,10 @@ class TheRundownSource:
             ev = self.events.get(eid)
             if ev is None:
                 continue
-            live = ev["status"] not in PREGAME_STATUSES
+            # in play if the provider says so OR the scheduled start has passed (status refreshes only every 5 min)
+            live = ev["status"] not in PREGAME_STATUSES or bool(ev.get("start") and self.clock() >= ev["start"])
             base = dict(league=ev["league"], home_team=ev["home"], away_team=ev["away"],
-                        market_type=MARKETS[mid], is_live=live)
+                        market_type=MARKETS[mid], is_live=live, start_time=ev.get("start"))
             for aff in {a for _, _, books in rows for a in books}:
                 src = AFFILIATE_NAMES.get(aff, f"affiliate-{aff}")
                 out += self._pair(ev, mid, rows, aff, base, src)

@@ -247,6 +247,20 @@ DISTINGUISHING = frozenset({"state", "tech", "southern", "northern", "eastern", 
                             "east", "west", "a", "and", "m", "international", "atlantic", "christian", "methodist",
                             "baptist", "city", "poly", "polytechnic", "university", "college", "institute", "saint",
                             "st", "upstate", "coastal", "gulf", "valley", "mountain", "pacific", "am"})
+# Place words that make a DIFFERENT school when added to a name ("Texas" vs "Texas El Paso", "Tennessee" vs
+# "Middle Tennessee", "Loyola" vs "Loyola Chicago"). A mascot ("Texas Longhorns") is fine; a place is not.
+LOCATION_WORDS = frozenset({
+    "el", "paso", "san", "antonio", "middle", "birmingham", "omaha", "monroe", "lafayette", "chicago", "corpus",
+    "christi", "wilmington", "commonwealth", "pine", "bluff", "las", "vegas", "little", "rock", "green", "bay",
+    "kearney", "huntsville", "martin", "charlotte", "greensboro", "asheville", "pembroke", "dearborn", "flint",
+    "tyler", "arlington", "dallas", "houston", "fort", "wayne", "indianapolis", "milwaukee", "riverside", "irvine",
+    "davis", "diego", "fullerton", "northridge", "bakersfield", "long", "beach", "maryland", "shore", "baltimore",
+    "county", "edwardsville", "carbondale", "chattanooga", "knoxville", "marymount", "kansas", "louis", "lowell",
+    "boston", "amherst", "stanislaus", "francisco", "jose", "marcos", "angelo", "orleans", "rio", "grande",
+    "permian", "basin", "commerce", "texarkana", "pan", "american", "tampa", "orlando", "miami", "albany",
+    "binghamton", "buffalo", "stony", "brook", "springfield", "monmouth", "camden", "newark", "pittsburgh",
+    "johnstown", "erie", "mobile", "montgomery", "upstate", "spartanburg", "aiken", "beaufort", "harbor",
+})
 COLLEGE_ABBREVIATIONS = {
     "ole miss": "mississippi", "uconn": "connecticut", "usc": "southern california", "lsu": "louisiana state",
     "ucf": "central florida", "smu": "southern methodist", "byu": "brigham young", "tcu": "texas christian",
@@ -317,12 +331,12 @@ def college_names_match(a: str, b: str) -> bool:
     tb, qb = _school_tokens(b)
     if not ta or not tb:
         return False
-    if qa and qb and qa != qb:
-        return False
+    if (qa or qb) and qa != qb:
+        return False                            # "Miami (FL)" vs "Miami" or "Miami (OH)": not provably the same
     small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
     if not small <= big:
         return False
-    return not ((big - small) & DISTINGUISHING)
+    return not ((big - small) & (DISTINGUISHING | LOCATION_WORDS))
 
 
 _dyn_alias: dict[str, dict[str, str]] = {}                 # league -> clean(raw) -> canonical

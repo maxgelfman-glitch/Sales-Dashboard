@@ -52,7 +52,8 @@ KELLY_FRACTION = 0.25            # 1/4 Kelly
 MIN_EDGE = 0.025                 # act only when EV per $1 is STRICTLY above 2.5%
 MAX_STAKE_USD = 1_000.00         # ABSOLUTE ceiling per position (1% of bankroll)
 GLOBAL_EXPOSURE_LIMIT_USD = 15_000.00  # max total open (un-settled) exposure (15% of bankroll)
-SUSPICIOUS_EDGE = 0.20           # edges above this are usually bad data; flagged in the log
+SUSPICIOUS_EDGE = 0.20           # edges above this are usually bad data: refused (CRITICAL alert)
+MIN_OVERROUND, MAX_OVERROUND = 0.98, 1.15   # a sharp two-way market outside this is bad data
 _EDGE_EPSILON = 1e-9             # absorbs floating-point noise at the 2.5% boundary
 
 log = logging.getLogger("trading.execution")
@@ -176,11 +177,15 @@ async def evaluate_market_edge(
         log.warning("CALC invalid input -> PASS: %s", exc)
         return EdgeDecision(action="PASS", reason=f"invalid input: {exc}")
 
-    # Spreads/totals are only comparable at the identical number.
-    if novig.line is not None and sharp.line is not None and not math.isclose(novig.line, sharp.line):
+    # Spreads/totals are only comparable at the identical number; one side without a number is not comparable.
+    if (novig.line is None) != (sharp.line is None) or (
+            novig.line is not None and not math.isclose(novig.line, sharp.line)):
         return EdgeDecision(action="PASS", reason=f"line mismatch novig={novig.line} sharp={sharp.line}")
 
     (fair_prob, _), overround = fair_devig([dec_for, dec_against])
+    if not MIN_OVERROUND <= overround <= MAX_OVERROUND:     # e.g. -1000/-1000 or +150/+150: not a real market
+        return EdgeDecision(action="PASS", reason=f"sharp overround {overround:.3f} outside "
+                                                  f"[{MIN_OVERROUND}, {MAX_OVERROUND}]: bad data")
     price = novig.effective_price
     if price >= 1.0:
         return EdgeDecision(action="PASS", reason="price incl. fees >= $1", fair_prob=fair_prob, novig_price=price)
@@ -199,7 +204,12 @@ async def evaluate_market_edge(
     stake = _floor_cents(stake)
     suspicious = edge > SUSPICIOUS_EDGE
     if suspicious:
-        log.warning("CALC suspicious edge %+.2f%% on %s — verify data/name mapping", edge * 100, novig.label or "-")
+        # the trade most likely to be a data error (swapped teams, wrong game, stale line) must not get the
+        # largest Kelly stake: refuse it and alert
+        log.critical("CALC suspicious edge %+.2f%% on %s REFUSED — verify the data and name mapping",
+                     edge * 100, novig.label or "-")
+        return EdgeDecision(action="PASS", reason=f"suspicious edge {edge:+.2%} > {SUSPICIOUS_EDGE:.0%}: "
+                                                  "likely bad data", suspicious=True, **base)
     if stake <= 0:
         return EdgeDecision(action="PASS", reason="stake rounds to $0", full_kelly_fraction=full_kelly, **base)
 

@@ -64,12 +64,11 @@ def test_already_stale_lines_rejected_at_ingest():
     assert book.lookup(*KEY) is None
 
 
-def test_future_timestamp_is_clamped_to_now():
+def test_future_timestamp_is_rejected_never_fresh_forever():
     clock = FakeClock()
     book = SharpBook(clock=clock)
-    book.ingest([{**KNICKS, "updated_at": clock.t + 3600}])  # provider clock wildly ahead
-    clock.t += 30.5
-    assert book.lookup(*KEY) is None                        # cannot live forever
+    assert book.ingest([{**KNICKS, "updated_at": clock.t + 3600}]) == (0, 1)   # provider clock wildly ahead
+    assert book.lookup(*KEY) is None
 
 
 async def test_provider_outage_makes_all_lines_expire():
@@ -158,7 +157,8 @@ def test_example_config_is_valid(monkeypatch):
 
 
 async def test_provider_source_end_to_end_over_http():
-    fresh_ts = "2099-01-01T00:00:00Z"   # far future -> clamped to now by the book
+    from datetime import datetime, timezone
+    fresh_ts = datetime.now(timezone.utc).isoformat()   # a real, current provider timestamp
 
     async def handler(request):
         assert request.headers["Authorization"] == "Bearer k"
@@ -363,7 +363,8 @@ async def test_opticodds_brief_over_http(monkeypatch):
 
     async def handler(request):
         assert request.headers["X-Api-Key"] == "k"
-        return web.json_response({"data": [brief_record(9_999_999_999_000), {"league": "NBA", "odds": {}}]})
+        import time as _t
+        return web.json_response({"data": [brief_record(int(_t.time() * 1000)), {"league": "NBA", "odds": {}}]})
 
     app = web.Application()
     app.router.add_get("/odds", handler)
