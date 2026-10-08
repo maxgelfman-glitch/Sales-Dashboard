@@ -530,3 +530,34 @@ async def test_websocket_pushes_rfqs_wins_and_executions_without_polling(tmp_pat
     assert "q1" in q.positions and "q1" not in q.quotes
     await q.step()                                                    # a poll in push mode reads no RFQ list
     assert len(q.comms.created) == 1
+
+
+def test_slice_verdicts_need_statistical_evidence():
+    from research_report import slice_verdict, wilson
+    lo, hi = wilson(12, 200)
+    assert lo < 0.06 < hi                                             # 6% of 200 is not "confidently above 5%"
+    base = dict(traded=1000, wins=120, win_ci=wilson(120, 1000), median_margin=0.10, settled=150, pnl=500.0,
+                pnl_t=1.8, below=5)
+    assert slice_verdict(base) == "PASS"
+    assert slice_verdict({**base, "traded": 150}) == "WAIT"
+    assert slice_verdict({**base, "below": 60}) == "FAIL"              # winning mostly by underpricing
+    assert slice_verdict({**base, "pnl": -900.0, "pnl_t": -2.5}) == "FAIL"
+    assert slice_verdict({**base, "settled": 40}) == "WATCH"
+
+
+def test_unknown_requesters_can_carry_an_extra_cushion():
+    from combo_quoter import ComboConfig, RequesterBook
+    book = RequesterBook(ComboConfig(requester_unknown_margin=0.02, requester_min_trades=2))
+    assert book.adjust("new") == (0.02, None) and book.adjust(None) == (0.02, None)
+    book.add("reg", -10.0, 100.0)
+    book.add("reg", -10.0, 100.0)                                       # a losing regular: no cushion needed
+    assert book.adjust("reg") == (0.0, None)
+    assert RequesterBook(ComboConfig()).adjust("new") == (0.0, None)   # off by default
+
+
+def test_unknown_requester_margin_is_bounded():
+    from main_supervisor import ConfigError, parlay_config
+    assert parlay_config({"COMBO_UNKNOWN_REQUESTER_MARGIN": "0.02"}, "shadow", None, "kalshi") \
+        .requester_unknown_margin == 0.02
+    with pytest.raises(ConfigError):
+        parlay_config({"COMBO_UNKNOWN_REQUESTER_MARGIN": "0.5"}, "shadow", None, "kalshi")

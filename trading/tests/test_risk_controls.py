@@ -196,3 +196,12 @@ def test_load_env_file(tmp_path):
     loaded = load_env_file(str(f), env)
     assert env == {"KEEP": "real", "TRADING_MODE": "paper", "A": "x # y", "B": "q", "EMPTY": "", "C": "value"}
     assert "KEEP" not in loaded
+
+
+def test_env_file_reports_settings_the_shell_overrides(tmp_path):
+    from main_supervisor import load_env_file
+    f = tmp_path / "live.env"
+    f.write_text("LIVE_MAX_STAKE_USD=10\nTRADING_MODE=paper\nNEW=1\n")
+    env, shadowed = {"LIVE_MAX_STAKE_USD": "1000", "TRADING_MODE": "paper"}, []
+    assert load_env_file(str(f), env, shadowed) == ["NEW"]
+    assert shadowed == ["LIVE_MAX_STAKE_USD"] and env["LIVE_MAX_STAKE_USD"] == "1000"   # same value: no warning

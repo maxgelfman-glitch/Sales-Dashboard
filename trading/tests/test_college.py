@@ -118,3 +118,14 @@ def test_different_schools_never_match(a, b):
 def test_same_school_spellings_still_match(a, b):
     from team_normalizer import college_names_match
     assert college_names_match(a, b)
+
+
+def test_a_fuzzy_college_name_is_re_checked_when_new_games_appear():
+    from team_normalizer import normalize_team_name, register_game, reset_dynamic_teams
+    reset_dynamic_teams()
+    t = time.time() + 86400
+    register_game("NCAAF", "Kentucky Wildcats", "Florida Gators", t)
+    assert normalize_team_name("Wildcats", "NCAAF") == "Kentucky Wildcats"   # only one Wildcats listed so far
+    register_game("NCAAF", "Arizona Wildcats", "Utah Utes", t)
+    assert normalize_team_name("Wildcats", "NCAAF") is None             # now ambiguous: never the stale guess
+    reset_dynamic_teams()

@@ -445,7 +445,8 @@ def test_any_scale_up_without_approval_is_refused(sharp_env, override):
 def test_scale_up_with_approval_is_logged_critical_to_ledger(sharp_env, tmp_path):
     sup = build_live_supervisor({**sharp_env, **LIVE_ENV, "TRADING_LOG_DIR": str(tmp_path),
                                  "LIVE_MAX_STAKE_USD": "1000", "LIVE_EXPOSURE_LIMIT_USD": "15000",
-                                 "MAKER_MODE": "true", "LIVE_SCALE_APPROVED_BY": "PM 2026-10-01 ledger reconciled"})
+                                 "MAKER_MODE": "true", "LIVE_SCALE_APPROVED_BY": "PM 2026-10-01 ledger reconciled",
+                                 "LIVE_SCALE_SKIP_LADDER": "test"})
     assert (sup.max_stake, sup.exposure.limit, sup.maker is not None) == (1000.0, 15000.0, True)
     sup.record_live_plan()
     [line] = [json.loads(l) for l in (tmp_path / "live_ledger.jsonl").read_text().splitlines()]

@@ -98,6 +98,22 @@ def event_teams(ev: dict) -> Optional[tuple[str, str]]:
     return None
 
 
+_PERIOD_RX = re.compile(r"\b(1st|2nd|3rd|4th|first|second|third|fourth|half|halves|quarter|q[1-4]|h[12]|"
+                        r"period|p[1-3]|inning|innings|f5|first[\s_]+5|set|map|frame|game[\s_]*\d|"
+                        r"regulation|3[\s_-]?way)\b", re.I)
+
+
+def is_period_market(market: dict) -> bool:
+    """A half / quarter / inning / period / 3-way market is priced off a different distribution than the full
+    game: matching it to the sharp full-game line would be a phantom edge."""
+    text = " ".join(str(market.get(k) or "") for k in ("type", "sub_type", "name", "display_name", "period",
+                                                        "segment", "market_period"))
+    period = market.get("period") or market.get("segment")
+    if period not in (None, "", 0, "0", "full", "FULL", "game", "GAME", "full_game", "FULL_GAME"):
+        return True
+    return bool(_PERIOD_RX.search(text.replace("_", " ")))
+
+
 def _containers(market: dict):
     """Yield (container, strike) pairs: the market itself and each of its market_strikes entries."""
     if isinstance(market.get("selections"), list):
@@ -129,7 +145,7 @@ def parse_markets(event: dict, league: str, markets: list[dict], start: Optional
         if not isinstance(m, dict) or str(m.get("status", "active")).lower() not in {"active", "open"}:
             continue
         mtype = canonical_market_type(str(_first(m, "type", "sub_type", "name") or ""))
-        if mtype not in TRACKED_TYPES:
+        if mtype not in TRACKED_TYPES or is_period_market(m):
             continue
         mid = str(_first(m, "id", "market_id"))
         for container, strike in _containers(m):

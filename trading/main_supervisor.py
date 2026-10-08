@@ -619,14 +619,14 @@ class Supervisor:
         if combo_quoter is not None:
             combo_quoter.pricer.leg_fair = combo_quoter._leg_fair_with_fallback(self.combo_leg_fair)
             combo_quoter.allowed = self._combo_block_reason
-            combo_quoter.on_settled = lambda pnl, key: self._on_parlay_settled("kalshi", pnl, key)
+            combo_quoter.on_settled = lambda pnl, key, **w: self._on_parlay_settled("kalshi", pnl, key, **w)
             self._task_factories["combo_quoter"] = combo_quoter.run
             self._task_factories["combo_results"] = combo_quoter.results_loop
         self.novig_rfq = novig_rfq
         if novig_rfq is not None:
             novig_rfq.leg_lookup = self.novig_leg_fair
             novig_rfq.allowed = self._combo_block_reason
-            novig_rfq.on_settled = lambda pnl, key: self._on_parlay_settled("novig", pnl, key)
+            novig_rfq.on_settled = lambda pnl, key, **w: self._on_parlay_settled("novig", pnl, key, **w)
             novig_rfq.on_state_change = self.on_feed_state
             self._task_factories["novig_rfq"] = novig_rfq.run
             self._task_factories["novig_rfq_results"] = novig_rfq.results_loop
@@ -1935,9 +1935,11 @@ class Supervisor:
         return info.event_id, LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread,
                                       books=books or None, start=self.game_start.get(key[:3]) or info.start_time)
 
-    def _on_parlay_settled(self, venue: str, pnl: float, key: str) -> None:
-        """A real parlay settled: its P&L counts toward the daily loss stop, and survives a restart (ledger)."""
-        self._ledger("SETTLE", venue=venue, kind="PARLAY", position=key, net_profit_usd=pnl)
+    def _on_parlay_settled(self, venue: str, pnl: float, key: str, **wager) -> None:
+        """A real parlay settled: its P&L counts toward the daily loss stop, and survives a restart (ledger).
+        The row carries stake and payout too: every wager is its own line for tax (wins and losses separately)."""
+        self._ledger("SETTLE", venue=venue, kind="PARLAY", position=key, net_profit_usd=pnl,
+                     timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"), **wager)
         self.cumulative_pnl = round(self.cumulative_pnl + pnl, 2)    # same capital pool as before a restart
         self._record_daily_pnl(pnl)
 
@@ -2455,7 +2457,7 @@ class Supervisor:
         self._record_daily_pnl(net)
         first = legs[0][1]
         row = dict(timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                   settlement_id=pos.settlement_id, game_id=first.event_id or pos.event_id,
+                   settlement_id=pos.settlement_id, venue=first.venue, game_id=first.event_id or pos.event_id,
                    market_type=first.market_type, outcome_id=pos.outcome_id, side=first.side,
                    contracts=pos.contracts, stake_usd=stake, payout_usd=payout, net_profit_usd=net,
                    pnl_method=method, result=pos.result, released_exposure_usd=round(released, 2),
@@ -2774,6 +2776,11 @@ CANARY_MAX_STAKE_USD = 10.0
 EARLY_SLIP_HOLD_SECONDS = 30.0
 CANARY_EXPOSURE_LIMIT_USD = 100.0
 CANARY_MAKER_ENABLED = False
+# Scaling up is one rung at a time, and only after LADDER_MIN_FILLS live fills at the current rung (counted from
+# the live ledger). LIVE_SCALE_SKIP_LADDER='<reason>' overrides it, logged CRITICAL.
+STAKE_LADDER = (10.0, 50.0, 250.0, 1000.0)
+EXPOSURE_LADDER = (100.0, 500.0, 2500.0, 15000.0)
+LADDER_MIN_FILLS = 50
 
 
 def validate_ws_url(url: Optional[str], name: str) -> str:
@@ -2809,8 +2816,31 @@ class LivePlan(BaseModel):
     approved_by: Optional[str] = None
 
 
-def resolve_live_plan(env: dict) -> LivePlan:
-    """Canary caps by default; any increase requires LIVE_SCALE_APPROVED_BY."""
+def ladder_history(ledger_path: Optional[Path]) -> tuple[float, float, int]:
+    """(stake, exposure) of the most recent live session in the ledger, and live fills since that rung began."""
+    stake, exposure, fills = CANARY_MAX_STAKE_USD, CANARY_EXPOSURE_LIMIT_USD, 0
+    if ledger_path is None or not Path(ledger_path).exists():
+        return stake, exposure, fills
+    for line in Path(ledger_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        event = row.get("event")
+        if event in {"CANARY_LIMITS", "SCALE_UP_AUTHORIZED"}:
+            new = (float(row.get("max_stake_usd") or stake), float(row.get("exposure_limit_usd") or exposure))
+            if new[0] > stake or new[1] > exposure:
+                fills = 0                                   # a new, higher rung: its own track record starts now
+            stake, exposure = new
+        elif event == "FILL":
+            fills += 1
+    return stake, exposure, fills
+
+
+def resolve_live_plan(env: dict, ledger_path: Optional[Path] = None) -> LivePlan:
+    """Canary caps by default; any increase requires LIVE_SCALE_APPROVED_BY and climbs the ladder one rung at a
+    time ($10 -> $50 -> $250 -> $1,000 stake; $100 -> $500 -> $2,500 -> $15,000 exposure), each rung only after
+    LADDER_MIN_FILLS live fills at the one below."""
     stake = _cap(env, "LIVE_MAX_STAKE_USD", MAX_STAKE_USD, CANARY_MAX_STAKE_USD)
     exposure = _cap(env, "LIVE_EXPOSURE_LIMIT_USD", GLOBAL_EXPOSURE_LIMIT_USD, CANARY_EXPOSURE_LIMIT_USD)
     maker = env.get("MAKER_MODE", env.get("MAKER_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -2821,6 +2851,24 @@ def resolve_live_plan(env: dict) -> LivePlan:
             f"live limits above the canary (${CANARY_MAX_STAKE_USD:,.0f} stake / ${CANARY_EXPOSURE_LIMIT_USD:,.0f} "
             f"exposure / maker off) require LIVE_SCALE_APPROVED_BY='<name, date, reconciliation reference>' "
             f"— set it only after live_ledger.jsonl has been reconciled against Novig's order history")
+    skip = (env.get("LIVE_SCALE_SKIP_LADDER") or "").strip()
+    if scaled and not skip:
+        cur_stake, cur_exp, fills = ladder_history(ledger_path)
+        for name, want, cur, ladder in (("LIVE_MAX_STAKE_USD", stake, cur_stake, STAKE_LADDER),
+                                        ("LIVE_EXPOSURE_LIMIT_USD", exposure, cur_exp, EXPOSURE_LADDER)):
+            if want <= cur + 1e-9:
+                continue
+            nxt = next((r for r in ladder if r > cur + 1e-9), ladder[-1])          # one rung above today
+            if want > nxt + 1e-9:
+                raise ConfigError(f"{name}=${want:,.0f} skips the ladder: the last live session ran at ${cur:,.0f}, "
+                                  f"so the next step is at most ${nxt:,.0f} (override: LIVE_SCALE_SKIP_LADDER="
+                                  f"'<reason>')")
+            if fills < LADDER_MIN_FILLS:
+                raise ConfigError(f"{name}=${want:,.0f} needs {LADDER_MIN_FILLS} live fills at the current "
+                                  f"${cur:,.0f} level first; the ledger shows {fills} (override: "
+                                  f"LIVE_SCALE_SKIP_LADDER='<reason>')")
+    elif scaled and skip:
+        log.critical("LIVE SIZE LADDER SKIPPED (%s): stake $%.0f, exposure $%.0f", skip, stake, exposure)
     return LivePlan(max_stake=stake, exposure_limit=exposure, maker_enabled=maker, scaled_up=scaled,
                     approved_by=approver if scaled else None)
 
@@ -2972,11 +3020,12 @@ def sharp_source_from_env(env: dict):
     return None
 
 
-def load_env_file(path: str, environ=None) -> list[str]:
+def load_env_file(path: str, environ=None, shadowed: Optional[list] = None) -> list[str]:
     """
     Read KEY=VALUE lines (blank lines, '#' comments and trailing ' # comments' ignored; optional quotes and
     'export ' prefix allowed) into the environment. Values already set in the real environment win.
-    Returns the keys it set. Values are never logged.
+    Returns the keys it set; keys the real environment overrode WITH A DIFFERENT VALUE are appended to `shadowed`
+    (a stale `export LIVE_MAX_STAKE_USD=...` in your shell silently beats the file). Values are never logged.
     """
     environ = os.environ if environ is None else environ
     loaded = []
@@ -2994,6 +3043,8 @@ def load_env_file(path: str, environ=None) -> list[str]:
         if key and key not in environ:
             environ[key] = value
             loaded.append(key)
+        elif key and shadowed is not None and environ.get(key) != value and key not in loaded:
+            shadowed.append(key)
     return loaded
 
 
@@ -3049,7 +3100,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
             except ConfigError as exc:
                 problems.append(str(exc))
         try:
-            plan = resolve_live_plan(env)
+            plan = resolve_live_plan(env, Path(env.get("TRADING_LOG_DIR", "logs")) / "live_ledger.jsonl")
         except ConfigError as exc:
             problems.append(str(exc))
             plan = None
@@ -3265,6 +3316,7 @@ def parlay_config(env, mode: str, plan, venue: str):
         min_size_factor=num("COMBO_MIN_SIZE_FACTOR", 0.25, 0.01, 1),
         base_margin=num("COMBO_BASE_MARGIN", 0.04, 0, 1), per_leg_margin=num("COMBO_PER_LEG_MARGIN", 0.02, 0, 1),
         min_roc=num("COMBO_MIN_ROC", 0.01, 0, 1),
+        requester_unknown_margin=num("COMBO_UNKNOWN_REQUESTER_MARGIN", 0.0, 0, 0.2),
         max_loss_per_combo=cap("max_loss_per_combo", "COMBO_MAX_LOSS_PER_COMBO", 25),
         max_leg_exposure=cap("max_leg_exposure", "COMBO_MAX_LEG_EXPOSURE", 150),
         max_game_exposure=cap("max_game_exposure", "COMBO_MAX_GAME_EXPOSURE", 300),
@@ -3595,11 +3647,16 @@ def main() -> None:
 
     if args.env_file:
         try:
-            loaded = load_env_file(args.env_file)
+            shadowed: list[str] = []
+            loaded = load_env_file(args.env_file, shadowed=shadowed)
         except OSError as exc:
             print(f"cannot read --env-file {args.env_file}: {exc}", file=sys.stderr)
             sys.exit(2)
         print(f"loaded {len(loaded)} setting(s) from {args.env_file}")
+        if shadowed:
+            print(f"WARNING: your shell environment overrides {len(shadowed)} setting(s) in {args.env_file} with a "
+                  f"different value: {', '.join(sorted(shadowed))}. The SHELL value is what runs. Remove them with "
+                  f"`unset NAME` if the file is meant to win.", file=sys.stderr)
     path = setup_logging(args.log_dir, alert_url=os.environ.get("ALERT_WEBHOOK_URL") or None)
     log.info("SUPERVISOR logging to %s", path.resolve())
     try:

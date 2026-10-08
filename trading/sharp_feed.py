@@ -49,7 +49,7 @@ from typing import Any, Awaitable, Callable, Literal, Optional
 import aiohttp
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from team_normalizer import canonical_league, normalize_outcome, normalize_team_name, orient
+from team_normalizer import DYNAMIC_LEAGUES, canonical_league, names_match, normalize_outcome, normalize_team_name, orient
 
 SHARP_MAX_AGE_SECONDS = 30.0      # the freshness rule
 CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
@@ -637,7 +637,11 @@ def pair_fixture_outcomes(fixture: Any, cfg: ProviderConfig) -> tuple[list[dict[
                 if role not in {"over", "under"}:
                     raise ValueError(f"total selection {selection!r}")
             else:
-                team = normalize_team_name(selection, league)
+                if canonical_league(league) in DYNAMIC_LEAGUES:     # college: match within THIS game only
+                    hits = [t for t in (home_c, away_c) if t and names_match(league, selection, t)]
+                    team = hits[0] if len(hits) == 1 else None
+                else:
+                    team = normalize_team_name(selection, league)
                 role = "home" if team is not None and team == home_c else "away" if team is not None and team == away_c else None
                 if role is None:
                     raise ValueError(f"selection {selection!r} is neither {home!r} nor {away!r}")

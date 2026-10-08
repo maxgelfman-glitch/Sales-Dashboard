@@ -173,3 +173,19 @@ def test_a_container_strike_never_gives_both_spread_sides_the_same_sign():
     rows = parse_markets(EVENT, "NBA", MARKETS, START)
     spreads = sorted(info.line for info, _ in rows if info.market_type == "spread")
     assert spreads == [-4.5, 4.5]
+
+
+@pytest.mark.parametrize("market,period", [
+    ({"type": "moneyline", "name": "Moneyline"}, False),
+    ({"type": "spread", "name": "Game Spread"}, False),
+    ({"type": "total", "name": "Total Points", "period": "full_game"}, False),
+    ({"type": "moneyline", "name": "1st Half Moneyline"}, True),
+    ({"type": "spread", "name": "1st Quarter Spread"}, True),
+    ({"type": "total", "name": "First 5 Innings Total"}, True),
+    ({"type": "moneyline", "sub_type": "moneyline_3_way"}, True),
+    ({"type": "total", "name": "Total", "period": 1}, True),
+    ({"type": "moneyline", "name": "Regulation Time Winner"}, True),
+])
+def test_period_markets_are_never_matched_to_full_game_lines(market, period):
+    from prophetx_feed import is_period_market
+    assert is_period_market(market) is period

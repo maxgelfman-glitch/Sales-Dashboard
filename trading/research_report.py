@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -198,6 +199,7 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
             if r.get("margin_vs_winner") is not None:
                 d["margins"].append(r["margin_vs_winner"])
         d["below"] += r["our_yes_price"] < r["traded_yes_price"] * (1 - FAR_BELOW)
+    pnls: dict[str, list[float]] = {}
     for r in results:
         d = out.get(_slice_key(r))
         if d is None:
@@ -205,10 +207,57 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
         d["settled"] += 1
         d["pnl"] += r.get("pnl") or 0
         d["expected"] += r.get("expected_profit") or 0
-    for d in out.values():
+        pnls.setdefault(_slice_key(r), []).append(float(r.get("pnl") or 0))
+    for name, d in out.items():
         d["win_rate"] = d["wins"] / d["traded"] if d["traded"] else None
         d["median_margin"] = _median(d.pop("margins"))
+        d["win_ci"] = wilson(d["wins"], d["traded"])
+        d["pnl_t"] = t_stat(pnls.get(name, []))
+        d["verdict"] = slice_verdict(d)
     return dict(sorted(out.items(), key=lambda kv: -kv[1]["rfqs"]))
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> Optional[tuple[float, float]]:
+    """95% confidence interval for a rate (Wilson): small samples get honest, wide intervals."""
+    if n <= 0:
+        return None
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def t_stat(xs: list[float]) -> Optional[float]:
+    """Mean / standard error: how many standard errors the average P&L is from zero."""
+    if len(xs) < 2:
+        return None
+    mean = sum(xs) / len(xs)
+    var = sum((x - mean) ** 2 for x in xs) / (len(xs) - 1)
+    return None if var <= 0 else mean / math.sqrt(var / len(xs))
+
+
+GATE_MIN_TRADED, GATE_MIN_SETTLED = 200, 100      # parlay outcomes are noisy: below these, nothing is decided
+
+
+def slice_verdict(d: dict) -> str:
+    """
+    PASS  the win rate is confidently >= 5% (lower 95% bound), the median margin when winning >= 8%, at least 100
+          settled with positive P&L (t >= 1), and fewer than 20% of wins came from quotes 10%+ under the market
+          (winning mostly by underpricing is the winner's curse, not edge).
+    FAIL  confidently < 5% wins, settled P&L confidently negative (t <= -2), or mostly suspiciously cheap wins.
+    WAIT  not enough data yet. WATCH  enough data, not conclusive.
+    """
+    ci, wins = d.get("win_ci"), d.get("wins", 0)
+    cheap = d.get("below", 0) / wins if wins else 0.0
+    if d.get("traded", 0) < GATE_MIN_TRADED:
+        return "WAIT"
+    if (ci and ci[1] < 0.05) or (d.get("pnl_t") is not None and d["pnl_t"] <= -2 and d["settled"] >= 30) \
+            or (wins >= 20 and cheap > 0.2):
+        return "FAIL"
+    if (ci and ci[0] >= 0.05 and (d.get("median_margin") or 0) >= 0.08 and d.get("settled", 0) >= GATE_MIN_SETTLED
+            and d["pnl"] > 0 and (d.get("pnl_t") or 0) >= 1 and cheap <= 0.2):
+        return "PASS"
+    return "WATCH"
 
 
 def decisions_summary(rows: list[dict]) -> dict:
@@ -513,13 +562,14 @@ def build_report(rows: list[dict]) -> str:
             out.append(f"  WARNING {c['far_below_market']} quote(s) were 10%+ cheaper than where the parlay traded: "
                        "usually our model, not a gift")
         out.append(f"  {'venue slice':<28}{'rfqs':>7}{'quote':>7}{'traded':>7}{'win%':>7}{'margin':>8}{'settled':>8}"
-                   f"{'P&L':>10}{'expected':>10}")
+                   f"{'P&L':>10}{'expected':>10}  verdict")
         for name, d in list(c["by_slice"].items())[:15]:
             out.append(f"  {name:<28}{d['rfqs']:>7,}{d['quotable']:>7,}{d['traded']:>7,}"
                        f"{_fmt(d['win_rate'] and d['win_rate'] * 100, '.1f'):>7}"
                        f"{_fmt(d['median_margin'] and d['median_margin'] * 100, '+.1f'):>8}{d['settled']:>8,}"
-                       f"{d['pnl']:>10,.2f}{d['expected']:>10,.2f}")
-        out.append("  (a slice goes live only when its own win rate >= 5% at a median margin >= 8%, enough settled)")
+                       f"{d['pnl']:>10,.2f}{d['expected']:>10,.2f}  {d['verdict']}")
+        out.append("  (a slice goes live only on PASS: win rate >= 5% at 95% confidence, median margin >= 8%, 100+ "
+                   "settled with positive P&L, wins not mostly from underpricing; WAIT = under 200 traded)")
     else:
         out.append("  no RFQs seen (COMBO_QUOTER=shadow with Kalshi keys)")
 

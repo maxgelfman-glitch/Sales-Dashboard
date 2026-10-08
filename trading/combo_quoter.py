@@ -148,6 +148,7 @@ class ComboConfig:
     requester_widen_roi: float = 0.05        # requester's taker ROI above this -> widen
     requester_widen_margin: float = 0.04
     requester_block_roi: float = 0.15        # ... above this -> decline
+    requester_unknown_margin: float = 0.0    # extra margin while a requester has no record yet (or is anonymous)
     max_book_spread: float = 0.03
     min_book_size: float = 100.0             # contracts on BOTH sides of a Kalshi book before its mid is used
     live_book_legs: bool = False             # legs priced only from Kalshi's own book: shadow-only by default
@@ -257,7 +258,7 @@ class RequesterBook:
     def adjust(self, creator: Optional[str]) -> tuple[float, Optional[str]]:
         roi = self.roi(creator)
         if roi is None:
-            return 0.0, None
+            return self.cfg.requester_unknown_margin, None
         if roi > self.cfg.requester_block_roi:
             return 0.0, f"requester wins {roi:.0%} on our prices"
         return (self.cfg.requester_widen_margin, None) if roi > self.cfg.requester_widen_roi else (0.0, None)
@@ -547,7 +548,7 @@ class ComboQuoter:
         self.book = RiskBook(cfg)
         self.research = research
         self.allowed = allowed                           # global kill switches (daily loss stop, halts ...)
-        self.on_settled: Callable[[float, str], None] = lambda pnl, key: None   # real P&L -> daily loss stop
+        self.on_settled: Callable[..., None] = lambda pnl, key, **wager: None   # real P&L -> daily loss stop + tax rows
         self.clock = clock
         self.seen: set[str] = set()
         self.priced: dict[str, dict] = {}               # rfq_id -> what we priced (for the follow-up)
@@ -900,7 +901,9 @@ class ComboQuoter:
             else:
                 self.positions.pop(key, None)
                 self.book.remove(key)
-                self.on_settled(round(pnl, 2), key)
+                stake = cp.contracts * cp.no_bid + cp.fee
+                self.on_settled(round(pnl, 2), key, stake_usd=round(stake, 2), payout_usd=round(stake + pnl, 2),
+                                result=result, market_ticker=ticker, contracts=cp.contracts)
             done += 1
         return done
 

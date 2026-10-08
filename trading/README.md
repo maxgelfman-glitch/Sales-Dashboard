@@ -26,6 +26,7 @@ Runs 24/7 on a small server: see `docs/deploy.md`. Open questions for the venues
 | `settlement.py` | Exchange positions: parsing, settlement P&L (WIN/LOSS/TIE 50¢/VOID), positions REST client |
 | `research.py` | Measurement rows (`research/research-YYYYMMDD.jsonl`): decisions, entries, closing lines, markouts, depth, cross-venue gaps |
 | `research_report.py` | Summarises the research rows: CLV, markouts, liquidity by time to start, gap frequency/profit, near misses |
+| `tax_export.py` | One CSV row per settled wager (straights and parlays) from the ledger, for your accountant |
 | `dashboard.py` | Read-only Streamlit cockpit (separate process; tails `live_ledger.jsonl` + `trading_engine.log`) |
 | `mock_novig_server.py` | Local fake exchange used by tests and `--simulate` |
 | `docs/venue_questions.md` | Questions to send Novig, Kalshi and TheRundown (each answer removes an assumption) |
@@ -63,7 +64,8 @@ and OpenAPI document, with the signer checked against Novig's 30 official test s
 
 ## Paper mode against real feeds
 All settings can live in one file: `python main_supervisor.py --env-file live.env` (template:
-`config/live.env.example`; the real environment wins over the file).
+`config/live.env.example`; the real environment wins over the file, and the engine prints a WARNING naming any
+setting your shell overrides with a different value, e.g. a stale `export LIVE_MAX_STAKE_USD=...`).
 
 **Measurement mode (no paid data):** leave `SHARP_PROVIDER` and `SHARP_PROVIDER_CONFIG` unset. The engine
 records Novig/Kalshi prices, cross-venue locked-profit gaps, near misses and liquidity by time to start.
@@ -95,7 +97,8 @@ python main_supervisor.py
   * Soccer is excluded (3-way moneyline with a draw: needs a 3-outcome model).
 * Venues from New York: **Novig** and **Kalshi** (live, gated). **ProphetX** as a price feed for paper trading
   and research (`PROPHETX_ENABLED=1`, partner API keys). Its 2%-of-winnings fee is in every edge and pair
-  calculation. Its field names are assumed from public docs mirrored by an open-source client: run
+  calculation. Half, quarter, inning, period and 3-way markets are skipped: only full-game lines are compared
+  with the sharp full-game price. Its field names are assumed from public docs mirrored by an open-source client: run
   `python prophetx_feed.py --probe` with your keys and share the saved file so they can be checked before any
   live ProphetX orders are added. Polymarket US (New York sued it Sept 24, 2026) and Sporttrade (not in NY) are
   not integrated.
@@ -214,9 +217,14 @@ quote them. Kalshi prices combos by **Request For Quote**: a user builds a combo
   * `demo`: real quotes on Kalshi's demo exchange (`KALSHI_ENV=demo`).
   * `live`: needs `TRADING_MODE=live`. Default caps are $25 per combo, $150 per leg and $1,000 total.
 * **Gates before real money:** (0) confirm with Kalshi that a regular account can quote combos in production;
-  (1) shadow, per slice: would-win rate ≥5% at a median margin ≥8%; (2) leg fair values track closing prices; (3) tiny live
+  (1) shadow, per slice, the report's verdict must read PASS: win rate ≥5% at 95% confidence (Wilson interval),
+  median margin ≥8%, 100+ settled with positive P&L (≥1 standard error above zero), and under 20% of wins from
+  quotes 10%+ under the market. WAIT = fewer than 200 traded RFQs; FAIL = confidently under 5%, P&L ≥2 standard
+  errors below zero, or winning mainly by underpricing; WATCH = enough data, not conclusive; (2) leg fair values track closing prices; (3) tiny live
   results within ~30% of shadow expectations; (4) scale up step by step, **after a CPA opinion** (if treated as
   gambling, only 90% of losses are deductible from 2026, which hits high-turnover short-combo books hard).
+* **Unknown requesters (optional):** `COMBO_UNKNOWN_REQUESTER_MARGIN` (default 0, max 0.2) adds margin until a
+  requester has 15 settled results against us; Novig RFQs are anonymous, so there it applies to every quote.
 * **Assumed, to verify on demo:** the requester buying YES pays 1 − our `no_bid`; quotes cover the full RFQ size;
   the combo maker fee and its NFL exemption (from news reports); that makers can list other members' open RFQs
   and see their `creator_id`.
@@ -262,8 +270,10 @@ the **expected profit of what actually filled, per month** ([PROJECTED MONTHLY])
 What no simulation can tell you is how much you really get at size: other traders' orders racing ours, and
 makers pulling quotes when hit. The live **size ladder** finds that out with little at risk:
 1. Canary: `LIVE_MAX_STAKE_USD=10`. Confirms orders, fills, settlement and real latency (LIVE rows in [EXECUTION]).
-2. Then $50, then $250, then $1,000 per order. Each step needs `LIVE_SCALE_APPROVED_BY` and at least ~50 live
-   orders at the current size.
+2. Then $50, then $250, then $1,000 per order (exposure $500, $2,500, $15,000). **Enforced:** each step needs
+   `LIVE_SCALE_APPROVED_BY`, may climb only one rung above the last live session in `live_ledger.jsonl`, and
+   needs 50 live fills at the current rung (counted from the ledger). `LIVE_SCALE_SKIP_LADDER='<reason>'`
+   overrides it and is logged CRITICAL. Parlay caps are separate (canary until `LIVE_SCALE_APPROVED_BY`).
 3. Move up only while the LIVE fill rate at the new size stays close to the simulated fill rate. If fills collapse
    as size grows (asking for $1,000 and getting $15), stop at the last size that held: that is the strategy's
    real capacity.
@@ -317,6 +327,11 @@ SETTLED positions, releases their exposure and writes one `SETTLE` row each (ide
 restarts). The same sweep resolves `UNCONFIRMED` orders against the exchange and restores untracked
 positions (e.g. manual trades). Novig v3: open positions from `GET /v3/account/positions`; a settled one
 is read from its market's grade (WIN / LOSS / PUSH, or a fair-value price that pays that fraction).
+
+**Tax records:** `python tax_export.py --ledger logs/live_ledger.jsonl --year 2026` writes one row per settled
+wager (date in New York time, venue, stake, payout, net, WIN/LOSS) and prints gross wins and gross losses
+separately: if event contracts are taxed as gambling, they cannot be netted. Wagers with unknown P&L are
+flagged for you to fill in from the venue statement. Not tax advice: give the CSV to a CPA.
 
 ### Rollout
 1. Paper mode against real feeds; compare decisions with the Novig UI.

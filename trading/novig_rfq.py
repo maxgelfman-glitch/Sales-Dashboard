@@ -179,7 +179,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         self.book = RiskBook(self.cfg)
         self.research = research
         self.allowed = allowed
-        self.on_settled: Callable[[float, str], None] = lambda pnl, key: None   # real P&L -> daily loss stop
+        self.on_settled: Callable[..., None] = lambda pnl, key, **wager: None   # real P&L -> daily loss stop + tax rows
         self.clock = clock
         self.rounds: dict[str, dict] = {}            # rfq_id -> {legs, price, wager, quoted, closed_at}
         self.positions: dict[str, dict] = {}         # rfq_id -> {price, wager, liability}
@@ -444,7 +444,9 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                         round(pos["wager"] / pos["price"] * (pos["price"] - pos["fair"]), 4))
             self.positions.pop(rid, None)
             self.book.remove(rid)
-            self.on_settled(pnl, rid)
+            stake = pos.get("liability") or 0.0                       # what we put at risk against their wager
+            self.on_settled(pnl, rid, stake_usd=round(stake, 2), payout_usd=round(stake + pnl, 2),
+                            result=row.get("result"), counterparty_wager_usd=pos.get("wager"))
             done += 1
         return done
 

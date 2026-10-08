@@ -369,11 +369,8 @@ def _dynamic_resolve(raw: str, league: str) -> Optional[str]:
     # not seen verbatim: accept only a UNIQUE conservative match among the league's registered teams
     teams = {t for g in _dyn_games.get(league, []) for t in g[:2]}
     matches = {t for t in teams if names_match(league, raw, t)}
-    if len(matches) == 1:
-        canonical = matches.pop()
-        aliases[clean(raw)] = canonical
-        return canonical
-    return None
+    # never cached: a game registered later can make this spelling ambiguous ("Miami" once Miami (OH) is listed)
+    return matches.pop() if len(matches) == 1 else None
 
 
 def register_game(league: str, home: str, away: str, start: Optional[float] = None,

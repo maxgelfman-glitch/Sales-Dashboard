@@ -108,3 +108,33 @@ async def test_kalshi_fees_count_against_the_canary_stake():
     from execution import kalshi_fee_per_contract
     fees = sum(o["contracts"] * kalshi_fee_per_contract(o["price_cents"]) for o in sup.kalshi_gateway.placed)
     assert sup.kalshi_gateway.placed and total + fees <= 10.0 + 0.01
+
+
+def _ledger_rows(path, stake, exposure, fills):
+    import json
+    with path.open("a") as fh:
+        fh.write(json.dumps({"event": "CANARY_LIMITS" if stake <= 10 else "SCALE_UP_AUTHORIZED",
+                             "max_stake_usd": stake, "exposure_limit_usd": exposure}) + "\n")
+        for _ in range(fills):
+            fh.write(json.dumps({"event": "FILL"}) + "\n")
+
+
+def test_scaling_climbs_the_ladder_one_rung_at_a_time_after_enough_fills(tmp_path):
+    from main_supervisor import ConfigError, resolve_live_plan
+    ledger = tmp_path / "live_ledger.jsonl"
+    up = {"LIVE_SCALE_APPROVED_BY": "PM", "LIVE_MAX_STAKE_USD": "50", "LIVE_EXPOSURE_LIMIT_USD": "500"}
+    with pytest.raises(ConfigError, match="50 live fills"):
+        resolve_live_plan(up, ledger)                                    # no live history at all
+    _ledger_rows(ledger, 10, 100, 49)
+    with pytest.raises(ConfigError, match="shows 49"):
+        resolve_live_plan(up, ledger)
+    _ledger_rows(ledger, 10, 100, 1)
+    assert resolve_live_plan(up, ledger).max_stake == 50                 # 50 fills at the canary: one rung up
+    with pytest.raises(ConfigError, match="skips the ladder"):
+        resolve_live_plan({**up, "LIVE_MAX_STAKE_USD": "250"}, ledger)
+    _ledger_rows(ledger, 50, 500, 10)                                    # the new rung's record starts from zero
+    with pytest.raises(ConfigError, match="shows 10"):
+        resolve_live_plan({**up, "LIVE_MAX_STAKE_USD": "250", "LIVE_EXPOSURE_LIMIT_USD": "2500"}, ledger)
+    assert resolve_live_plan(up, ledger).max_stake == 50                 # staying on a rung needs nothing new
+    assert resolve_live_plan({**up, "LIVE_MAX_STAKE_USD": "1000", "LIVE_EXPOSURE_LIMIT_USD": "15000",
+                              "LIVE_SCALE_SKIP_LADDER": "PM: reconciled 2 months"}, ledger).max_stake == 1000
