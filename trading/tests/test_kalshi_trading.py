@@ -166,7 +166,7 @@ async def test_kalshi_edge_is_traded_live_with_fee_in_the_cost():
                                     venue="kalshi"))
     await sup.on_fill_slip(FillSlip(order_id="k1", status="PARTIAL", filled_volume=sent["contracts"] - 100,
                                     price_cents=45, venue="kalshi"))
-    fee = kalshi_taker_fee(100, 45) + kalshi_taker_fee(sent["contracts"] - 100, 45)
+    fee = kalshi_taker_fee(sent["contracts"], 45)                  # the order's exact total, rounded up once
     assert not leg.pending and leg.contracts == sent["contracts"]
     assert leg.stake_usd == pytest.approx(round(sent["contracts"] * 0.45 + fee, 2))
     assert sup.total_exposure() == pytest.approx(leg.stake_usd) and sup.kalshi_fills_confirmed

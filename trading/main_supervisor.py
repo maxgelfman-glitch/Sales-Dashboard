@@ -86,6 +86,8 @@ from execution import (
     MAKER_LINE_MOVE_POINTS,
     MAKER_ML_FAIR_MOVE,
     MAX_STAKE_USD,
+    MAX_OVERROUND,
+    MIN_OVERROUND,
     MIN_EDGE,
     GLOBAL_EXPOSURE_LIMIT_USD,
     ExposureMonitor,
@@ -269,6 +271,7 @@ class LiveOrder(BaseModel):
     exchange_filled: Optional[float] = None  # the exchange's own record (authoritative once read)
     cancel_attempts: int = 0
     fees: float = 0.0                        # Kalshi taker fees included in fill_cost
+    raw_fee: float = 0.0                     # the exact (unrounded) Kalshi fee accumulated over this order's fills
     expected_price: Optional[float] = None   # best ask when we decided (slippage is measured against it)
     edge: Optional[float] = None
     locked_per_contract: Optional[float] = None   # pairs / hedges: profit per contract if both legs fill
@@ -366,7 +369,7 @@ def _is_half_point(line: Optional[float]) -> bool:
 def order_cost(venue: str, contracts: int, price: float) -> tuple[float, float]:
     """(total cash out incl. fees, fee) for buying `contracts` at `price` on `venue`."""
     fee = kalshi_taker_fee(contracts, price * 100) if venue == "kalshi" else 0.0
-    return round(contracts * price + fee, 2), fee
+    return math.ceil(round((contracts * price + fee) * 100, 6)) / 100, fee   # a cent up: cash never understated
 
 
 def _sweep_avg(levels: list, contracts: float) -> float:
@@ -907,12 +910,13 @@ class Supervisor:
 
     @staticmethod
     def _fair(line: SharpLine) -> Optional[float]:
+        """De-vigged probability, or None for a market that is not a real two-way price (bad data)."""
         try:
-            (p, _), _ = fair_devig([american_to_decimal(line.odds_for),
-                                              american_to_decimal(line.odds_against)])
-            return p
-        except ValueError:
+            (p, _), overround = fair_devig([american_to_decimal(line.odds_for),
+                                            american_to_decimal(line.odds_against)])
+        except (ValueError, ZeroDivisionError):
             return None
+        return p if MIN_OVERROUND <= overround <= MAX_OVERROUND else None
 
     def _canonical(self, update: MarketUpdate) -> Optional[tuple[GameKey, str]]:
         league = update.league
@@ -1056,7 +1060,7 @@ class Supervisor:
         if contracts < decision.contracts:
             log.info("EV_TRIGGER size limited by liquidity: %d of %d contracts ($%.2f)", contracts,
                      decision.contracts, stake)
-        reserve = round(contracts * limit_price + fee, 2) if self._single_limit(used) else stake
+        reserve = order_cost(update.venue, contracts, limit_price)[0] if self._single_limit(used) else stake
         if not self._kill_switch_allows(reserve, update.outcome_id):
             return
         if self.executing:
@@ -1168,7 +1172,8 @@ class Supervisor:
                     used.pop()
                 continue
             net = (contracts * decision.fair_prob - stake) / stake
-            if update.venue != "kalshi" or net > MIN_EDGE + 1e-9 or len(used) == 1 and contracts == decision.contracts:
+            floor = max(MIN_EDGE, self.league_min_edge.get(canonical_league(update.league), MIN_EDGE))   # after fees
+            if net > floor + 1e-9:
                 avg = round(sum(p * n for p, n in used) / contracts, 6)
                 return contracts, stake, fee, avg, used[-1][0], used
             log.info("EV_TRIGGER net edge %+.4f%% after fees too thin at %d levels; dropping the worst", net * 100,
@@ -1334,7 +1339,8 @@ class Supervisor:
                  update.venue, side, avg_price, limit_price, contracts,
                  f" (PARTIAL: {held.unhedged() - contracts:g} stay unhedged)" if partial else "", cost, fee,
                  json.dumps(scenarios), min(scenarios.values()))
-        reserve = round(contracts * limit_price + fee, 2) if self._single_limit(self._last_hedge_levels) else cost
+        reserve = order_cost(update.venue, contracts, limit_price)[0] if self._single_limit(self._last_hedge_levels) \
+            else cost
         # no kill-switch check here: a hedge LOCKS a profit and removes the open risk of the first leg. Blocking
         # it when exposure is high (the canary's $100 is reached fast) would leave every position naked.
         if self.executing:
@@ -1871,9 +1877,13 @@ class Supervisor:
                 lo.first_fill_at = time.time()
             lo.filled += delta
             lo.fill_cost += delta * price
-            if lo.venue == "kalshi":                   # taker fee per fill, rounded up: never understated
-                fee = kalshi_taker_fee(int(math.ceil(delta - 1e-9)), price * 100)
-                lo.fees += fee
+            if lo.venue == "kalshi":
+                # Kalshi accumulates the exact fee and rounds the order's total up once (its fee-rounding rules
+                # rebate per-fill rounding): booking a ceiling per fill would overstate cost by up to 1c a fill
+                lo.raw_fee += kalshi_fee_per_contract(price * 100) * delta
+                total = math.ceil(round(lo.raw_fee * 100, 6)) / 100
+                fee = round(total - lo.fees, 2)
+                lo.fees = total
                 lo.fill_cost += fee
             self.stats["fills"] += 1
             if lo.kind == "MAKER":
@@ -1883,9 +1893,11 @@ class Supervisor:
                 if leg is not None:
                     kids = self._children(leg.order_id)       # one order, or several staggered tranches
                     filled, cost = sum(k.filled for k in kids), sum(k.fill_cost for k in kids)
+                    fees = sum(k.fees for k in kids)
                     leg.contracts = round(filled, 2)
-                    leg.stake_usd = round(cost, 2)
-                    leg.price = round(cost / filled, 6)
+                    leg.stake_usd = round(cost, 2)                 # cash out, fees included
+                    leg.fee_usd = round(fees, 2)
+                    leg.price = round((cost - fees) / filled, 6)   # per-contract price, fees excluded
                     if lo.done:   # late fill after we cancelled the remainder: still real
                         log.warning("LIVE late fill on %s after cancel: +%g", lo.exchange_order_id, delta)
                         if self._reserve_leg(leg, self._leg_exposure(kids)):
@@ -2744,7 +2756,8 @@ class Supervisor:
             fair = self._fair(sharp)
             if fair is not None:
                 targets.append(MakerTarget(outcome_id=info.outcome_id, market_key=key, fair_prob=fair,
-                                           label=f"{key[0]} {key[3]} {side}"))
+                                           label=f"{key[0]} {key[3]} {side}",
+                                           min_edge=self.league_min_edge.get(key[0], MIN_EDGE)))
         return targets
 
     async def _simulate_maker_fills(self, update: MarketUpdate, key: GameKey) -> None:
@@ -2752,8 +2765,14 @@ class Supervisor:
         for q in list(self.maker.quotes_for(update.outcome_id)):
             crossed = ((q.side == "buy" and update.price is not None and update.price * 100 <= q.price_cents)
                        or (q.side == "sell" and update.best_bid is not None and update.best_bid * 100 >= q.price_cents))
-            if not crossed or self.maker.on_fill(q.order_id) is None:
+            if not crossed:
                 continue
+            # only the size that traded through us fills (like live, the rest is then cancelled)
+            shown = update.available_volume if q.side == "buy" else update.bid_volume
+            n = min(q.contracts, int(shown or 0))
+            if n <= 0 or self.maker.on_fill(q.order_id) is None:
+                continue
+            q = q.model_copy(update=dict(contracts=n))
             if q.side == "buy":
                 side, price = self._canonical(update)[1], q.price_cents / 100
             else:   # selling this outcome == owning its sibling at (1 - price)

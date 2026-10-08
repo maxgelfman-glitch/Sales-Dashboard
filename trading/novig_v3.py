@@ -347,8 +347,8 @@ def build_market_infos(events: list[dict], markets: list[dict]) -> list[MarketIn
             fee = m.get("fee") or {}
             if mtype not in TRACKED_MARKET_TYPES or m.get("status", "OPEN") != "OPEN" or len(outcomes) != 2:
                 continue
-            if fee.get("charged", "WHEN_LIVE") != "WHEN_LIVE":
-                skip("market charges a pregame fee")
+            if fee.get("charged") != "WHEN_LIVE":       # fail closed: a missing fee rule is not "free"
+                skip("market fee rule is not WHEN_LIVE (pregame fee or unknown)")
                 continue
             strike = m.get("strike")
             if mtype in ("SPREAD", "TOTAL") and strike is None:

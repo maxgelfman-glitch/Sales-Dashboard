@@ -459,6 +459,7 @@ class MakerTarget(BaseModel):
     market_key: tuple
     fair_prob: float
     label: str = ""
+    min_edge: float = MIN_EDGE               # the league's floor: a maker fill never carries less than a taker may
 
 
 class RestingQuote(BaseModel):
@@ -585,7 +586,7 @@ class MakerEngine:
 
     # ---------------- quoting ----------------
     def _desired(self, t: MakerTarget) -> list[tuple[str, int, int]]:
-        bid, ask = maker_quote_prices(t.fair_prob)
+        bid, ask = maker_quote_prices(t.fair_prob, max(MIN_EDGE, t.min_edge))
         out = []
         for side, price in (("buy", bid), ("sell", ask)):
             if price is None:
