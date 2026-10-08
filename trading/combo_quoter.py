@@ -108,6 +108,7 @@ class LegFair:
     game: Optional[tuple] = None             # canonical (league, home, away) when known
     spread: Optional[float] = None           # max - min fair probability across sharp books (None = unknown)
     books: Optional[int] = None              # how many sharp books priced it (1 = no second opinion)
+    start: Optional[float] = None            # scheduled start of the leg's game (epoch s), when known
 
     def prob(self, side: str) -> float:
         return self.prob_yes if side == "yes" else 1.0 - self.prob_yes
@@ -148,6 +149,12 @@ class ComboConfig:
     max_loss_per_combo: float = 25.0
     max_leg_exposure: float = 150.0
     max_total_liability: float = 1000.0
+    max_game_exposure: float = 300.0         # every open short parlay with a leg in one game, summed
+    settle_after_start_h: float = 4.0        # a leg's game is decided this long after its start (horizon check)
+    book_fetches_per_step: int = 10          # REST budget: Kalshi single-market lookups per poll
+    followups_per_step: int = 10             # REST budget: trade-price follow-ups per poll
+    max_open_quotes: int = 20                # Kalshi: each open quote is polled every step (REST budget, and a
+                                             # win must be seen inside the confirm window)
     quote_ttl_s: float = 10.0
     last_look_min_margin: float = 0.02       # at confirmation the combo must still clear this margin on fresh fairs
     poll_s: float = 1.0
@@ -255,6 +262,10 @@ class ComboPricer:
             if lf.spread is not None and lf.spread > cfg.max_disagreement + 1e-12:
                 return skip(f"sharp books disagree by {lf.spread:.3f} on leg {leg.market_ticker}")
             fairs.append(lf)
+        if expires_at is None and fairs and all(lf.start for lf in fairs):
+            expires_at = max(lf.start for lf in fairs) + cfg.settle_after_start_h * 3600
+            if expires_at - time.time() > cfg.max_horizon_h * 3600:
+                return skip("settles beyond the horizon (capital tied up too long)")
         # which legs share a game: event ticker, the game code inside Kalshi tickers, or the canonical game
         groups: list[set] = []
         for leg, lf in zip(legs, fairs):
@@ -339,8 +350,14 @@ class ComboPricer:
         return None
 
 
+def leg_game(leg: Leg) -> str:
+    """The game a leg belongs to: the date+teams code inside Kalshi tickers, else the event (Novig: event id)."""
+    return game_code(leg.market_ticker) or game_code(leg.event_ticker) or leg.event_ticker or leg.market_ticker
+
+
 class RiskBook:
-    """Open short-combo liabilities: per combo, per leg+side (popular legs concentrate risk), and in total."""
+    """Open short-combo liabilities: per combo, per leg+side (popular legs concentrate risk), per game (one game
+    decides every parlay holding any of its legs), and in total."""
 
     def __init__(self, cfg: ComboConfig) -> None:
         self.cfg = cfg
@@ -366,7 +383,14 @@ class RiskBook:
         for leg in cp.legs:
             if sum(l for legs, l in others.values() if leg in legs) + loss > self.cfg.max_leg_exposure + 1e-9:
                 return f"leg {leg.market_ticker} exposure would exceed ${self.cfg.max_leg_exposure:,.0f}"
+        for game in {leg_game(l) for l in cp.legs}:
+            held = sum(l for legs, l in others.values() if any(leg_game(x) == game for x in legs))
+            if held + loss > self.cfg.max_game_exposure + 1e-9:
+                return f"game {game} exposure would exceed ${self.cfg.max_game_exposure:,.0f}"
         return None
+
+    def game_exposure(self, game: str) -> float:
+        return round(sum(l for legs, l in self.open.values() if any(leg_game(x) == game for x in legs)), 2)
 
     def add(self, key: str, cp: ComboPrice) -> None:
         self.open[key] = (list(cp.legs), self.max_loss(cp))
@@ -406,6 +430,10 @@ class KalshiComms:
     async def confirm_quote(self, quote_id: str) -> None:
         await self._ok("PUT", f"/communications/quotes/{quote_id}/confirm", {})
 
+    async def positions(self) -> list[dict]:
+        data = await self._ok("GET", "/portfolio/positions?limit=1000&count_filter=position")
+        return (data or {}).get("market_positions") or []
+
     async def market(self, ticker: str) -> dict:
         data = await self._ok("GET", f"/markets/{ticker}")
         return (data or {}).get("market") or data or {}
@@ -426,12 +454,14 @@ class ComboQuoter:
         self.book = RiskBook(cfg)
         self.research = research
         self.allowed = allowed                           # global kill switches (daily loss stop, halts ...)
+        self.on_settled: Callable[[float, str], None] = lambda pnl, key: None   # real P&L -> daily loss stop
         self.clock = clock
         self.seen: set[str] = set()
         self.priced: dict[str, dict] = {}               # rfq_id -> what we priced (for the follow-up)
         self.quotes: dict[str, dict] = {}               # our quote_id -> {rfq, price, created}
         self.positions: dict[str, dict] = {}             # confirmed quote_id -> {price, ticker}
         self._book_cache: dict[str, tuple[float, Optional[LegFair]]] = {}
+        self._fetch_budget = cfg.book_fetches_per_step
         self.stats: dict[str, int] = {}
 
     # ------------------------------------------------------------------ fair values
@@ -447,14 +477,19 @@ class ComboQuoter:
         return fair
 
     async def _refresh_book_fairs(self, legs: list[Leg]) -> None:
-        """Kalshi single-market mid for legs the engine does not price (cached 5s), only if the book is tight."""
+        """Kalshi single-market mid for legs the engine does not price (cached 5s; 60s when unpriceable), only if
+        the book is tight. At most `book_fetches_per_step` lookups per poll: at ~100 RFQs a second, unbudgeted
+        lookups of player props would exhaust Kalshi's rate limit and starve the quotes themselves."""
         now = self.clock()
         for leg in legs:
             if getattr(self, "_primary", None) is not None and self._primary(leg) is not None:
                 continue                                  # the sharp line prices it: no API call needed
             cached = self._book_cache.get(leg.market_ticker)
-            if cached is not None and now - cached[0] < 5:
+            if cached is not None and now - cached[0] < (5 if cached[1] is not None else 60):
                 continue
+            if self._fetch_budget <= 0:
+                return
+            self._fetch_budget -= 1
             try:
                 m = await self.comms.market(leg.market_ticker)
             except Exception as exc:  # noqa: BLE001
@@ -466,8 +501,33 @@ class ComboQuoter:
                 lf = LegFair(prob_yes=(bid + ask) / 2, source="kalshi_book", age_s=0.0)
             self._book_cache[leg.market_ticker] = (now, lf)
 
+    async def restore(self) -> float:
+        """After a restart: count every short parlay we still hold toward the total cap (legs unknown, so the
+        per-leg and per-game caps cannot include them: logged)."""
+        if self.cfg.mode == "shadow" or not hasattr(self.comms, "positions"):
+            return 0.0
+        total = 0.0
+        for p in await self.comms.positions():
+            ticker = str(p.get("ticker") or "")
+            held = _num(p.get("position_fp")) if p.get("position_fp") is not None else _num(p.get("position"))
+            if not ticker.startswith("KXMVE") or not held or held >= 0:
+                continue
+            exposure = _num(p.get("market_exposure_dollars")) or 0.0
+            self.book.open[f"restored-{ticker}"] = ([], exposure)
+            total += exposure
+        if total:
+            log.warning("COMBO restored $%.2f of open short-parlay liability from Kalshi (legs unknown: total cap "
+                        "only)", total)
+        return total
+
     # ------------------------------------------------------------------ main loop
     async def run(self) -> None:
+        try:
+            await self.restore()
+        except Exception as exc:  # noqa: BLE001
+            log.critical("COMBO could not restore open parlay liability (%s): quoting anyway would ignore it; "
+                         "stopping the combo quoter", exc)
+            return
         while True:
             try:
                 await self.step()
@@ -478,6 +538,7 @@ class ComboQuoter:
             await asyncio.sleep(self.cfg.poll_s)
 
     async def step(self) -> None:
+        self._fetch_budget = self.cfg.book_fetches_per_step
         rfqs = await self.comms.open_rfqs()
         for rfq in rfqs:
             rid = str(rfq.get("id"))
@@ -494,17 +555,21 @@ class ComboQuoter:
     async def on_rfq(self, rfq: dict) -> ComboPrice:
         legs = parse_legs(rfq)
         await self._refresh_book_fairs(legs)
-        expires = None
-        try:
-            expires = _ts((await self.comms.market(rfq.get("market_ticker"))).get("expected_expiration_time"))
-        except Exception:  # noqa: BLE001
-            pass
-        cp = self.pricer.price(rfq, expires)
+        cp = self.pricer.price(rfq)                    # horizon from the legs' start times when all are known
+        if cp.action == "QUOTE" and not all((self.pricer.leg_fair(l) or LegFair(0.5, "", 0)).start for l in legs):
+            try:                                       # some leg has no start time: ask Kalshi when it settles
+                expires = _ts((await self.comms.market(rfq.get("market_ticker"))).get("expected_expiration_time"))
+            except Exception:  # noqa: BLE001
+                expires = None
+            if expires is not None:
+                cp = self.pricer.price(rfq, expires)
         blocked = self.allowed()
         if cp.action == "QUOTE" and blocked:
             cp.action, cp.reason = "SKIP", blocked
         if cp.action == "QUOTE" and self.cfg.mode != "shadow":
-            gate = self.pricer.live_allowed(cp) or self.book.check(cp)
+            gate = self.pricer.live_allowed(cp) or self.book.check(cp) or (
+                f"{len(self.quotes)} quotes already open (max {self.cfg.max_open_quotes})"
+                if len(self.quotes) >= self.cfg.max_open_quotes else None)
             if gate:
                 cp.action, cp.reason = "SKIP", gate
         self._count(f"rfq_{cp.action.lower()}")
@@ -524,8 +589,10 @@ class ComboQuoter:
                     self._count("quote_rejected")
                     log.warning("COMBO quote on %s rejected: %s", rfq.get("id"), exc)
                     return cp
+                # no reservation yet: most quotes never win, and reserving each one's full liability would cap
+                # how many we can have out at once. The caps are enforced at the last look, where the liability
+                # becomes real (and one event loop confirms one at a time, so two wins cannot both slip under).
                 self.quotes[qid] = dict(rfq=rfq, price=cp, created=self.clock())
-                self.book.add(qid, cp)                 # reserve the liability while the quote can be accepted
                 self._count("quotes_sent")
         return cp
 
@@ -562,7 +629,12 @@ class ComboQuoter:
               and not fresh.reason.startswith(("stale", "no fair")))
         blocked = self.allowed() or self.book.check(old, exclude=qid)
         if ok and not blocked:
-            await self.comms.confirm_quote(qid)
+            self.book.add(qid, old)                    # reserved BEFORE the await: the next last look sees it
+            try:
+                await self.comms.confirm_quote(qid)
+            except Exception:
+                self.book.remove(qid)
+                raise
             self._count("confirmed")
             self._write("COMBO_CONFIRM", quote_id=qid, rfq_id=q["rfq"].get("id"), yes_price=old.yes_price,
                         fair_then=old.fair, fair_now=fresh.fair, contracts=old.contracts)
@@ -580,6 +652,8 @@ class ComboQuoter:
     def _executed(self, qid: str, q: dict, info: dict) -> None:
         cp: ComboPrice = q["price"]
         self.quotes.pop(qid, None)
+        if qid not in self.book.open:                  # executed without passing our last look: still ours
+            self.book.add(qid, cp)
         self.positions[qid] = dict(price=cp, ticker=q["rfq"].get("market_ticker"), at=self.clock(),
                                    creator=q["rfq"].get("creator_id"))
         self._count("executed")
@@ -595,9 +669,13 @@ class ComboQuoter:
     # ------------------------------------------------------------------ follow-up: did we win, did it pay?
     async def _followup(self) -> None:
         now = self.clock()
+        budget = self.cfg.followups_per_step
         for rid, p in list(self.priced.items()):
             if p["followed"] or now - p["at"] < self.cfg.followup_after_s:
                 continue
+            if budget <= 0:
+                break
+            budget -= 1
             p["followed"] = True
             cp: ComboPrice = p["price"]
             ticker = p["rfq"].get("market_ticker")
@@ -649,6 +727,7 @@ class ComboQuoter:
             else:
                 self.positions.pop(key, None)
                 self.book.remove(key)
+                self.on_settled(round(pnl, 2), key)
             done += 1
         return done
 

@@ -181,8 +181,14 @@ quote them. Kalshi prices combos by **Request For Quote**: a user builds a combo
 * **Sportsbook check (optional feed):** when we are unsure, never quote tighter than a retail sportsbook's
   price for the same parlay (minus 3%); if our fair is above the sportsbook's price, we decline: the model is
   the likely error. Until a feed exists, spot-check same-game parlays by hand in a sportsbook app.
-* **Risk book:** caps on max loss per combo, per leg (popular legs appear in many combos) and in total, checked
-  when quoting and again at confirmation. Quotes expire after 10s. The last look re-prices every leg and declines
+* **Risk book:** caps on max loss per combo, per leg (popular legs appear in many combos), per game
+  (`max_game_exposure`, default $300: one game decides every parlay holding any of its legs) and in total.
+  Liability is reserved when a quote WINS (at the last look, before confirming), not when it is sent: most quotes
+  lose, and reserving each would cap volume; confirmations run one at a time, so two wins cannot both slip under
+  a cap. After a restart, open short parlays are reloaded into the caps (Kalshi: total only; Novig: with legs),
+  or the quoter refuses to start. Real parlay P&L counts toward the daily loss stop. Legs whose game is live,
+  started or inside the 3-minute maker cutoff are never priced. Kalshi REST budgets: at most 20 open quotes,
+  10 single-market lookups and 10 trade follow-ups per poll. Quotes expire after 10s. The last look re-prices every leg and declines
   if the combo moved against us. The daily loss stop and exposure kill-switch block new quotes.
 * **Modes:**
   * `shadow` (start here): prices every open RFQ and sends nothing. It then checks the price each combo actually

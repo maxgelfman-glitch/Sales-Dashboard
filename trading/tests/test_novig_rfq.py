@@ -68,11 +68,13 @@ async def test_quote_within_caps_then_confirm_and_settle(tmp_path):
     price, wager = float(sub["data"]["price"]), float(sub["data"]["max_wager"])
     assert price > 0.33 and len(sub["data"]["price"]) == 5                  # 0.xxx, rounded up
     assert wager * (1 - price) / price <= 100 + 0.01                      # collateral within the per-combo cap
-    assert q.book.total() > 0
+    assert q.book.total() == 0                                            # reserved only when a quote wins
     await q._handle_raw(json.dumps({"event": "quote_accepted", "data": {
         "rfq_id": "r1", "quote_id": "nv-q1", "wager": "20", "price": sub["data"]["price"]}}))
     confirm = q._ws_conn.sent[-1]
     assert confirm == {"event": "confirm", "data": {"rfq_id": "r1", "quote_id": "nv-q1", "confirmed": True}}
+    assert q.book.total() == pytest.approx(20 * (1 - float(sub["data"]["price"])) / float(sub["data"]["price"]),
+                                           abs=0.02)
     await q._handle_raw(json.dumps({"event": "quote_executed", "data": {"rfq_id": "r1", "wager": "20",
                                                                          "price": sub["data"]["price"]}}))
     assert "r1" in q.positions
@@ -148,3 +150,58 @@ def test_configuration(tmp_path):
     assert sup.novig_rfq is not None and sup.novig_rfq.url == "wss://api-qa.novig.us/rfq/ws"
     assert sup.novig_rfq.cfg.maker_fee_rate == 0 and "novig_rfq" in sup._task_factories
     assert sup.novig_rfq.leg_lookup == sup.novig_leg_fair
+
+
+async def test_restart_restores_open_parlays_with_their_legs(tmp_path):
+    q = quoter(tmp_path)
+
+    class Rest:
+        async def executions(self, status=None, limit=500):
+            assert status == "open"
+            return [{"rfq_id": "old", "wager": "42", "price": "0.42", "liability": "58", "status": "open",
+                     "outcome_ids": ["kc", "dal"]}]
+    q.rest = Rest()
+    assert await q.restore() == pytest.approx(58)
+    assert q.book.game_exposure("ev-kcbuf") == pytest.approx(58)      # per-game cap sees the restored parlay
+    assert "old" in q.positions
+
+
+async def test_token_is_refreshed_before_every_reconnect(tmp_path):
+    q = quoter(tmp_path)
+    calls = []
+
+    async def ensure(session=None):
+        calls.append(1)
+        raise ConnectionError("stop here")
+    q.auth.ensure = ensure
+    with pytest.raises(ConnectionError):
+        await q._session()
+    assert calls == [1]
+
+
+async def test_legs_in_started_or_live_games_are_never_priced(tmp_path):
+    import time as _t
+    from novig_feed import MarketInfo
+    sup = build_live_supervisor({"NOVIG_RFQ": "qa", "NOVIG_RFQ_ACCESS_TOKEN": "t", "TRADING_LOG_DIR": str(tmp_path),
+                                 "RESEARCH_ENABLED": "0"})
+    info = MarketInfo(outcome_id="o1", market_id="m1", sibling_outcome_id="o2", league="NFL", market_type="moneyline",
+                      event_id="e1", home_team="Kansas City Chiefs", away_team="Buffalo Bills",
+                      outcome="Kansas City Chiefs", start_time=_t.time() + 3600)
+    sup.registry.replace_all([info, info.model_copy(update={"outcome_id": "o2", "sibling_outcome_id": "o1",
+                                                            "outcome": "Buffalo Bills"})])
+    sup._index_start_times()
+    sup.book.ingest([dict(league="NFL", home_team="Kansas City Chiefs", away_team="Buffalo Bills",
+                          market_type="moneyline", side="Kansas City Chiefs", odds_for=-150, odds_against=130)])
+    hit = sup.novig_leg_fair("o1")
+    assert hit is not None and hit[1].start is not None
+    sup.mark_game_live(sup._canonical(__import__("novig_feed").MarketUpdate.from_info(info))[0][:3], "test")
+    assert sup.novig_leg_fair("o1") is None
+
+
+async def test_parlay_losses_count_toward_the_daily_loss_stop(tmp_path):
+    sup = build_live_supervisor({"NOVIG_RFQ": "qa", "NOVIG_RFQ_ACCESS_TOKEN": "t", "TRADING_LOG_DIR": str(tmp_path),
+                                 "RESEARCH_ENABLED": "0", "DAILY_LOSS_LIMIT_USD": "100"})
+    sup.novig_rfq.on_settled(-60.0, "a")
+    assert sup._combo_block_reason() is None
+    sup.novig_rfq.on_settled(-50.0, "b")
+    assert sup._combo_block_reason() == "daily loss stop"             # no new parlay quotes today

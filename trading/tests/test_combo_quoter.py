@@ -222,10 +222,11 @@ async def test_demo_quote_then_confirm_on_unchanged_fairs(tmp_path):
     await q.step()
     [c] = q.comms.created
     assert c["yes_bid"] == 0.0 and c["no_bid"] == pytest.approx(1 - _yes(0.33, 0.085 + 2 * 0.01 / 30))   # we sell it
-    assert q.book.total() > 0                                                               # liability reserved
+    assert q.book.total() == 0                                      # nothing reserved until a quote wins
     q.comms.quote_status["q1"] = {"status": "accepted", "accepted_side": "yes"}
     await q.step()
     assert q.comms.confirmed == ["q1"] and rows(tmp_path, "COMBO_CONFIRM")
+    assert q.book.total() > 0                                       # reserved at the last look
 
 
 async def test_last_look_declines_when_a_leg_moved(tmp_path):
@@ -362,3 +363,58 @@ def test_report_breaks_results_down_by_slice_and_flags_suspiciously_cheap_quotes
     assert c["far_below_market"] == 1                                    # 0.30 vs a 0.40 trade
     assert c["by_slice"]["kalshi NFL:2L:x"]["win_rate"] == 1 and c["by_slice"]["kalshi NFL:2L:x"]["pnl"] == 7.5
     assert c["by_slice"]["kalshi NBA:2L:sgp"]["below"] == 1
+
+
+def test_one_game_cannot_carry_more_than_its_cap_across_parlays():
+    cfg = ComboConfig(max_loss_per_combo=100, max_leg_exposure=1000, max_total_liability=1000, max_game_exposure=20)
+    book, pr = RiskBook(cfg), ComboPricer(cfg, leg_fair)
+    a = pr.price(rfq(contracts=20))                                   # T1 (BOS-NYK) + T2 (KC-BUF), ~$13.6
+    book.add("a", a)
+    other_nyk = "KXNBAGAME-26OCT01BOSNYK-BOS"                         # a different leg, same game
+    FAIRS[other_nyk] = 0.45
+    try:
+        b = pr.price(rfq(legs=((other_nyk, "yes"), (T3, "yes")), contracts=20))
+        assert "game 26OCT01BOSNYK exposure" in book.check(b)
+    finally:
+        FAIRS.pop(other_nyk)
+
+
+async def test_two_wins_at_once_cannot_both_slip_under_the_cap(tmp_path):
+    q, clock = quoter(tmp_path, max_total_liability=20)               # room for one ~$13.6 parlay, not two
+    q.comms.rfqs = [rfq("r1"), rfq("r2", ticker="KXMVE-COMBO-2")]
+    await q.step()
+    assert len(q.comms.created) == 2                                  # both quoted (nothing reserved yet)
+    q.comms.quote_status["q1"] = {"status": "accepted", "accepted_side": "yes"}
+    q.comms.quote_status["q2"] = {"status": "accepted", "accepted_side": "yes"}
+    await q.step()
+    assert len(q.comms.confirmed) == 1 and len(q.comms.deleted) == 1  # the second fails the cap at last look
+
+
+async def test_restart_restores_open_short_parlays_into_the_total_cap(tmp_path):
+    q, clock = quoter(tmp_path)
+
+    async def positions():
+        return [{"ticker": "KXMVE-COMBO-9", "position_fp": "-40", "market_exposure_dollars": "26.40"},
+                {"ticker": "KXNBAGAME-26OCT01BOSNYK-NYK", "position_fp": "10", "market_exposure_dollars": "5"}]
+    q.comms.positions = positions
+    assert await q.restore() == pytest.approx(26.40) and q.book.total() == pytest.approx(26.40)
+
+
+async def test_unpriceable_legs_are_looked_up_within_a_budget(tmp_path):
+    q, clock = quoter(tmp_path, book_fetches_per_step=3)
+    calls = []
+
+    async def market(ticker):
+        calls.append(ticker)
+        return {}
+    q.comms.market = market
+    q.comms.rfqs = [rfq(f"r{i}", legs=((T1, "yes"), (f"KXNBAPTS-26OCT0{i}XXXYYY-P", "yes"))) for i in range(1, 8)]
+    await q.step()
+    assert len(calls) <= 3                                            # not one lookup per prop per RFQ
+
+
+async def test_open_quotes_are_capped(tmp_path):
+    q, clock = quoter(tmp_path, max_open_quotes=2, max_total_liability=10_000)
+    q.comms.rfqs = [rfq(f"r{i}", ticker=f"KXMVE-C{i}") for i in range(5)]
+    await q.step()
+    assert len(q.comms.created) == 2

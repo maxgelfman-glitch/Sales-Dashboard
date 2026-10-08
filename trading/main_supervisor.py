@@ -554,12 +554,14 @@ class Supervisor:
         if combo_quoter is not None:
             combo_quoter.pricer.leg_fair = combo_quoter._leg_fair_with_fallback(self.combo_leg_fair)
             combo_quoter.allowed = self._combo_block_reason
+            combo_quoter.on_settled = lambda pnl, key: self._on_parlay_settled("kalshi", pnl, key)
             self._task_factories["combo_quoter"] = combo_quoter.run
             self._task_factories["combo_results"] = combo_quoter.results_loop
         self.novig_rfq = novig_rfq
         if novig_rfq is not None:
             novig_rfq.leg_lookup = self.novig_leg_fair
             novig_rfq.allowed = self._combo_block_reason
+            novig_rfq.on_settled = lambda pnl, key: self._on_parlay_settled("novig", pnl, key)
             novig_rfq.on_state_change = self.on_feed_state
             self._task_factories["novig_rfq"] = novig_rfq.run
             self._task_factories["novig_rfq_results"] = novig_rfq.results_loop
@@ -1608,9 +1610,12 @@ class Supervisor:
         fair = self._fair(sharp) if sharp is not None else None
         if fair is None:
             return None
+        if self._trade_blocked(key[:3], "maker"):          # live, started or about to: a pregame price is wrong
+            return None
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
         spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
-        return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread, books=books or None)
+        return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread, books=books or None,
+                       start=self.game_start.get(key[:3]) or info.start_time)
 
     def novig_leg_fair(self, outcome_id: str):
         """(event id, LegFair) for a Novig outcome used as a parlay leg: P(this outcome wins) from the sharp line."""
@@ -1626,12 +1631,17 @@ class Supervisor:
         fair = self._fair(sharp) if sharp is not None else None
         if fair is None:
             return None
-        if self._trade_blocked(key[:3], "taker"):             # live, cut off, or no start time: never a leg
+        if self._trade_blocked(key[:3], "maker"):             # live, started or about to: never a leg
             return None
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
         spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
         return info.event_id, LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread,
-                                      books=books or None)
+                                      books=books or None, start=self.game_start.get(key[:3]) or info.start_time)
+
+    def _on_parlay_settled(self, venue: str, pnl: float, key: str) -> None:
+        """A real parlay settled: its P&L counts toward the daily loss stop, and survives a restart (ledger)."""
+        self._ledger("SETTLE", venue=venue, kind="PARLAY", position=key, net_profit_usd=pnl)
+        self._record_daily_pnl(pnl)
 
     def _combo_block_reason(self) -> Optional[str]:
         if self._loss_halted():

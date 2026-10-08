@@ -168,6 +168,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         self.book = RiskBook(self.cfg)
         self.research = research
         self.allowed = allowed
+        self.on_settled: Callable[[float, str], None] = lambda pnl, key: None   # real P&L -> daily loss stop
         self.clock = clock
         self.rounds: dict[str, dict] = {}            # rfq_id -> {legs, price, wager, quoted, closed_at}
         self.positions: dict[str, dict] = {}         # rfq_id -> {price, wager, liability}
@@ -179,8 +180,36 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         return {"Authorization": f"Bearer {self.auth.token}"} if self.auth.token else None
 
     async def run(self) -> None:
-        await self.auth.ensure()
+        try:
+            await self.restore()
+        except Exception as exc:  # noqa: BLE001
+            log.critical("NOVIG_RFQ could not load open parlays (%s): quoting would ignore their liability; "
+                         "the Novig parlay quoter is stopping", exc)
+            return
         await super().run()
+
+    async def _session(self) -> None:
+        await self.auth.ensure()                  # the token is checked at every (re)connect: refresh first
+        await super()._session()
+
+    async def restore(self) -> float:
+        """After a restart: every parlay we still hold counts toward the caps again, with its legs."""
+        if self.cfg.mode == "shadow":
+            return 0.0
+        total = 0.0
+        for row in await self.rest.executions(status="open"):
+            rid, wager, price = str(row.get("rfq_id")), _num(row.get("wager")), _num(row.get("price"))
+            if not wager or not price or not 0 < price < 1 or rid in self.positions:
+                continue
+            legs = [Leg(str(o), (self.leg_lookup(str(o)) or ("",))[0] or str(o), "yes")
+                    for o in row.get("outcome_ids") or []]
+            liability = _num(row.get("liability")) or wager * (1 - price) / price
+            self.book.open[rid] = (legs, round(liability, 2))
+            self.positions[rid] = dict(price=price, wager=wager, liability=liability, fair=None, slice=None)
+            total += liability
+        if total:
+            log.warning("NOVIG_RFQ restored %d open parlay(s), $%.2f collateral", len(self.positions), total)
+        return total
 
     async def _send(self, event: str, data: Any) -> None:
         if self._ws_conn is not None:
@@ -272,9 +301,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
             wager = math.floor(cp.contracts * cp.yes_price * 100) / 100
             await self._send("create_quote", {"rfq_id": rid, "price": f"{cp.yes_price:.3f}",
                                               "max_wager": f"{wager:.2f}", "quote_id": f"q-{rid[:8]}"})
-            self.rounds[rid]["quoted"] = True
-            self.book.add(rid, cp)                         # reserved until the round resolves
-            self._count("quotes_sent")
+            self.rounds[rid]["quoted"] = True               # liability is reserved at the last look, not here:
+            self._count("quotes_sent")                      # most quotes lose, and reserving each would cap volume
         elif live:
             await self._send("decline", {"rfq_id": rid})  # tells Novig we are alive, just passing
 
@@ -315,6 +343,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                                                        no_bid=round(1 - price, 4))
                 why = self.allowed() or self.book.check(held, exclude=rid)
                 ok = why is None
+                if ok:
+                    self.book.add(rid, held)            # before the await: the next last look counts it
         await self._send("confirm", {"rfq_id": rid, "quote_id": qid, "confirmed": ok})
         elapsed = time.monotonic() - started
         self._count("confirmed" if ok else "declined_last_look")
@@ -336,6 +366,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         if cp is not None:
             self.book.add(rid, dataclasses.replace(cp, contracts=wager / price, yes_price=price,
                                                    no_bid=round(1 - price, 4), fee=0.0))
+        else:
+            self.book.open[rid] = ([], liability)         # unknown round (e.g. after a restart): total cap only
         self.positions[rid] = dict(price=price, wager=wager, liability=liability,
                                    fair=None if cp is None else cp.fair, slice=None if cp is None else cp.slice)
         self.rounds.pop(rid, None)
@@ -375,6 +407,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                         round(pos["wager"] / pos["price"] * (pos["price"] - pos["fair"]), 4))
             self.positions.pop(rid, None)
             self.book.remove(rid)
+            self.on_settled(pnl, rid)
             done += 1
         return done
 
