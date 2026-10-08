@@ -146,7 +146,10 @@ async def test_full_dual_venue_runtime_is_fully_logged(log_path):
     kinds = [(o.kind, o.venue, o.side, o.contracts, o.stake_usd, o.fee_usd) for o in sup.orders]
     assert kinds[:2] == [("DIRECTIONAL", "novig", "New York Knicks", 2040, 999.60, 0.0),
                          ("ARB_HEDGE", "kalshi", "Boston Celtics", 2040, 953.35, 35.35)]
-    assert kinds[2][:3] == ("DIRECTIONAL", "novig", "over")
+    # after the reconnect the maker may re-quote the total quickly enough for the 44c tick to fill that quote
+    # first (a correct MAKER_FILL, which then locks the market against a second bet). Either way the engine
+    # traded "over" on the re-established socket, which is what this step proves.
+    assert {k[:3] for k in kinds[2:]} & {("DIRECTIONAL", "novig", "over"), ("MAKER_FILL", "novig", "over")}
     assert sup.maker.last_cancel_ms is not None and sup.maker.last_cancel_ms < MAKER_CANCEL_BUDGET_MS
     assert sup.maker.quotes == {}                                         # pulled at shutdown
     assert not async_errors, async_errors

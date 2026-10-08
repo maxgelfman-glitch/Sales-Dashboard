@@ -242,6 +242,32 @@ class SharpBook:
             return next(iter(pool.values()))[0]
         return self._consensus(pool)
 
+    def dispersion(self, league: str, home: str, away: str, market_type: str, side: str,
+                   line: Optional[float] = None) -> tuple[Optional[float], int]:
+        """(max - min de-vigged probability across the fresh books behind lookup(), number of books)."""
+        from execution import american_to_decimal, fair_devig
+        key = (league, home, away, market_type, side)
+        now = self.clock()
+        fresh = lambda books: {b: v for b, v in books.items()  # noqa: E731
+                               if now - v[1] <= self.max_age and self._weight(b) > 0}
+        pool = fresh(self._src.get((key, line), {})) if line is not None else {}
+        if not pool:
+            mains = fresh(self._main_src.get(key, {}))
+            if not mains:
+                return None, 0
+            best = max(mains, key=lambda b: (self._weight(b), b))
+            pool = fresh(self._src.get((key, mains[best][0].line), {})) or {best: mains[best]}
+        probs = []
+        for ln, _ in pool.values():
+            try:
+                (p, _), _ = fair_devig([american_to_decimal(ln.odds_for), american_to_decimal(ln.odds_against)])
+                probs.append(p)
+            except ValueError:
+                continue
+        if not probs:
+            return None, 0
+        return (max(probs) - min(probs) if len(probs) > 1 else None), len(probs)
+
     def _weight(self, book: str) -> float:
         return self.weights.get(book, 1.0 if not self.weights else self.weights.get("*", 0.0))
 

@@ -162,27 +162,42 @@ Every game gets its scheduled start time from the Novig events data (Kalshi: `oc
 Retail loses heavily on Kalshi combos (reported ~$294M net in 2026, implied margin ~14.7%), and only a handful of bots
 quote them. Kalshi prices combos by **Request For Quote**: a user builds a combo, makers quote, the user accepts, and
 **the maker confirms (last look)** before anything executes. `combo_quoter.py` quotes the SHORT side of combos:
-* **What it quotes:** combos of at most 4 legs whose legs are all on different games. It checks both the event
-  and the game code inside Kalshi tickers, so a player prop plus the moneyline of one game is rejected. Every leg
-  needs a fresh fair value: the sharp line when the leg is a game we track, otherwise Kalshi's own book when the
-  bid/ask spread is ≤3¢ (with an extra margin).
-* **Pricing:** fair = product of the legs' probabilities. Margin = 4% + 2% per leg (+1% per book-priced leg),
-  because errors compound per leg. The requester pays fair × (1 + margin) for YES; we buy NO. The expected return
-  on collateral must be ≥1%, which skips the 0.1¢ longshot trap where collateral is huge and profit tiny.
+* **What it quotes:** every league we have sharp prices for (NFL, NBA, MLB, NHL, WNBA, college, tennis). Shadow
+  prices parlays of up to 6 legs, same-game ones included; real quotes default to parlays of up to 4 legs on
+  **different games** (`COMBO_LIVE_KINDS=xgame`, `COMBO_LIVE_MAX_LEGS=4`, optional `COMBO_LIVE_LEAGUES=NFL,NBA`).
+  Same-game legs (same event, or the game code inside Kalshi tickers) move together, so they stay shadow-only
+  until their own numbers hold up (`COMBO_LIVE_KINDS=xgame,sgp`). Every leg needs a fresh fair value: the sharp
+  line, or Kalshi's own book when its bid/ask spread is ≤3¢ (with an extra margin).
+* **Pricing: the less sure, the wider and the smaller.** Fair = product of the legs' probabilities. Margin =
+  4% + 2% per leg + an uncertainty margin per leg: league (NFL 0, NBA/MLB/NHL +0.5%, WNBA/college/tennis +1%,
+  other +2%), line age (up to +1%), sharp books disagreeing (spread ÷ probability; over 3¢ apart = no quote),
+  one book only (+0.5%, no second opinion: add a second sharp book to `THERUNDOWN_AFFILIATE_IDS` and weight
+  Pinnacle higher in `SHARP_BOOK_WEIGHTS`), Kalshi-book pricing (+1%), same-game (+8% per extra leg) and a
+  requester with a winning record (+4%; declined above +15% ROI over 15+ parlays: we cannot limit winners the
+  way sportsbooks do). Size shrinks with the same uncertainty, down to 25% of the per-combo cap.
+* **Fee:** since 2026-08-20 Kalshi charges combo makers half the taker fee, 0.035·P·(1−P), except parlays of
+  NFL legs on different games. It is added on top of the margin. Expected return on collateral must be ≥1%,
+  which skips the 0.1¢ longshot trap.
+* **Sportsbook check (optional feed):** when we are unsure, never quote tighter than a retail sportsbook's
+  price for the same parlay (minus 3%); if our fair is above the sportsbook's price, we decline: the model is
+  the likely error. Until a feed exists, spot-check same-game parlays by hand in a sportsbook app.
 * **Risk book:** caps on max loss per combo, per leg (popular legs appear in many combos) and in total, checked
   when quoting and again at confirmation. Quotes expire after 10s. The last look re-prices every leg and declines
   if the combo moved against us. The daily loss stop and exposure kill-switch block new quotes.
 * **Modes:**
   * `shadow` (start here): prices every open RFQ and sends nothing. It then checks the price each combo actually
-    traded at (would ours have won?) and its result (would it have paid?). Report section [COMBO QUOTING].
+    traded at (would ours have won?) and its result (would it have paid?). Report section [COMBO QUOTING],
+    broken down by slice (leagues : legs : x/sgp), with a warning when we would have been 10%+ cheaper than
+    where the parlay traded (usually our model, not a gift).
   * `demo`: real quotes on Kalshi's demo exchange (`KALSHI_ENV=demo`).
   * `live`: needs `TRADING_MODE=live`. Default caps are $25 per combo, $150 per leg and $1,000 total.
 * **Gates before real money:** (0) confirm with Kalshi that a regular account can quote combos in production;
-  (1) shadow: would-win rate ≥5% at a median margin ≥8%; (2) leg fair values track closing prices; (3) tiny live
+  (1) shadow, per slice: would-win rate ≥5% at a median margin ≥8%; (2) leg fair values track closing prices; (3) tiny live
   results within ~30% of shadow expectations; (4) scale up step by step, **after a CPA opinion** (if treated as
   gambling, only 90% of losses are deductible from 2026, which hits high-turnover short-combo books hard).
 * **Assumed, to verify on demo:** the requester buying YES pays 1 − our `no_bid`; quotes cover the full RFQ size;
-  a maker fee of 0.0175·P·(1−P) on fills; that makers can list other members' open RFQs.
+  the combo maker fee and its NFL exemption (from news reports); that makers can list other members' open RFQs
+  and see their `creator_id`.
 
 ## Realistic paper execution and the size ladder
 Paper trading defaults to `PAPER_EXECUTION=simulated`. Every paper order goes through the **same order path

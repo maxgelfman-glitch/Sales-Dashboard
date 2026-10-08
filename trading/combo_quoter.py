@@ -13,16 +13,23 @@ MODES (COMBO_QUOTER)
     demo    real quotes on Kalshi's DEMO exchange (fake money): proves the quote/accept/confirm plumbing
     live    real quotes (TRADING_MODE=live), tiny caps by default
 
-PRICING (per combo)
+PRICING (per combo): the less sure we are, the wider the quote and the smaller the size
     * legs: each (market ticker, side). Fair probability from the sharp line when the leg maps to a game we track
       (preferred), else from Kalshi's own single-market book if its bid/ask spread is tight.
-    * REJECT: > max legs; any leg without a fresh fair value; two legs on the same game (event ticker OR the game
-      code embedded in Kalshi tickers, which catches a player prop + moneyline of one game); settlement beyond
-      the horizon; requester YES price outside the price band.
-    * fair = product of leg probabilities (legs independent by construction)
-    * margin = base + per-leg (+ extra for legs priced only from Kalshi's own book) -> errors compound per leg
-    * requester's YES price = fair x (1 + margin); we BUY NO at no_bid = 1 - that price (we are short the combo)
-    * expected profit per contract = yes_price - fair - maker fee (assumed 0.0175 x P x (1-P), rounded up)
+    * REJECT: > max legs; any leg without a fresh fair value; sharp books disagreeing on a leg by more than
+      COMBO_MAX_DISAGREEMENT; settlement beyond the horizon; requester YES price outside the price band; our fair
+      above a retail sportsbook's price for the same parlay (then OUR model is the likely error).
+    * SAME-GAME legs (event ticker or the game code in Kalshi tickers) are priced as if independent plus a large
+      per-leg margin, and are SHADOW-ONLY unless COMBO_LIVE_KINDS includes "sgp": their legs move together.
+    * fair = product of leg probabilities
+    * margin = base + per-leg + uncertainty, where uncertainty adds per leg for: the league (NFL lines are the
+      sharpest), books disagreeing, a single book (no second opinion), the line's age, Kalshi-book pricing,
+      same-game legs, and a requester with a winning record
+    * fee: Kalshi charges combo makers half the taker fee (0.035 x P x (1-P)) since 2026-08-20, except parlays of
+      NFL legs from different games. The fee is added on top of the margin, never taken out of it.
+    * requester's YES price = fair x (1 + margin) + fee; we BUY NO at no_bid = 1 - that price (short the combo)
+    * size: the max loss allowed per combo shrinks as uncertainty grows (down to COMBO_MIN_SIZE_FACTOR)
+    * optional sportsbook price (a feed of retail parlay prices): when we are unsure we quote no tighter than it
     * return on collateral = expected profit / no_bid; must clear COMBO_MIN_ROC (kills the 0.1c longshot trap)
 
 RISK BOOK (demo / live)
@@ -48,7 +55,12 @@ from typing import Any, Awaitable, Callable, Optional
 
 log = logging.getLogger("trading.combos")
 
-MAKER_FEE_RATE = 0.0175
+MAKER_FEE_RATE = 0.035                                   # combo makers: half the 0.07 taker rate (2026-08-20)
+LEAGUE_LEG_MARGIN = {"NFL": 0.0, "NBA": 0.005, "MLB": 0.005, "NHL": 0.005, "WNBA": 0.01, "NCAAF": 0.01,
+                     "NCAAB": 0.01, "TENNIS": 0.01}
+OTHER_LEAGUE_MARGIN = 0.02
+_SERIES_LEAGUE = (("NCAAF", "NCAAF"), ("NCAAMB", "NCAAB"), ("NCAAB", "NCAAB"), ("WNBA", "WNBA"), ("NFL", "NFL"),
+                  ("NBA", "NBA"), ("MLB", "MLB"), ("NHL", "NHL"), ("ATP", "TENNIS"), ("WTA", "TENNIS"))
 _GAME_CODE = re.compile(r"^\d{2}[A-Z]{3}\d{2}")        # e.g. 26OCT01BOSNYK: date + teams, shared by one game's markets
 
 
@@ -81,12 +93,21 @@ class Leg:
     side: str                                # "yes" | "no"
 
 
+def league_of(ticker: str) -> str:
+    """'KXNBAGAME-...' -> 'NBA', 'KXNCAAMBGAME-...' -> 'NCAAB'; 'OTHER' when the series is not a tracked league."""
+    series = (ticker or "").split("-")[0].upper()
+    series = series[2:] if series.startswith("KX") else series
+    return next((lg for prefix, lg in _SERIES_LEAGUE if series.startswith(prefix)), "OTHER")
+
+
 @dataclass
 class LegFair:
     prob_yes: float                          # fair probability the leg's market resolves YES
     source: str                              # "sharp" | "kalshi_book"
     age_s: float
     game: Optional[tuple] = None             # canonical (league, home, away) when known
+    spread: Optional[float] = None           # max - min fair probability across sharp books (None = unknown)
+    books: Optional[int] = None              # how many sharp books priced it (1 = no second opinion)
 
     def prob(self, side: str) -> float:
         return self.prob_yes if side == "yes" else 1.0 - self.prob_yes
@@ -95,7 +116,8 @@ class LegFair:
 @dataclass
 class ComboConfig:
     mode: str = "shadow"                     # shadow | demo | live
-    max_legs: int = 4
+    max_legs: int = 6                        # priced (shadow) up to this many legs
+    live_max_legs: int = 4                   # quoted for real only up to this many
     base_margin: float = 0.04
     per_leg_margin: float = 0.02
     book_leg_extra_margin: float = 0.01      # legs priced only from Kalshi's own book are less certain
@@ -103,6 +125,24 @@ class ComboConfig:
     max_price: float = 0.60
     min_roc: float = 0.01                    # expected profit / collateral, per quote
     max_leg_age_s: float = 30.0
+    age_margin: float = 0.01                 # added per leg at max_leg_age_s (linear)
+    max_disagreement: float = 0.03           # sharp books further apart than this on a leg -> do not quote
+    disagreement_mult: float = 1.0           # margin added per leg = mult x spread / leg probability
+    single_book_margin: float = 0.005        # per leg priced by only one sharp book
+    league_margin: dict = field(default_factory=lambda: dict(LEAGUE_LEG_MARGIN))
+    other_league_margin: float = OTHER_LEAGUE_MARGIN
+    same_game_margin: float = 0.08           # per extra leg in the same game (correlation unknown)
+    live_kinds: tuple = ("xgame",)           # what may be quoted for real: "xgame" (different games), "sgp"
+    live_leagues: Optional[tuple] = None     # None = every league we can price
+    fee_exempt_leagues: tuple = ("NFL",)     # cross-game parlays of only these leagues pay no maker fee
+    uncertainty_full_cut: float = 0.08       # uncertainty margin at which size falls to min_size_factor
+    min_size_factor: float = 0.25
+    sportsbook_discount: float = 0.03        # when unsure: quote no tighter than the sportsbook price x (1 - this)
+    sportsbook_when_uncertain: float = 0.03  # "unsure" = uncertainty margin at least this (or same-game)
+    requester_min_trades: int = 15           # requester record needed before it counts
+    requester_widen_roi: float = 0.05        # requester's taker ROI above this -> widen
+    requester_widen_margin: float = 0.04
+    requester_block_roi: float = 0.15        # ... above this -> decline
     max_book_spread: float = 0.03
     max_horizon_h: float = 36.0
     max_loss_per_combo: float = 25.0
@@ -129,6 +169,13 @@ class ComboPrice:
     expected_profit: Optional[float] = None  # $ for the whole quote
     roc: Optional[float] = None
     sources: list[str] = field(default_factory=list)
+    slice: str = ""                          # e.g. "NFL:2L:x", "NBA+NHL:3L:x", "NBA:2L:sgp"
+    leagues: list[str] = field(default_factory=list)
+    same_game: bool = False
+    fee_exempt: bool = False
+    uncertainty: float = 0.0                 # the uncertainty part of the margin
+    size_factor: float = 1.0                 # share of max_loss_per_combo this quote may use
+    sportsbook_yes: Optional[float] = None
 
 
 def maker_fee(contracts: int, price: float, rate: float = MAKER_FEE_RATE) -> float:
@@ -148,10 +195,45 @@ def rfq_contracts(rfq: dict, yes_price: Optional[float]) -> int:
     return int(cost / yes_price) if cost and yes_price else 0
 
 
+class RequesterBook:
+    """How each RFQ creator has done as a TAKER against our prices (real fills and would-have-won shadow quotes).
+    Sportsbooks limit winners; we cannot refuse anyone, so we widen or decline instead."""
+
+    def __init__(self, cfg: ComboConfig) -> None:
+        self.cfg = cfg
+        self.record: dict[str, list[float]] = {}           # creator id -> [n, taker pnl $, taker stake $]
+
+    def add(self, creator: Optional[str], taker_pnl: float, taker_stake: float) -> None:
+        if not creator:
+            return
+        r = self.record.setdefault(creator, [0, 0.0, 0.0])
+        r[0] += 1
+        r[1] += taker_pnl
+        r[2] += taker_stake
+
+    def roi(self, creator: Optional[str]) -> Optional[float]:
+        r = self.record.get(creator or "")
+        if not r or r[0] < self.cfg.requester_min_trades or r[2] <= 0:
+            return None
+        return r[1] / r[2]
+
+    def adjust(self, creator: Optional[str]) -> tuple[float, Optional[str]]:
+        roi = self.roi(creator)
+        if roi is None:
+            return 0.0, None
+        if roi > self.cfg.requester_block_roi:
+            return 0.0, f"requester wins {roi:.0%} on our prices"
+        return (self.cfg.requester_widen_margin, None) if roi > self.cfg.requester_widen_roi else (0.0, None)
+
+
 class ComboPricer:
-    def __init__(self, cfg: ComboConfig, leg_fair: Callable[[Leg], Optional[LegFair]]) -> None:
+    def __init__(self, cfg: ComboConfig, leg_fair: Callable[[Leg], Optional[LegFair]],
+                 sportsbook_price: Optional[Callable[[list], Optional[float]]] = None,
+                 requesters: Optional[RequesterBook] = None) -> None:
         self.cfg = cfg
         self.leg_fair = leg_fair
+        self.sportsbook_price = sportsbook_price          # retail book's YES price for the same parlay, if known
+        self.requesters = requesters or RequesterBook(cfg)
 
     def price(self, rfq: dict, expires_at: Optional[float] = None) -> ComboPrice:
         cfg = self.cfg
@@ -163,50 +245,98 @@ class ComboPricer:
             return skip(f"{len(legs)} legs > max {cfg.max_legs}")
         if expires_at is not None and expires_at - time.time() > cfg.max_horizon_h * 3600:
             return skip("settles beyond the horizon (capital tied up too long)")
-        seen_events, seen_codes, seen_games = set(), set(), set()
-        for leg in legs:
-            code = game_code(leg.market_ticker) or game_code(leg.event_ticker)
-            if leg.event_ticker in seen_events or (code and code in seen_codes):
-                return skip("two legs on the same game (correlated)")
-            seen_events.add(leg.event_ticker)
-            if code:
-                seen_codes.add(code)
-        fair, sources, extra = 1.0, [], 0.0
+        fairs: list[LegFair] = []
         for leg in legs:
             lf = self.leg_fair(leg)
             if lf is None:
                 return skip(f"no fair value for leg {leg.market_ticker}")
             if lf.age_s > cfg.max_leg_age_s:
                 return skip(f"stale fair value for leg {leg.market_ticker} ({lf.age_s:.0f}s)")
+            if lf.spread is not None and lf.spread > cfg.max_disagreement + 1e-12:
+                return skip(f"sharp books disagree by {lf.spread:.3f} on leg {leg.market_ticker}")
+            fairs.append(lf)
+        # which legs share a game: event ticker, the game code inside Kalshi tickers, or the canonical game
+        groups: list[set] = []
+        for leg, lf in zip(legs, fairs):
+            ids = {("e", leg.event_ticker)} if leg.event_ticker else set()
+            code = game_code(leg.market_ticker) or game_code(leg.event_ticker)
+            if code:
+                ids.add(("c", code))
             if lf.game is not None:
-                if lf.game in seen_games:
-                    return skip("two legs on the same game (correlated)")
-                seen_games.add(lf.game)
+                ids.add(("g", tuple(lf.game)))
+            hit = next((g for g in groups if g & ids), None)
+            if hit is None:
+                groups.append(set(ids))
+            else:
+                hit |= ids
+        same_game_extra = len(legs) - len(groups)
+        same_game = same_game_extra > 0
+        leagues = [lf.game[0] if lf.game else league_of(leg.market_ticker) for leg, lf in zip(legs, fairs)]
+        fair, sources, uncertainty = 1.0, [], 0.0
+        for leg, lf, league in zip(legs, fairs, leagues):
             p = lf.prob(leg.side)
             if not 0 < p < 1:
                 return skip(f"degenerate leg probability {p}")
             fair *= p
             sources.append(lf.source)
+            uncertainty += cfg.league_margin.get(league, cfg.other_league_margin)
+            uncertainty += cfg.age_margin * min(1.0, lf.age_s / max(cfg.max_leg_age_s, 1e-9))
             if lf.source != "sharp":
-                extra += cfg.book_leg_extra_margin
-        margin = cfg.base_margin + cfg.per_leg_margin * len(legs) + extra
-        yes_price = round(min(fair * (1 + margin), 0.99), 4)
+                uncertainty += cfg.book_leg_extra_margin
+            if lf.spread is not None:
+                uncertainty += cfg.disagreement_mult * lf.spread / p
+            if lf.books == 1:
+                uncertainty += cfg.single_book_margin
+        uncertainty += cfg.same_game_margin * same_game_extra
+        req_add, req_block = self.requesters.adjust(rfq.get("creator_id"))
+        if req_block:
+            return skip(req_block)
+        uncertainty += req_add
+        margin = cfg.base_margin + cfg.per_leg_margin * len(legs) + uncertainty
+        fee_exempt = not same_game and all(lg in cfg.fee_exempt_leagues for lg in leagues)
+        rate = 0.0 if fee_exempt else cfg.maker_fee_rate
+        base_yes = fair * (1 + margin)
+        yes_price = base_yes + rate * base_yes * (1 - base_yes)          # the fee goes on top of the margin
+        sb = self.sportsbook_price(legs) if self.sportsbook_price is not None else None
+        if sb is not None:
+            if fair > sb:
+                return skip("our fair is above the sportsbook's price (model likely wrong)", fair=fair,
+                            sportsbook_yes=sb)
+            if same_game or uncertainty >= cfg.sportsbook_when_uncertain:
+                yes_price = max(yes_price, sb * (1 - cfg.sportsbook_discount))
+        yes_price = round(min(yes_price, 0.99), 4)
         no_bid = round(1 - yes_price, 4)
+        span = max(cfg.uncertainty_full_cut, 1e-9)
+        size_factor = round(max(cfg.min_size_factor, 1 - (1 - cfg.min_size_factor) * min(1.0, uncertainty / span)), 3)
+        tags = "+".join(sorted(set(leagues)))
+        info = dict(fair=fair, margin=margin, yes_price=yes_price, no_bid=no_bid, sources=sources, leagues=leagues,
+                    slice=f"{tags}:{len(legs)}L:{'sgp' if same_game else 'x'}", same_game=same_game,
+                    fee_exempt=fee_exempt, uncertainty=round(uncertainty, 4), size_factor=size_factor,
+                    sportsbook_yes=sb)
         if not cfg.min_price <= yes_price <= cfg.max_price:
-            return skip(f"price {yes_price:.4f} outside band", fair=fair, margin=margin, yes_price=yes_price,
-                        no_bid=no_bid, sources=sources)
+            return skip(f"price {yes_price:.4f} outside band", **info)
         contracts = rfq_contracts(rfq, yes_price)
         if contracts <= 0:
-            return skip("no size", fair=fair, margin=margin, yes_price=yes_price, no_bid=no_bid, sources=sources)
-        fee = maker_fee(contracts, no_bid, cfg.maker_fee_rate)
+            return skip("no size", **info)
+        fee = maker_fee(contracts, no_bid, rate)
         expected = contracts * (yes_price - fair) - fee
         roc = expected / (contracts * no_bid)
-        out = ComboPrice(action="QUOTE", reason="ok", legs=legs, fair=fair, margin=margin, yes_price=yes_price,
-                         no_bid=no_bid, contracts=contracts, fee=fee, expected_profit=round(expected, 4),
-                         roc=round(roc, 5), sources=sources)
+        out = ComboPrice(action="QUOTE", reason="ok", legs=legs, contracts=contracts, fee=fee,
+                         expected_profit=round(expected, 4), roc=round(roc, 5), **info)
         if roc < cfg.min_roc:
             out.action, out.reason = "SKIP", f"return on collateral {roc:.2%} < {cfg.min_roc:.2%}"
         return out
+
+    def live_allowed(self, cp: ComboPrice) -> Optional[str]:
+        """None if this slice may be quoted for real; otherwise why it stays shadow-only."""
+        if len(cp.legs) > self.cfg.live_max_legs:
+            return f"slice {cp.slice} is shadow-only (more than {self.cfg.live_max_legs} legs)"
+        kind = "sgp" if cp.same_game else "xgame"
+        if kind not in self.cfg.live_kinds:
+            return f"slice {cp.slice} is shadow-only ({kind})"
+        if self.cfg.live_leagues is not None and not set(cp.leagues) <= set(self.cfg.live_leagues):
+            return f"slice {cp.slice} is shadow-only (league)"
+        return None
 
 
 class RiskBook:
@@ -227,8 +357,9 @@ class RiskBook:
 
     def check(self, cp: ComboPrice, exclude: Optional[str] = None) -> Optional[str]:
         loss = self.max_loss(cp)
-        if loss > self.cfg.max_loss_per_combo + 1e-9:
-            return f"max loss ${loss:.2f} > ${self.cfg.max_loss_per_combo:.0f} per combo"
+        cap = self.cfg.max_loss_per_combo * cp.size_factor              # unsure -> smaller
+        if loss > cap + 1e-9:
+            return f"max loss ${loss:.2f} > ${cap:.2f} per combo (size factor {cp.size_factor:g})"
         others = {k: v for k, v in self.open.items() if k != exclude}
         if sum(l for _, l in others.values()) + loss > self.cfg.max_total_liability + 1e-9:
             return f"total liability would exceed ${self.cfg.max_total_liability:,.0f}"
@@ -286,10 +417,12 @@ class KalshiComms:
 
 class ComboQuoter:
     def __init__(self, cfg: ComboConfig, comms: KalshiComms, leg_fair: Callable[[Leg], Optional[LegFair]],
-                 research=None, allowed: Callable[[], Optional[str]] = lambda: None, clock=time.time) -> None:
+                 research=None, allowed: Callable[[], Optional[str]] = lambda: None, clock=time.time,
+                 sportsbook_price: Optional[Callable[[list], Optional[float]]] = None) -> None:
         self.cfg = cfg
         self.comms = comms
-        self.pricer = ComboPricer(cfg, self._leg_fair_with_fallback(leg_fair))
+        self.requesters = RequesterBook(cfg)
+        self.pricer = ComboPricer(cfg, self._leg_fair_with_fallback(leg_fair), sportsbook_price, self.requesters)
         self.book = RiskBook(cfg)
         self.research = research
         self.allowed = allowed                           # global kill switches (daily loss stop, halts ...)
@@ -370,15 +503,18 @@ class ComboQuoter:
         blocked = self.allowed()
         if cp.action == "QUOTE" and blocked:
             cp.action, cp.reason = "SKIP", blocked
-        risk = self.book.check(cp) if cp.action == "QUOTE" and self.cfg.mode != "shadow" else None
-        if risk:
-            cp.action, cp.reason = "SKIP", risk
+        if cp.action == "QUOTE" and self.cfg.mode != "shadow":
+            gate = self.pricer.live_allowed(cp) or self.book.check(cp)
+            if gate:
+                cp.action, cp.reason = "SKIP", gate
         self._count(f"rfq_{cp.action.lower()}")
         self._write("COMBO_RFQ", rfq_id=rfq.get("id"), market_ticker=rfq.get("market_ticker"), mode=self.cfg.mode,
                     legs=[[l.market_ticker, l.side] for l in legs], n_legs=len(legs), action=cp.action,
                     reason=cp.reason, fair=cp.fair, margin=cp.margin, yes_price=cp.yes_price, no_bid=cp.no_bid,
                     contracts=cp.contracts, expected_profit=cp.expected_profit, roc=cp.roc, sources=cp.sources,
-                    created_ts=rfq.get("created_ts"))
+                    created_ts=rfq.get("created_ts"), slice=cp.slice, same_game=cp.same_game,
+                    fee_exempt=cp.fee_exempt, uncertainty=cp.uncertainty, size_factor=cp.size_factor,
+                    sportsbook_yes=cp.sportsbook_yes, creator_id=rfq.get("creator_id"))
         if cp.action == "QUOTE":
             self.priced[str(rfq.get("id"))] = dict(rfq=rfq, price=cp, at=self.clock(), followed=False)
             if self.cfg.mode in {"demo", "live"}:
@@ -444,7 +580,8 @@ class ComboQuoter:
     def _executed(self, qid: str, q: dict, info: dict) -> None:
         cp: ComboPrice = q["price"]
         self.quotes.pop(qid, None)
-        self.positions[qid] = dict(price=cp, ticker=q["rfq"].get("market_ticker"), at=self.clock())
+        self.positions[qid] = dict(price=cp, ticker=q["rfq"].get("market_ticker"), at=self.clock(),
+                                   creator=q["rfq"].get("creator_id"))
         self._count("executed")
         self._write("COMBO_FILL", quote_id=qid, market_ticker=q["rfq"].get("market_ticker"), yes_price=cp.yes_price,
                     no_bid=cp.no_bid, contracts=cp.contracts, fair=cp.fair, expected_profit=cp.expected_profit,
@@ -472,7 +609,7 @@ class ComboQuoter:
             prices = [_num(t.get("yes_price_dollars")) for t in trades if _num(t.get("yes_price_dollars"))]
             traded = min(prices) if prices else None
             self._write("COMBO_TRADE", rfq_id=rid, market_ticker=ticker, mode=self.cfg.mode, traded_yes_price=traded,
-                        our_yes_price=cp.yes_price, fair=cp.fair, n_trades=len(prices),
+                        our_yes_price=cp.yes_price, fair=cp.fair, n_trades=len(prices), slice=cp.slice,
                         would_win=None if traded is None else cp.yes_price <= traded + 1e-9,
                         margin_vs_winner=None if traded is None or not cp.fair else round(traded / cp.fair - 1, 4))
             if traded is None or cp.yes_price > traded + 1e-9:
@@ -483,10 +620,10 @@ class ComboQuoter:
     async def check_results(self) -> int:
         """Settle would-have-won shadow quotes and real positions against the combo market's result."""
         done = 0
-        items = [(k, v["rfq"].get("market_ticker"), v["price"], "shadow") for k, v in self.priced.items()
-                 if v.get("await_result")]
-        items += [(k, v["ticker"], v["price"], "position") for k, v in self.positions.items()]
-        for key, ticker, cp, kind in items:
+        items = [(k, v["rfq"].get("market_ticker"), v["price"], "shadow", v["rfq"].get("creator_id"))
+                 for k, v in self.priced.items() if v.get("await_result")]
+        items += [(k, v["ticker"], v["price"], "position", v.get("creator")) for k, v in self.positions.items()]
+        for key, ticker, cp, kind, creator in items:
             try:
                 m = await self.comms.market(ticker)
             except Exception:  # noqa: BLE001
@@ -503,8 +640,10 @@ class ComboQuoter:
                 result = result or "void"
             else:
                 continue
+            self.requesters.add(creator, -pnl, cp.contracts * cp.yes_price)       # their gain is our loss
             self._write("COMBO_RESULT", key=key, position_type=kind, market_ticker=ticker, result=result, pnl=round(pnl, 2),
-                        expected_profit=cp.expected_profit, contracts=cp.contracts, yes_price=cp.yes_price, fair=cp.fair)
+                        expected_profit=cp.expected_profit, contracts=cp.contracts, yes_price=cp.yes_price, fair=cp.fair,
+                        slice=cp.slice, creator_id=creator)
             if kind == "shadow":
                 self.priced.pop(key, None)
             else:

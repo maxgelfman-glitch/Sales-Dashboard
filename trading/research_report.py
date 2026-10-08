@@ -167,7 +167,44 @@ def combo_summary(rows: list[dict]) -> dict:
         "declines": sum(r["kind"] == "COMBO_DECLINE" for r in rows),
         "confirms": sum(r["kind"] == "COMBO_CONFIRM" for r in rows),
         "skip_reasons": dict(reasons.most_common(6)),
+        "far_below_market": sum(1 for r in trades if r["our_yes_price"] < r["traded_yes_price"] * (1 - FAR_BELOW)),
+        "by_slice": combo_slices(rfqs, trades, results),
     }
+
+
+FAR_BELOW = 0.10           # our price 10%+ under the price the parlay actually traded at: suspect our model
+
+
+def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> dict:
+    """Per slice (leagues : legs : x = different games / sgp = same game): where we would win, at what margin,
+    and what it paid. Slices go live one by one, only when their own numbers hold up."""
+    out: dict[str, dict] = {}
+    for r in rfqs:
+        d = out.setdefault(r.get("slice") or "?", dict(rfqs=0, quotable=0, traded=0, wins=0, margins=[], below=0,
+                                                         settled=0, pnl=0.0, expected=0.0))
+        d["rfqs"] += 1
+        d["quotable"] += r.get("action") == "QUOTE"
+    for r in trades:
+        d = out.get(r.get("slice") or "?")
+        if d is None:
+            continue
+        d["traded"] += 1
+        if r.get("would_win"):
+            d["wins"] += 1
+            if r.get("margin_vs_winner") is not None:
+                d["margins"].append(r["margin_vs_winner"])
+        d["below"] += r["our_yes_price"] < r["traded_yes_price"] * (1 - FAR_BELOW)
+    for r in results:
+        d = out.get(r.get("slice") or "?")
+        if d is None:
+            continue
+        d["settled"] += 1
+        d["pnl"] += r.get("pnl") or 0
+        d["expected"] += r.get("expected_profit") or 0
+    for d in out.values():
+        d["win_rate"] = d["wins"] / d["traded"] if d["traded"] else None
+        d["median_margin"] = _median(d.pop("margins"))
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]["rfqs"]))
 
 
 def decisions_summary(rows: list[dict]) -> dict:
@@ -468,7 +505,17 @@ def build_report(rows: list[dict]) -> str:
         out.append(f"  settled {c['settled']:,}: P&L ${c['settled_pnl']:,.2f} vs expected ${c['settled_expected']:,.2f}"
                    f"   live last look: {c['confirms']} confirmed, {c['declines']} declined")
         out.append(f"  top skip reasons: {c['skip_reasons']}")
-        out.append("  (Gate 1: win rate >= 5% at a median margin >= 8% before any real quoting)")
+        if c["far_below_market"]:
+            out.append(f"  WARNING {c['far_below_market']} quote(s) were 10%+ cheaper than where the parlay traded: "
+                       "usually our model, not a gift")
+        out.append(f"  {'slice':<22}{'rfqs':>7}{'quote':>7}{'traded':>7}{'win%':>7}{'margin':>8}{'settled':>8}"
+                   f"{'P&L':>10}{'expected':>10}")
+        for name, d in list(c["by_slice"].items())[:15]:
+            out.append(f"  {name:<22}{d['rfqs']:>7,}{d['quotable']:>7,}{d['traded']:>7,}"
+                       f"{_fmt(d['win_rate'] and d['win_rate'] * 100, '.1f'):>7}"
+                       f"{_fmt(d['median_margin'] and d['median_margin'] * 100, '+.1f'):>8}{d['settled']:>8,}"
+                       f"{d['pnl']:>10,.2f}{d['expected']:>10,.2f}")
+        out.append("  (a slice goes live only when its own win rate >= 5% at a median margin >= 8%, enough settled)")
     else:
         out.append("  no RFQs seen (COMBO_QUOTER=shadow with Kalshi keys)")
 

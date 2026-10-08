@@ -45,13 +45,20 @@ def pricer(**kw):
 # ---------------------------------------------------------------------------
 # Pricing
 # ---------------------------------------------------------------------------
+def _yes(fair, margin, rate=0.035):
+    base = fair * (1 + margin)
+    return round(base + rate * base * (1 - base), 4)
+
+
 def test_prices_independent_legs_with_margin_growing_per_leg():
-    cp = pricer().price(rfq())
+    cp = pricer().price(rfq())                               # NBA leg + NFL leg, different games
     assert cp.action == "QUOTE"
     assert cp.fair == pytest.approx(0.55 * 0.60)
-    assert cp.margin == pytest.approx(0.04 + 0.02 * 2)
-    assert cp.yes_price == pytest.approx(round(0.33 * 1.08, 4)) and cp.no_bid == pytest.approx(1 - cp.yes_price)
-    assert cp.fee == maker_fee(20, cp.no_bid)
+    age = 2 * 0.01 * 1.0 / 30                                            # two legs, 1 s old
+    assert cp.margin == pytest.approx(0.04 + 0.02 * 2 + 0.005 + age)    # + NBA's league margin; NFL adds none
+    assert cp.yes_price == pytest.approx(_yes(0.33, cp.margin)) and cp.no_bid == pytest.approx(1 - cp.yes_price)
+    assert cp.slice == "NBA+NFL:2L:x" and not cp.fee_exempt
+    assert cp.fee == maker_fee(20, cp.no_bid, 0.035)
     assert cp.expected_profit == pytest.approx(20 * (cp.yes_price - 0.33) - cp.fee, abs=1e-4)
     assert cp.roc == pytest.approx(cp.expected_profit / (20 * cp.no_bid), abs=1e-4)
 
@@ -62,15 +69,65 @@ def test_no_side_leg_uses_the_complement():
 
 
 @pytest.mark.parametrize("legs,reason", [
-    (((T1, "yes"), ("KXNBAPTS-26OCT01BOSNYK-TATUM25", "yes")), "same game"),   # prop + moneyline of one game
-    (((T1, "yes"), ("KXNBAGAME-26OCT01BOSNYK-BOS", "no")), "same game"),
     (((T1, "yes"), ("KXUNKNOWN-26OCT09AAABBB-X", "yes")), "no fair value"),
     (((T1, "yes"), (T2, "yes"), (T3, "yes"), ("KXNHLGAME-26OCT03NYRBOS-NYR", "yes"),
       ("KXWNBAGAME-26OCT03NYLLVA-NYL", "yes")), "legs > max"),
 ])
 def test_rejections(legs, reason):
-    cp = pricer().price(rfq(legs=legs))
+    cp = pricer(max_legs=4).price(rfq(legs=legs))
     assert cp.action == "SKIP" and reason in cp.reason
+
+
+def test_same_game_legs_are_priced_wide_and_stay_shadow_only():
+    prop = "KXNBAPTS-26OCT01BOSNYK-TATUM25"
+    pr = ComboPricer(ComboConfig(), lambda leg: LegFair(prob_yes=0.5, source="sharp", age_s=1.0))
+    cp = pr.price(rfq(legs=((T1, "yes"), (prop, "yes"))))     # prop + moneyline of one game
+    assert cp.action == "QUOTE" and cp.same_game and cp.slice == "NBA:2L:sgp"
+    assert cp.uncertainty >= 0.08 and cp.size_factor < 1                # wide AND small
+    assert "shadow-only" in pr.live_allowed(cp)
+    assert pr.live_allowed(pr.price(rfq())) is None                      # different games: may go live
+    sgp_ok = ComboPricer(ComboConfig(live_kinds=("xgame", "sgp")), pr.leg_fair)
+    assert sgp_ok.live_allowed(cp) is None
+
+
+def test_nfl_cross_game_parlays_pay_no_maker_fee():
+    t4 = "KXNFLGAME-26OCT04DALPHI-DAL"
+    pr = ComboPricer(ComboConfig(), lambda leg: LegFair(prob_yes=0.6, source="sharp", age_s=0.0))
+    cp = pr.price(rfq(legs=((T2, "yes"), (t4, "yes"))))
+    assert cp.fee_exempt and cp.fee == 0 and cp.slice == "NFL:2L:x"
+    assert cp.yes_price == pytest.approx(round(0.36 * (1 + 0.08), 4))
+
+
+def test_uncertainty_widens_margin_and_cuts_size():
+    sure = ComboPricer(ComboConfig(), lambda leg: LegFair(0.5, "sharp", 0.0, spread=0.0, books=3)).price(rfq())
+    unsure = ComboPricer(ComboConfig(), lambda leg: LegFair(0.5, "sharp", 25.0, spread=0.02, books=2)).price(rfq())
+    single = ComboPricer(ComboConfig(), lambda leg: LegFair(0.5, "sharp", 0.0, books=1)).price(rfq())
+    assert unsure.margin > single.margin > sure.margin
+    assert unsure.size_factor < sure.size_factor
+    split = ComboPricer(ComboConfig(), lambda leg: LegFair(0.5, "sharp", 0.0, spread=0.05, books=2)).price(rfq())
+    assert split.action == "SKIP" and "disagree" in split.reason
+
+
+def test_sportsbook_price_is_a_floor_when_unsure_and_a_tripwire():
+    unsure_leg = lambda leg: LegFair(0.5, "sharp", 0.0, books=1)   # noqa: E731
+    pr = ComboPricer(ComboConfig(sportsbook_when_uncertain=0.0), unsure_leg, sportsbook_price=lambda legs: 0.33)
+    cp = pr.price(rfq())
+    assert cp.yes_price == pytest.approx(0.33 * 0.97, abs=1e-4)          # no tighter than the book, minus 3%
+    wrong = ComboPricer(ComboConfig(), unsure_leg, sportsbook_price=lambda legs: 0.20).price(rfq())
+    assert wrong.action == "SKIP" and "sportsbook" in wrong.reason       # our fair 0.25 > book's 0.20
+
+
+def test_winning_requesters_get_wider_quotes_then_none():
+    cfg = ComboConfig(requester_min_trades=3)
+    pr = ComboPricer(cfg, leg_fair)
+    base = pr.price({**rfq(), "creator_id": "sharp1"}).margin
+    for _ in range(3):
+        pr.requesters.add("sharp1", 1.0, 10.0)                          # +10% ROI as a taker
+    assert pr.price({**rfq(), "creator_id": "sharp1"}).margin == pytest.approx(base + cfg.requester_widen_margin)
+    pr.requesters.add("sharp1", 30.0, 10.0)
+    cp = pr.price({**rfq(), "creator_id": "sharp1"})
+    assert cp.action == "SKIP" and "requester" in cp.reason
+    assert pr.price({**rfq(), "creator_id": "retail9"}).margin == pytest.approx(base)
 
 
 def test_stale_legs_horizon_price_band_and_longshot_trap():
@@ -164,7 +221,7 @@ async def test_demo_quote_then_confirm_on_unchanged_fairs(tmp_path):
     q.comms.rfqs = [rfq()]
     await q.step()
     [c] = q.comms.created
-    assert c["yes_bid"] == 0.0 and c["no_bid"] == pytest.approx(1 - round(0.33 * 1.08, 4))   # we sell the combo
+    assert c["yes_bid"] == 0.0 and c["no_bid"] == pytest.approx(1 - _yes(0.33, 0.085 + 2 * 0.01 / 30))   # we sell it
     assert q.book.total() > 0                                                               # liability reserved
     q.comms.quote_status["q1"] = {"status": "accepted", "accepted_side": "yes"}
     await q.step()
@@ -289,3 +346,19 @@ async def test_void_settlement_clears_the_book_and_sharp_legs_need_no_api_calls(
     q.comms.markets["KXMVE-COMBO-1"] = {"status": "settled", "result": ""}
     assert await q.check_results() == 1
     assert rows(tmp_path, "COMBO_RESULT")[0]["result"] == "void" and q.book.total() == 0
+
+
+def test_report_breaks_results_down_by_slice_and_flags_suspiciously_cheap_quotes():
+    rows_ = [
+        {"kind": "COMBO_RFQ", "action": "QUOTE", "slice": "NFL:2L:x", "rfq_id": "a", "expected_profit": 1.0},
+        {"kind": "COMBO_RFQ", "action": "QUOTE", "slice": "NBA:2L:sgp", "rfq_id": "b", "expected_profit": 1.0},
+        {"kind": "COMBO_TRADE", "slice": "NFL:2L:x", "rfq_id": "a", "traded_yes_price": 0.40, "our_yes_price": 0.38,
+         "would_win": True, "margin_vs_winner": 0.12},
+        {"kind": "COMBO_TRADE", "slice": "NBA:2L:sgp", "rfq_id": "b", "traded_yes_price": 0.40,
+         "our_yes_price": 0.30, "would_win": True, "margin_vs_winner": 0.30},
+        {"kind": "COMBO_RESULT", "slice": "NFL:2L:x", "pnl": 7.5, "expected_profit": 1.0},
+    ]
+    c = combo_summary(rows_)
+    assert c["far_below_market"] == 1                                    # 0.30 vs a 0.40 trade
+    assert c["by_slice"]["NFL:2L:x"]["win_rate"] == 1 and c["by_slice"]["NFL:2L:x"]["pnl"] == 7.5
+    assert c["by_slice"]["NBA:2L:sgp"]["below"] == 1

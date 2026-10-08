@@ -146,7 +146,8 @@ from settlement import (
     load_ledger_settlements,
     settlement_pnl,
 )
-from team_normalizer import DYNAMIC_LEAGUES, normalize_outcome, normalize_team_name, orient, register_game
+from team_normalizer import (DYNAMIC_LEAGUES, canonical_league, normalize_outcome, normalize_team_name, orient,
+                             register_game)
 
 LOG_FILE_NAME = "trading_engine.log"
 LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)-20s | %(message)s"
@@ -1600,7 +1601,8 @@ class Supervisor:
         if fair is None:
             return None
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
-        return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3])
+        spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
+        return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread, books=books or None)
 
     def _combo_block_reason(self) -> Optional[str]:
         if self._loss_halted():
@@ -2659,7 +2661,16 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                 return float(env.get(name) or default)
             except ValueError:
                 raise ConfigError(f"{name} must be a number") from None
-        cfg = ComboConfig(mode=combo_mode, max_legs=int(f("COMBO_MAX_LEGS", 4)), base_margin=f("COMBO_BASE_MARGIN", 0.04),
+        kinds = tuple(k.strip().lower() for k in (env.get("COMBO_LIVE_KINDS") or "xgame").split(",") if k.strip())
+        if not set(kinds) <= {"xgame", "sgp"}:
+            raise ConfigError("COMBO_LIVE_KINDS must list xgame and/or sgp")
+        live_leagues = tuple(canonical_league(x.strip()) for x in (env.get("COMBO_LIVE_LEAGUES") or "").split(",")
+                             if x.strip()) or None
+        cfg = ComboConfig(mode=combo_mode, max_legs=int(f("COMBO_MAX_LEGS", 6)),
+                          live_max_legs=int(f("COMBO_LIVE_MAX_LEGS", 4)), live_kinds=kinds, live_leagues=live_leagues,
+                          max_disagreement=f("COMBO_MAX_DISAGREEMENT", 0.03),
+                          min_size_factor=f("COMBO_MIN_SIZE_FACTOR", 0.25),
+                          base_margin=f("COMBO_BASE_MARGIN", 0.04),
                           per_leg_margin=f("COMBO_PER_LEG_MARGIN", 0.02), min_roc=f("COMBO_MIN_ROC", 0.01),
                           max_loss_per_combo=f("COMBO_MAX_LOSS_PER_COMBO", 25),
                           max_leg_exposure=f("COMBO_MAX_LEG_EXPOSURE", 150),
