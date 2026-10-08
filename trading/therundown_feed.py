@@ -263,7 +263,8 @@ class TheRundownSource:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect forever; freshness guards the engine
-                log.warning("THERUNDOWN websocket dropped (%s: %s); reconnecting in 2.5s", type(exc).__name__, exc)
+                msg = str(exc).replace(self.api_key, "***") if self.api_key else str(exc)   # never log the key
+                log.warning("THERUNDOWN websocket dropped (%s: %s); reconnecting in 2.5s", type(exc).__name__, msg)
             await asyncio.sleep(2.5)
 
     # ------------------------------------------------------------------ table -> SharpLine dicts

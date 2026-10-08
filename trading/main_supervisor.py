@@ -1123,21 +1123,29 @@ class Supervisor:
                 cap = min(cap, level.stake_usd)
                 unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
                 n = min(int(size), int(math.floor((cap - spent) / unit + 1e-9)))
+            unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
             if self.max_stake < MAX_STAKE_USD:
-                n = min(n, int(math.floor((self.max_stake - spent) / price + 1e-9)))
+                n = min(n, int(math.floor((self.max_stake - spent) / unit + 1e-9)))
             if n <= 0:
                 break
             used.append((price, n))
-            spent += n * price
+            spent += n * unit                              # fees count against the stake caps too
             if n < int(size):
                 break
         if len(used) > 1 and self.multi_level_mode == "single":
             # one order limited at the deepest level: size for everything filling at that limit
             used = self._fit_worst_case(update.venue, used, min(cap, self.max_stake, MAX_STAKE_USD))
+        limit = min(cap, self.max_stake, MAX_STAKE_USD)
         while used:
             contracts = sum(n for _, n in used)
             costs = [order_cost(update.venue, n, p) for p, n in used]
             stake, fee = round(sum(c for c, _ in costs), 2), round(sum(f for _, f in costs), 2)
+            if stake > limit + 0.005:                      # per-order fee rounding can still overshoot: trim
+                p_last, n_last = used[-1]
+                used[-1] = (p_last, n_last - 1)
+                if used[-1][1] <= 0:
+                    used.pop()
+                continue
             net = (contracts * decision.fair_prob - stake) / stake
             if update.venue != "kalshi" or net > MIN_EDGE + 1e-9 or len(used) == 1 and contracts == decision.contracts:
                 avg = round(sum(p * n for p, n in used) / contracts, 6)

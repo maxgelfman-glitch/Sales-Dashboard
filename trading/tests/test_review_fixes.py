@@ -93,3 +93,14 @@ async def test_a_failed_second_pair_leg_never_leaves_the_first_marked_hedged():
     pos = sup.positions.get(KEY)
     assert pos is not None and not pos.hedged                            # the Kalshi leg stands alone: SEEN as naked
     assert sup.game_unhedged(KEY[:3]) > 0
+
+
+async def test_kalshi_fees_count_against_the_canary_stake():
+    from tests.test_kalshi_trading import K_NYK, kalshi_sup
+    from tests.test_research import book_upd
+    sup = kalshi_sup(max_stake=10.0)
+    await sup.on_market_update(book_upd(K_NYK, [(0.47, 15), (0.48, 100)]), None)        # fair 0.5217
+    total = sum(o["contracts"] * o["price_cents"] / 100 for o in sup.kalshi_gateway.placed)
+    from execution import kalshi_fee_per_contract
+    fees = sum(o["contracts"] * kalshi_fee_per_contract(o["price_cents"]) for o in sup.kalshi_gateway.placed)
+    assert sup.kalshi_gateway.placed and total + fees <= 10.0 + 0.01
