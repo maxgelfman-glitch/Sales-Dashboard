@@ -105,13 +105,15 @@ python main_supervisor.py
 * `DEVIG_METHOD` = multiplicative (default) | power | shin. Power/Shin take more margin off longshots.
   Every DECISION research row records all three so the report can show which one holds up at the close.
 * `SHARP_BOOK_WEIGHTS=pinnacle:2,circa sports:1`: fresh books quoting the same number are blended into one
-  consensus fair value; unlisted books are ignored (`*:1` includes them). A book whose own market is broken
-  (overround outside 0.98-1.15, e.g. teams swapped) is left out, and books more than 3 points of probability
-  apart give **no** price (a blended line always looks clean and would hide the bad book).
+  consensus fair value; unlisted books are ignored (`*:1` includes them). The heaviest book (Pinnacle) is the
+  anchor: a book whose own market is broken (overround outside 0.98-1.15, e.g. teams swapped) or more than 3
+  points of probability from the anchor is left out, never averaged in; a broken anchor gives no price.
 * **Never priced:** whole-number spreads and totals (-3, 8: a push makes the de-vigged price overstate the edge,
-  and the venues' push rules are unconfirmed); a matchup with two start times 2-20 hours apart (an MLB
-  doubleheader: game 2's line must never price game 1, and positions could not be kept apart); a sharp line
-  outside 1-99%; Kalshi games that list a Tie/Draw market (its team contracts then pay $0 on a tie).
+  and the venues' push rules are unconfirmed); a doubleheader (two events of one matchup at ONE venue 2-10 hours
+  apart: game 2's line must never price game 1; a rescheduled event or a next-day series game is not one); in
+  live mode, a market with no start time of its own; a sharp line outside 1-99%; Kalshi games that list a
+  Tie/Draw market (its team contracts then pay $0 on a tie). A 24/7 session moves on to the next game of a series
+  once the previous one is 6 hours past its start.
 * TheRundown: when the main line moves, the old number's price is dropped (it is the pre-move price), and a
   price that changed on one side only waits up to 2 seconds for the other side before it is used.
 * A sharp move re-checks every venue price of that market immediately: the stale-price edge no longer waits
@@ -128,10 +130,10 @@ sharp line on its own. Size = the thinner side's best level, capped at $1,000 pe
 stake, and a per-game cap applied to the worst case (one leg fills, the other doesn't). In live mode both
 venues must be live-enabled. If one leg misses, the other stays as a normal position and the regular hedge
 path keeps trying to complete it (logged CRITICAL as `PAIR_UNLOCKED`: until then it is a bet, not a lock).
-* **Ties (NFL, MLB, NHL moneylines):** each venue's own rule. Kalshi pays 50c per team (its contract terms).
-  Novig is treated as refunding the price paid (its rule is unconfirmed; its exchange's filing says "void at fair
-  value"), every other venue as paying $0. So a pair must still profit when the game ties under those rules.
-  Ask Novig for its written tie and postponement rules: if it pays 50c, cross-venue NFL pairs widen.
+* **Ties (NFL moneylines):** each venue's own rule. Kalshi pays 50c per team (its contract terms); every other
+  venue is treated as paying $0 until it confirms its rule in writing (Novig's filings describe binary $1/$0
+  contracts). So NFL moneyline pairs involving Novig or ProphetX are not taken. Ask Novig for its written tie and
+  postponement rules: a confirmed 50c or refund reopens them.
 * **Postponed or cancelled games** are not priced: Kalshi settles them at its own "last fair price", other venues
   may refund. A cross-venue pair can lose here (bounded by the per-game cap); confirm the venues' rules.
 * **Doubleheaders** are never traded (see above). Live pairs and hedges need both games' start times to agree.
@@ -355,8 +357,12 @@ restarts). The same sweep resolves `UNCONFIRMED` orders against the exchange and
 positions (e.g. manual trades). Novig v3: open positions from `GET /v3/account/positions`; a settled one
 is read from its market's grade (WIN / LOSS / PUSH, or a fair-value price that pays that fraction).
 Accounting rules that keep exposure and P&L exact at every edge:
-* Cost and payout always come from ONE view: the exchange's (count and cost) when ours differs or an order's
-  outcome was unknown; contracts we never saw fill are charged at the order's limit price (never understated).
+* Cost and payout always come from ONE view: the exchange's whenever it reports a cost (Kalshi's includes its
+  fee); otherwise our own tally (never cut) plus contracts we never saw at the order's limit + fee.
+* A provisional `HOLD` is written when an order is accepted and corrected when it finishes, so a crash at any
+  moment leaves the ledger enough to book a settlement that happens while the engine is down. After a restart,
+  orders the exchange confirms never filled are cleared; anything uncertain stays reserved (Novig up to 6h).
+* Each fill carries the venue's trade id: a replayed fill is booked once.
 * A tranche whose outcome is unknown (timeout) keeps its reservation until the exchange's records resolve it.
 * A fill or finish arriving after its position settled releases the reservation instead of re-reserving it, and
   is logged (`LATE_FILL_AFTER_SETTLE`, `FINALIZED_AFTER_SETTLE`) for reconciliation.

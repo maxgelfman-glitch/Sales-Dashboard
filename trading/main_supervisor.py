@@ -569,6 +569,7 @@ class Supervisor:
         self.synced = positions_client is None and kalshi_positions_client is None   # nothing to sync without one
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         self.settled_legs: set[int] = set()              # legs already settled: a late event must not re-reserve
+        self._settled_outcomes: dict[tuple, float] = {}   # (venue, outcome) -> when we booked its settlement
         self._settled_parlays: set[tuple[str, str]] = set()
         self._seen_trades: set[tuple[str, str]] = set()   # (venue, trade id) of every fill booked
         self._early_slips: dict[str, list] = {}           # exchange order id -> [(received, slip)] before its ack
@@ -1544,7 +1545,8 @@ class Supervisor:
                     log.critical("LIVE_ORDER outcome UNKNOWN %s %s x%g @ %.4f (%s: %s): lock and reservation KEPT "
                                  "until the exchange's records resolve it", update.outcome_id, side, n, p,
                                  type(res).__name__, res)
-                    self._ledger("UNCONFIRMED", kind=kind, payload=payload, error=f"{type(res).__name__}: {res}")
+                    self._ledger("UNCONFIRMED", kind=kind, payload=payload, error=f"{type(res).__name__}: {res}",
+                                 leg=leg.order_id)
                     unknown.append((p, n))
                     continue
                 log.error("LIVE_ORDER rejected %s %s x%d @ %.4f: %s", update.outcome_id, side, n, p, res)
@@ -1765,7 +1767,7 @@ class Supervisor:
                          filled=lo.filled, requested=lo.requested, price=lo.limit_price,
                          cost_usd=round(lo.fill_cost, 2), reason=reason)
             if any(not k.done for k in kids):          # other tranches still working
-                self._reserve_leg(leg, self._leg_exposure(kids))
+                self._reserve_leg(leg, self._leg_exposure(kids) + leg.extra_cost)
                 return
             lo = lo.model_copy(update=dict(          # the whole leg, seen as one order from here on
                 exchange_confirmed_zero=all(k.exchange_confirmed_zero for k in kids),
@@ -1788,10 +1790,11 @@ class Supervisor:
                          self._leg_exposure([k.model_copy(update=dict(done=False)) for k in kids]),
                          lo.venue.capitalize())
             self.unconfirmed_legs[leg.order_id] = time.time()   # the settlement sweep reconciles it
-            self._reserve_leg(leg, self._leg_exposure([k.model_copy(update=dict(done=False)) for k in kids]))
+            self._reserve_leg(leg, self._leg_exposure([k.model_copy(update=dict(done=False)) for k in kids])
+                              + leg.extra_cost)
             self._ledger("UNCONFIRMED", exchange_order_id=lo.exchange_order_id, reason=reason)
             return
-        self._reserve_leg(leg, round(lo.fill_cost, 2))
+        self._reserve_leg(leg, round(lo.fill_cost + leg.extra_cost, 2))
         if lo.filled <= 0 and leg.order_id in self.unconfirmed_legs:
             log.warning("LIVE_DONE %s %s: nothing filled, but another tranche's outcome is UNKNOWN: its $%.2f stays "
                         "reserved until the sweep resolves it", lo.kind, lo.exchange_order_id, leg.unknown_reserved)
@@ -1935,6 +1938,12 @@ class Supervisor:
                 await self._book_maker_fill(lo, delta, price)
             else:
                 leg = self._leg(lo.leg_id)
+                if leg is not None and leg.extra_contracts > 1e-9:
+                    # contracts the exchange already showed us (resolved as "extra") arriving now as a fill slip:
+                    # they are the SAME contracts, so they come out of the extra, never on top of it
+                    take = min(leg.extra_contracts, delta)
+                    leg.extra_cost = round(leg.extra_cost * (1 - take / leg.extra_contracts), 2)
+                    leg.extra_contracts = round(leg.extra_contracts - take, 4)
                 if leg is not None:
                     kids = self._children(leg.order_id)       # one order, or several staggered tranches
                     filled, cost = sum(k.filled for k in kids), sum(k.fill_cost for k in kids)
@@ -1946,6 +1955,9 @@ class Supervisor:
                     if lo.done:   # late fill after we cancelled the remainder: still real
                         log.warning("LIVE late fill on %s after cancel: +%g", lo.exchange_order_id, delta)
                         key = tuple(lo.key)
+                        if leg.order_id not in self.settled_legs and \
+                                self._settled_outcomes.get((leg.venue, leg.outcome_id), 0) >= leg.placed_at:
+                            self.settled_legs.add(leg.order_id)   # its market settled after it was sent
                         if leg.order_id not in self.settled_legs and not any(
                                 leg in p.legs for p in self.positions.values()):
                             # dropped at a "nothing filled" finish: it holds contracts after all. Re-attach it, so
@@ -1953,7 +1965,7 @@ class Supervisor:
                             self.positions.setdefault(key, MarketPosition(legs=[])).legs.append(leg)
                             log.critical("LIVE late fill on %s revived a leg finalised as unfilled: %g contracts "
                                          "back in %s", lo.exchange_order_id, leg.contracts, key)
-                        if self._reserve_leg(leg, self._leg_exposure(kids)):
+                        if self._reserve_leg(leg, self._leg_exposure(kids) + leg.extra_cost):
                             self._hold_sync(leg)
                         else:
                             log.critical("LIVE late fill on %s arrived after its position SETTLED: +%g contracts "
@@ -2621,6 +2633,37 @@ class Supervisor:
                         pos.outcome_id)
         return leg
 
+    async def _orders_confirm_nothing_filled(self, venue: str, outcome_id: str) -> bool:
+        """True only when EVERY order the ledger sent for this outcome (since its last settlement) is final at the
+        exchange with nothing filled. Any doubt (no record, unreadable, still working, any fill) -> False."""
+        gateway = self._gateway(venue)
+        if not hasattr(gateway, "get_order") or not hasattr(gateway, "filled_count") or self.ledger_path is None:
+            return False
+        legs, oids = set(), []
+        try:
+            rows = [json.loads(x) for x in self.ledger_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+        except (OSError, ValueError):
+            return False
+        for r in rows:
+            if r.get("event") == "SETTLE" and r.get("outcome_id") == outcome_id:
+                legs, oids = set(), []                   # an earlier position on this outcome is closed
+            elif r.get("event") == "HOLD" and r.get("outcome_id") == outcome_id and r.get("leg"):
+                legs.add(r["leg"])
+            elif r.get("event") == "ORDER" and r.get("leg") in legs and r.get("exchange_order_id"):
+                oids.append(str(r["exchange_order_id"]))
+            elif r.get("event") == "UNCONFIRMED" and r.get("leg") in legs and not r.get("exchange_order_id"):
+                return False                             # an order with no id (timed out): cannot be checked
+        if not oids:
+            return False
+        for oid in oids:
+            try:
+                n = gateway.filled_count(await gateway.get_order(oid))
+            except Exception:  # noqa: BLE001
+                return False
+            if n is None or n > 1e-9:
+                return False
+        return True
+
     async def startup_sync(self) -> bool:
         """Live: load every OPEN exchange position (every venue we trade) before trading. False = could not."""
         restored = []
@@ -2655,6 +2698,12 @@ class Supervisor:
                     continue
                 pos = next((p for p in settled if p.outcome_id == oid and p.is_settled
                             and p.settlement_id not in self.processed_settlements), None)
+                if pos is None and await self._orders_confirm_nothing_filled(venue, oid):
+                    # in flight at shutdown, and the exchange's own order records say none of it ever filled
+                    self._ledger("HOLD", venue=venue, outcome_id=oid, market_id=h.get("market_id"),
+                                 contracts=-h["contracts"], cost_usd=-h["cost_usd"], reason="orders never filled")
+                    log.info("SYNC %s %s: its orders never filled (exchange records): nothing held", venue, oid)
+                    continue
                 leg = self._restore(ExchangePosition(settlement_id=f"ledger-{oid}", outcome_id=oid,
                                                      market_id=h.get("market_id"), contracts=h["contracts"],
                                                      cost_usd=h["cost_usd"], status="OPEN"), "ledger", venue)
@@ -2662,7 +2711,8 @@ class Supervisor:
                     # its result is not published yet: keep it as a held leg (reserved, game locked) so the
                     # settlement sweep books it when the grade appears, instead of forgetting it. If the exchange
                     # still shows nothing for it after 6h (it never filled), it is released like any UNCONFIRMED
-                    self.unconfirmed_legs[leg.order_id] = time.time() + 6 * 3600
+                    # (Novig publishes grades late; Kalshi lists a settlement as soon as it happens)
+                    self.unconfirmed_legs[leg.order_id] = time.time() + (6 * 3600 if venue == "novig" else 0)
                     log.warning("SYNC %s %s was held at shutdown and is no longer open; no settlement seen yet: "
                                 "kept as a held position until the sweep sees its result", venue, oid)
                     continue
@@ -2686,20 +2736,24 @@ class Supervisor:
         mismatch = bool(pos.contracts) and abs(pos.contracts - ours) > 1e-6
         view = "engine"
         # Cost and payout must come from ONE view of the position, never the exchange's count with our cost.
-        if (mismatch or unknown) and pos.contracts and pos.cost_usd is not None:
-            stake, view = round(pos.cost_usd, 2), "exchange"                  # the exchange's whole position
+        if pos.contracts and pos.cost_usd is not None:
+            # the exchange's own cost of the whole position is authoritative whenever it gives one (fills we mis-
+            # priced or missed, fees): our tally is only the fallback
+            stake, view = round(pos.cost_usd, 2), "exchange"
         elif unknown and pos.contracts:
             # what we saw fill at its real cost; the rest at most the limit price + fee (never understated)
             worst = max((l for _, l in legs), key=lambda l: l.limit_price or l.price)
-            seen = stake * min(1.0, pos.contracts / ours) if ours > 1e-9 else 0.0
-            stake = round(seen + self._cost_at_limit(worst, max(0.0, pos.contracts - ours)), 2)
+            # without the exchange's cost, never cut our own tally (which contracts are missing is unknown)
+            stake = round(stake + self._cost_at_limit(worst, max(0.0, pos.contracts - ours)), 2)
             view = "exchange_contracts_at_limit"
         elif mismatch:
             # the exchange's count is what pays out; contracts we never saw fill cost at most the limit price,
             # and if we tracked too many, our cost is scaled down to the contracts that really exist
+            # without the exchange's cost: our tally is never cut (which contracts are phantom is unknown, so a
+            # loss is never understated); contracts we never saw are charged at the limit + fee
             unseen = max(0.0, pos.contracts - ours)
             worst = max((l for _, l in legs), key=lambda l: l.limit_price or l.price)
-            stake = round(stake * min(1.0, pos.contracts / ours) + self._cost_at_limit(worst, unseen), 2)
+            stake = round(stake + self._cost_at_limit(worst, unseen), 2)
             view = "exchange_contracts"
         if mismatch:
             log.warning("SETTLE %s: exchange reports %g contracts, engine tracked %g (booked from the %s view)",
@@ -2716,6 +2770,7 @@ class Supervisor:
             self.unconfirmed_legs.pop(leg.order_id, None)
             self.settled_legs.add(leg.order_id)
             self._drop_leg(key, leg)
+        self._settled_outcomes[(legs[0][1].venue, pos.outcome_id)] = time.time()
         self.processed_settlements.add(pos.settlement_id)
         self.cumulative_pnl = round(self.cumulative_pnl + (net or 0.0), 2)
         settled_at = min(pos.settled_at, time.time()) if pos.settled_at else time.time()
