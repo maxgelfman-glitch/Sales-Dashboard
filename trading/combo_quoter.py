@@ -626,32 +626,48 @@ class ComboQuoter:
         the combo market) so the per-leg and per-game caps include it."""
         if self.cfg.mode == "shadow" or not hasattr(self.comms, "positions"):
             return 0.0
-        total = 0.0
+        total, open_tickers = 0.0, set()
         for p in await self.comms.positions():
             ticker = str(p.get("ticker") or "")
             held = _num(p.get("position_fp")) if p.get("position_fp") is not None else _num(p.get("position"))
             if not ticker.startswith("KXMVE") or not held or held >= 0:
                 continue
             exposure = _num(p.get("market_exposure_dollars")) or 0.0
-            key = next((k for k, r in self.ledger_open.items() if r.get("market_ticker") == ticker),
-                       f"restored-{ticker}")                 # the ledger's key: its SETTLE row closes it
-            if key in self.book.open:
-                continue
+            n = abs(held)
+            open_tickers.add(ticker)
             legs: list[Leg] = []
             try:                                       # the combo market lists its legs: per-leg/game caps see it
                 legs = parse_legs(await self.comms.market(ticker))
             except Exception as exc:  # noqa: BLE001
                 log.warning("COMBO restored %s without its legs (%s): total cap only", ticker, exc)
-            self.book.open[key] = (legs, exposure)
-            n = abs(held)
-            no = min(max(exposure / n, 0.0001), 0.9999)
-            cp = ComboPrice(action="QUOTE", reason="restored", contracts=n, no_bid=round(no, 4),
-                            yes_price=round(1 - no, 4), fee=0.0, slice="restored")
-            self.positions[key] = dict(price=cp, ticker=ticker, at=self.clock(), creator=None)   # settles normally
+            # Kalshi reports ONE aggregate position per combo market; several of our parlays can share it. Each
+            # ledger parlay gets its own share (its own contracts, price, fee: its SETTLE row closes it); any rest
+            # (e.g. a parlay the ledger missed) is booked under restored-<ticker>.
+            mine = [(k, r) for k, r in self.ledger_open.items() if r.get("market_ticker") == ticker and r.get("contracts")]
+            parts = []
+            for k, r in mine:
+                c = min(float(r["contracts"]), n - sum(x[1].contracts for x in parts))
+                if c <= 1e-9:
+                    break
+                parts.append((k, ComboPrice(action="QUOTE", reason="restored", contracts=c,
+                                            no_bid=float(r.get("no_bid") or 0), yes_price=float(r.get("yes_price") or 0),
+                                            fee=float(r.get("fee") or 0) * c / float(r["contracts"]), slice="restored")))
+            rest = n - sum(cp.contracts for _, cp in parts)
+            if rest > 1e-9:
+                no = min(max(exposure * rest / n / rest, 0.0001), 0.9999)
+                parts.append((f"restored-{ticker}", ComboPrice(action="QUOTE", reason="restored", contracts=rest,
+                                                               no_bid=round(no, 4), yes_price=round(1 - no, 4),
+                                                               fee=0.0, slice="restored")))
+            for key, cp in parts:
+                if key in self.book.open:
+                    continue
+                self.book.open[key] = (legs, round(cp.contracts * cp.no_bid + cp.fee, 2))
+                self.positions[key] = dict(price=cp, ticker=ticker, at=self.clock(), creator=None)  # settles normally
             total += exposure
-        # parlays the ledger holds that are no longer open at Kalshi settled while we were down: book them too
+        # parlays the ledger holds whose market is no longer open at Kalshi settled while we were down: book them
         for key, r in self.ledger_open.items():
-            if key in self.positions or not r.get("market_ticker") or not r.get("contracts"):
+            if key in self.positions or not r.get("market_ticker") or not r.get("contracts") \
+                    or r["market_ticker"] in open_tickers:
                 continue
             cp = ComboPrice(action="QUOTE", reason="settled while down", contracts=float(r["contracts"]),
                             no_bid=float(r.get("no_bid") or 0), yes_price=float(r.get("yes_price") or 0),

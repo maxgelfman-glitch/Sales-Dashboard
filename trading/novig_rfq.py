@@ -223,10 +223,12 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
             self.positions[rid] = dict(price=price, wager=wager, liability=liability, fair=None, slice=None)
             total += liability
         # parlays the ledger holds that are no longer open settled while we were down: check_results books them
+        # (once: restore() also runs from reconcile(), and a booked parlay must never come back)
         for rid, r in self.ledger_open.items():
             if rid not in self.positions and r.get("wager") and r.get("price"):
                 self.positions[rid] = dict(price=float(r["price"]), wager=float(r["wager"]),
                                            liability=float(r.get("liability") or 0), fair=None, slice=None)
+        self.ledger_open = {}
         if total:
             log.warning("NOVIG_RFQ restored %d open parlay(s), $%.2f collateral", len(self.positions), total)
         return total

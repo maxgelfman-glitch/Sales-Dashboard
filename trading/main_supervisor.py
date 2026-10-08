@@ -244,8 +244,12 @@ class PaperOrder(BaseModel):
     exchange_order_id: Optional[str] = None
     start_time: Optional[float] = None      # the game's scheduled start: tells the same matchup on two days apart
     unknown_reserved: float = 0.0           # $ of tranches whose outcome is unknown (timeout): kept reserved
+    unknown_contracts: float = 0.0          # ... and their size
     held_contracts: float = 0.0             # what HOLD/RESTORE ledger rows already record for this leg
     held_cost: float = 0.0
+    limit_price: Optional[float] = None     # live: the highest limit sent (what an unseen fill could have cost)
+    extra_contracts: float = 0.0            # resolved from the exchange beyond what our tracked orders show
+    extra_cost: float = 0.0
 
     @property
     def position_id(self) -> str:
@@ -566,6 +570,7 @@ class Supervisor:
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         self.settled_legs: set[int] = set()              # legs already settled: a late event must not re-reserve
         self._settled_parlays: set[tuple[str, str]] = set()
+        self._seen_trades: set[tuple[str, str]] = set()   # (venue, trade id) of every fill booked
         self._early_slips: dict[str, list] = {}           # exchange order id -> [(received, slip)] before its ack
         self._pending_pairs: dict[tuple, tuple] = {}      # game key -> second leg waiting for the first's fill
         self.venue_halts: dict[str, tuple[float, str]] = {}   # venue -> (halted until, reason)
@@ -996,6 +1001,11 @@ class Supervisor:
         if self.arb_pairs_enabled and not shadow and await self._try_locked_pair(update, key, side):
             return
 
+        if self.require_start_time and update.start_time is None:
+            # without its own start time this market could be another game of the matchup (a series): never
+            # price it against the sharp line of the game we hold
+            self.stats["no_market_start_time"] += 1
+            return
         sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=update.line, start=update.start_time)
         if sharp is None:
             self.stats["no_sharp"] += 1
@@ -1205,9 +1215,7 @@ class Supervisor:
             canon = self._canonical(other)
             if canon is None or canon[0] != key or canon[1] == side:
                 continue
-            known = self.game_start.get(key[:3])         # the game's start from any venue (doubleheaders refused)
-            if not same_game_time(update.start_time or known, other.start_time or known,
-                                  strict=self.require_start_time):
+            if not same_game_time(update.start_time, other.start_time, strict=self.require_start_time):
                 continue                                   # same teams, another day: two bets, not a lock
             if mtype == "spread" and (other.line is None or update.line is None
                                       or not math.isclose(other.line, -update.line)):
@@ -1371,8 +1379,7 @@ class Supervisor:
         first = held.primary
         league, _, _, mtype = key
         fail = lambda why: (False, why, 0, 0.0, 0.0, {}, 0.0, 0.0)  # noqa: E731
-        known = self.game_start.get(key[:3])
-        if not same_game_time(first.start_time or known, update.start_time or known, strict=self.require_start_time):
+        if not same_game_time(first.start_time, update.start_time, strict=self.require_start_time):
             return fail("a different game of the same matchup (start times differ)")
         if mtype == "spread":
             if first.line is None or update.line is None or not math.isclose(update.line, -first.line):
@@ -1504,7 +1511,9 @@ class Supervisor:
         leg = PaperOrder(order_id=len(self.orders) + 1, kind=kind, venue=venue, outcome_id=update.outcome_id,
                          event_id=update.event_id, league=update.league, market_type=update.market_type, side=side,
                          line=update.line, price=price, contracts=0, stake_usd=0.0, edge=edge, capped=capped,
-                         placed_at=time.time(), live=True, pending=True, requested_contracts=contracts)
+                         placed_at=time.time(), live=True, pending=True, requested_contracts=contracts,
+                         start_time=update.start_time,        # which game of the matchup: pairs/hedges compare it
+                         limit_price=max(p for p, _ in tranches))
         if kind == "ARB_HEDGE":                                         # risk-reducing: always allowed
             self.exposure.record_fill(leg.position_id, stake)
         else:
@@ -1546,6 +1555,7 @@ class Supervisor:
         if unknown:
             self.stats["unconfirmed_orders"] += len(unknown)
             leg.unknown_reserved = round(sum(order_cost(venue, n, p)[0] for p, n in unknown), 2)
+            leg.unknown_contracts = float(sum(n for _, n in unknown))
             self.unconfirmed_legs[leg.order_id] = time.time()   # the settlement sweep reconciles it
         if not placed and not unknown:
             self.exposure.adjust(leg.position_id, 0)
@@ -1557,6 +1567,14 @@ class Supervisor:
             leg.requested_contracts = sum(n for _, _, n, _ in placed) + sum(n for _, n in unknown)
             self.exposure.adjust(leg.position_id, round(sum(order_cost(venue, n, p)[0] for _, p, n, _ in placed)
                                                         + sum(order_cost(venue, n, p)[0] for p, n in unknown), 2))
+        # PROVISIONAL holding: everything accepted or unknown, at its limit + fee. Finishes correct it (HOLD deltas),
+        # so a crash at ANY moment leaves the ledger enough to book a settlement that happens while we are down
+        info = self._registry_for(venue).get(update.outcome_id)
+        leg.held_contracts = float(sum(n for _, _, n, _ in placed) + sum(n for _, n in unknown))
+        leg.held_cost = round(sum(order_cost(venue, n, p)[0] for _, p, n, _ in placed)
+                              + sum(order_cost(venue, n, p)[0] for p, n in unknown), 2)
+        self._ledger("HOLD", venue=venue, outcome_id=update.outcome_id, market_id=info.market_id if info else None,
+                     contracts=leg.held_contracts, cost_usd=leg.held_cost, leg=leg.order_id, provisional=True)
         if not placed:                                   # nothing known to be working: the sweep decides
             leg.pending = False
             return
@@ -1604,17 +1622,31 @@ class Supervisor:
         self.exposure.adjust(leg.position_id, round(amount + extra, 2))
         return True
 
+    @staticmethod
+    def _cost_at_limit(leg: PaperOrder, contracts: float) -> float:
+        """The most `contracts` of this leg could have cost: its highest limit price plus the venue fee."""
+        if contracts <= 1e-9:
+            return 0.0
+        price = leg.limit_price or leg.price
+        cost = contracts * price
+        if leg.venue == "kalshi":
+            cost += kalshi_taker_fee(int(math.ceil(contracts - 1e-9)), price * 100)
+        return math.ceil(round(cost * 100, 6)) / 100
+
     def _hold_sync(self, leg: PaperOrder) -> None:
         """Write a HOLD row for whatever this leg holds that the ledger does not record yet (fills learned late,
         resolved UNCONFIRMED orders): a restart must see every contract to book a settlement that happened while
         the engine was down, at its real cost."""
-        dc, dcost = round(leg.contracts - leg.held_contracts, 4), round(leg.stake_usd - leg.held_cost, 2)
+        open_unknown = leg.order_id in self.unconfirmed_legs      # an unknown tranche may hold contracts too
+        n = leg.contracts + (leg.unknown_contracts if open_unknown else 0.0)
+        cost = leg.stake_usd + (leg.unknown_reserved if open_unknown else 0.0)
+        dc, dcost = round(n - leg.held_contracts, 4), round(cost - leg.held_cost, 2)
         if abs(dc) < 1e-9 and abs(dcost) < 0.005:
             return
         info = self._registry_for(leg.venue).get(leg.outcome_id)
         self._ledger("HOLD", venue=leg.venue, outcome_id=leg.outcome_id, market_id=info.market_id if info else None,
                      contracts=dc, cost_usd=dcost, leg=leg.order_id)
-        leg.held_contracts, leg.held_cost = leg.contracts, leg.stake_usd
+        leg.held_contracts, leg.held_cost = n, cost
 
     async def _taker_timeout(self, oid: str) -> None:
         await asyncio.sleep(self.taker_fill_timeout)
@@ -1765,6 +1797,7 @@ class Supervisor:
                         "reserved until the sweep resolves it", lo.kind, lo.exchange_order_id, leg.unknown_reserved)
             return
         if lo.filled <= 0:
+            self._hold_sync(leg)                          # the provisional holding comes back off the ledger
             self._drop_leg(lo.key, leg)
             pos = self.positions.get(lo.key)
             if pos is not None and pos.legs:            # any leg of a pair can be the missing one
@@ -1858,6 +1891,13 @@ class Supervisor:
         elif not self.orders_channel_confirmed:
             self.orders_channel_confirmed = True
             log.info("LIVE orders channel confirmed by first execution slip")
+        tid = getattr(slip, "trade_id", None)
+        if tid:
+            tkey = (getattr(slip, "venue", "novig"), tid)
+            if tkey in self._seen_trades:            # the same fill delivered twice (replay, reconnect)
+                log.info("FILL %s trade %s already booked: ignored", slip.order_id, tid)
+                return
+            self._seen_trades.add(tkey)
         self._ledger("SLIP", **slip.model_dump())
         lo = self.live_orders.get(slip.order_id)
         if lo is None:                       # cannot happen: on_fill_slip holds unknown slips first
@@ -1899,12 +1939,20 @@ class Supervisor:
                     kids = self._children(leg.order_id)       # one order, or several staggered tranches
                     filled, cost = sum(k.filled for k in kids), sum(k.fill_cost for k in kids)
                     fees = sum(k.fees for k in kids)
-                    leg.contracts = round(filled, 2)
-                    leg.stake_usd = round(cost, 2)                 # cash out, fees included
+                    leg.contracts = round(filled + leg.extra_contracts, 2)   # + any part resolved from the exchange
+                    leg.stake_usd = round(cost + leg.extra_cost, 2)          # cash out, fees included
                     leg.fee_usd = round(fees, 2)
                     leg.price = round((cost - fees) / filled, 6)   # per-contract price, fees excluded
                     if lo.done:   # late fill after we cancelled the remainder: still real
                         log.warning("LIVE late fill on %s after cancel: +%g", lo.exchange_order_id, delta)
+                        key = tuple(lo.key)
+                        if leg.order_id not in self.settled_legs and not any(
+                                leg in p.legs for p in self.positions.values()):
+                            # dropped at a "nothing filled" finish: it holds contracts after all. Re-attach it, so
+                            # the game lock, the per-game cap and the settlement all see it again
+                            self.positions.setdefault(key, MarketPosition(legs=[])).legs.append(leg)
+                            log.critical("LIVE late fill on %s revived a leg finalised as unfilled: %g contracts "
+                                         "back in %s", lo.exchange_order_id, leg.contracts, key)
                         if self._reserve_leg(leg, self._leg_exposure(kids)):
                             self._hold_sync(leg)
                         else:
@@ -2107,8 +2155,14 @@ class Supervisor:
         return max(worst + (leg.unknown_reserved if leg.order_id in self.unconfirmed_legs else 0.0), leg.stake_usd)
 
     def game_unhedged(self, gid: tuple) -> float:
-        """Unhedged $ across every market (moneyline, spread, total) of one game."""
-        return round(sum(self._position_unhedged_usd(pos) for key, pos in self.positions.items() if key[:3] == gid), 2)
+        """Unhedged $ across every market (moneyline, spread, total) of one game. An UNCONFIRMED order (it may have
+        filled, we do not know) counts as naked for whatever it still has reserved beyond what it is known to hold."""
+        reserved = self.exposure.open_positions()
+        unknown = sum(max(0.0, reserved.get(l.position_id, 0.0) - l.stake_usd)
+                      for key, pos in self.positions.items() if key[:3] == gid
+                      for l in pos.legs if l.order_id in self.unconfirmed_legs and not l.pending)
+        return round(sum(self._position_unhedged_usd(pos) for key, pos in self.positions.items() if key[:3] == gid)
+                     + unknown, 2)
 
     def game_room(self, gid: tuple) -> float:
         return max(0.0, self.game_exposure_limit - self.game_unhedged(gid))
@@ -2130,7 +2184,7 @@ class Supervisor:
         day = self._utc_day(ts)
         self.daily_pnl[day] = round(self.daily_pnl.get(day, 0.0) + net, 2)
         if (self.daily_loss_limit is not None and self.daily_pnl[day] <= -self.daily_loss_limit
-                and self.loss_halted_day != day):
+                and self.loss_halted_day != day and day == self._utc_day()):   # a PAST day never moves today's stop
             self.loss_halted_day = day
             log.critical("DAILY_LOSS_STOP settled net P&L today $%.2f <= -$%.0f: no new positions or quotes until "
                          "06:00 New York time (hedges still allowed)", self.daily_pnl[day], self.daily_loss_limit)
@@ -2552,7 +2606,8 @@ class Supervisor:
                          event_id=(info.event_id if info else pos.event_id) or "", league=info.league if info else "",
                          market_type=info.market_type if info else "", side=side, line=info.line if info else None,
                          price=min(max(price, 0.0001), 0.9999), contracts=round(pos.contracts, 2), stake_usd=stake,
-                         edge=None, capped=False, placed_at=time.time(), live=True)
+                         edge=None, capped=False, placed_at=time.time(), live=True,
+                         start_time=info.start_time if info else None)
         leg.held_contracts, leg.held_cost = leg.contracts, leg.stake_usd      # the RESTORE row records it
         self.exposure.record_fill(leg.position_id, stake)
         self.orders.append(leg)
@@ -2600,13 +2655,17 @@ class Supervisor:
                     continue
                 pos = next((p for p in settled if p.outcome_id == oid and p.is_settled
                             and p.settlement_id not in self.processed_settlements), None)
-                if pos is None:
-                    log.warning("SYNC %s %s was held at shutdown and is no longer open; no settlement seen yet "
-                                "(the sweep keeps looking)", venue, oid)
-                    continue
                 leg = self._restore(ExchangePosition(settlement_id=f"ledger-{oid}", outcome_id=oid,
                                                      market_id=h.get("market_id"), contracts=h["contracts"],
                                                      cost_usd=h["cost_usd"], status="OPEN"), "ledger", venue)
+                if pos is None:
+                    # its result is not published yet: keep it as a held leg (reserved, game locked) so the
+                    # settlement sweep books it when the grade appears, instead of forgetting it. If the exchange
+                    # still shows nothing for it after 6h (it never filled), it is released like any UNCONFIRMED
+                    self.unconfirmed_legs[leg.order_id] = time.time() + 6 * 3600
+                    log.warning("SYNC %s %s was held at shutdown and is no longer open; no settlement seen yet: "
+                                "kept as a held position until the sweep sees its result", venue, oid)
+                    continue
                 key = next((k for k, mp in self.positions.items() if leg in mp.legs), None)
                 self._apply_settlement(pos, [(key, leg)])
                 log.warning("SYNC %s %s settled while the engine was down: booked now", venue, oid)
@@ -2630,13 +2689,17 @@ class Supervisor:
         if (mismatch or unknown) and pos.contracts and pos.cost_usd is not None:
             stake, view = round(pos.cost_usd, 2), "exchange"                  # the exchange's whole position
         elif unknown and pos.contracts:
-            # what the order(s) could have cost at most: the limit price (a loss is never understated)
-            stake, view = round(pos.contracts * max(l.price for _, l in legs), 2), "exchange_contracts_at_limit"
+            # what we saw fill at its real cost; the rest at most the limit price + fee (never understated)
+            worst = max((l for _, l in legs), key=lambda l: l.limit_price or l.price)
+            seen = stake * min(1.0, pos.contracts / ours) if ours > 1e-9 else 0.0
+            stake = round(seen + self._cost_at_limit(worst, max(0.0, pos.contracts - ours)), 2)
+            view = "exchange_contracts_at_limit"
         elif mismatch:
             # the exchange's count is what pays out; contracts we never saw fill cost at most the limit price,
             # and if we tracked too many, our cost is scaled down to the contracts that really exist
             unseen = max(0.0, pos.contracts - ours)
-            stake = round(stake * min(1.0, pos.contracts / ours) + unseen * max(l.price for _, l in legs), 2)
+            worst = max((l for _, l in legs), key=lambda l: l.limit_price or l.price)
+            stake = round(stake * min(1.0, pos.contracts / ours) + self._cost_at_limit(worst, unseen), 2)
             view = "exchange_contracts"
         if mismatch:
             log.warning("SETTLE %s: exchange reports %g contracts, engine tracked %g (booked from the %s view)",
@@ -2716,15 +2779,23 @@ class Supervisor:
             if leg.venue != venue:
                 continue
             key = next((k for k, pos in self.positions.items() if leg in pos.legs), None)
+            kids = self._children(leg.order_id)
+            if any(not k.done for k in kids):
+                continue                                         # a sibling tranche still working: resolve later
             if leg.outcome_id in open_by_outcome:
                 exch = open_by_outcome[leg.outcome_id]
                 others = [l for _, l in self._legs_for_outcome(leg.outcome_id) if l is not leg]
                 tracked = sum(l.contracts for l in others)
                 mine = max(0.0, exch.contracts - tracked)        # the exchange total minus what other legs hold
                 share = mine / exch.contracts if exch.contracts else 0.0
+                seen_n, seen_cost = sum(k.filled for k in kids), sum(k.fill_cost for k in kids)
+                total_cost = exch.cost_usd * share if exch.cost_usd is not None else \
+                    seen_cost + self._cost_at_limit(leg, max(0.0, mine - seen_n))
+                leg.extra_contracts = round(max(0.0, mine - seen_n), 4)  # survives later fills of our own orders
+                leg.extra_cost = round(max(0.0, total_cost - seen_cost), 2)
                 leg.contracts = round(mine, 2)
-                leg.stake_usd = round(exch.cost_usd * share if exch.cost_usd is not None else mine * leg.price, 2)
-                leg.unknown_reserved = 0.0
+                leg.stake_usd = round(total_cost, 2)
+                leg.unknown_reserved, leg.unknown_contracts = 0.0, 0.0
                 self.unconfirmed_legs.pop(leg_id)
                 self._reserve_leg(leg, leg.stake_usd)
                 self._hold_sync(leg)
@@ -2734,6 +2805,8 @@ class Supervisor:
                             leg.exchange_order_id, leg.contracts, leg.stake_usd)
             elif leg.outcome_id not in settled_outcomes and now - since >= 60 and key is not None:
                 self.exposure.adjust(leg.position_id, 0)
+                leg.contracts, leg.stake_usd = 0.0, 0.0
+                self._hold_sync(leg)                      # nothing is held after all: clear it from the ledger too
                 self._drop_leg(key, leg)
                 self.unconfirmed_legs.pop(leg_id)
                 self._ledger("UNCONFIRMED_RELEASED", exchange_order_id=leg.exchange_order_id,
@@ -2751,8 +2824,21 @@ class Supervisor:
                 if abs(ours - exch.contracts) > 1e-6 and not any(l.pending for _, l in tracked):
                     self._ledger("POSITION_MISMATCH", outcome_id=outcome, engine_contracts=ours,
                                  exchange_contracts=exch.contracts)
-                    log.warning("POSITION_MISMATCH %s: engine %d vs exchange %g contracts", outcome, ours,
+                    log.warning("POSITION_MISMATCH %s: engine %g vs exchange %g contracts", outcome, ours,
                                 exch.contracts)
+                    if exch.contracts > ours and not any(l.order_id in self.unconfirmed_legs for _, l in tracked):
+                        # the exchange holds MORE (fills we never saw): reserve, cap and ledger them now, not
+                        # only at settlement. Cost: the exchange's share, else the limit price + fee.
+                        extra = exch.contracts - ours
+                        leg = tracked[-1][1]
+                        add = exch.cost_usd * extra / exch.contracts if exch.cost_usd is not None \
+                            else self._cost_at_limit(leg, extra)
+                        leg.extra_contracts = round(leg.extra_contracts + extra, 4)
+                        leg.extra_cost = round(leg.extra_cost + add, 2)
+                        leg.contracts = round(leg.contracts + extra, 2)
+                        leg.stake_usd = round(leg.stake_usd + add, 2)
+                        self._reserve_leg(leg, leg.stake_usd)
+                        self._hold_sync(leg)
         return rows
 
     async def _settlement_loop(self) -> None:

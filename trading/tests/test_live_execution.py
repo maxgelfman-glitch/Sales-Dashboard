@@ -355,9 +355,11 @@ async def test_end_to_end_live_single_socket(tmp_path):
     assert (leg.contracts, leg.stake_usd, leg.pending, leg.exchange_order_id) == (20, 9.80, False, "srv-1")
     assert sup.total_exposure() == 9.80 and sup.orders_channel_confirmed
     events = [json.loads(line) for line in ledger.read_text().splitlines()]
-    assert [e["event"] for e in events] == ["SESSION_START", "ORDER", "SLIP", "FILL", "DONE", "HOLD"]
-    assert events[1]["payload"] == posted[0]                                           # exact body sent
-    assert (events[3]["filled_total"], events[3]["cost_total_usd"]) == (20, 9.8)
+    # a provisional HOLD (at the limit) goes in before the order; a fill exactly at the limit needs no correction
+    assert [e["event"] for e in events] == ["SESSION_START", "HOLD", "ORDER", "SLIP", "FILL", "DONE"]
+    assert events[2]["payload"] == posted[0]                                           # exact body sent
+    assert (events[4]["filled_total"], events[4]["cost_total_usd"]) == (20, 9.8)
+    assert (events[1]["contracts"], events[1]["cost_usd"], events[1]["provisional"]) == (20, 9.8, True)
     for h in logging.getLogger("trading").handlers:
         h.flush()
     text = path.read_text()

@@ -954,7 +954,8 @@ def event_to_slip(ev: dict) -> Optional[FillSlip]:
         return FillSlip(order_id=str(oid), status="FILLED" if ev.get("remaining") == 0 else "PARTIAL",
                         filled_volume=from_novig_qty(float(ev.get("qty", 0))),
                         price_cents=float(ev["price"]) * 100 if ev.get("price") is not None else None, venue="novig",
-                        price_is_bought_outcome=True)
+                        price_is_bought_outcome=True,
+                        trade_id=next((str(ev[k]) for k in ("fillId", "tradeId", "id") if ev.get(k)), None))
     if kind in {"cancel", "reject"}:
         return FillSlip(order_id=str(oid), status="CANCELED" if kind == "cancel" else "REJECTED", filled_volume=0,
                         venue="novig")

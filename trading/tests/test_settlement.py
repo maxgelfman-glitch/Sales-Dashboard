@@ -319,7 +319,9 @@ async def test_sweep_restores_untracked_positions_and_flags_mismatches(tmp_path)
                                  pos(settlement_id="m", outcome_id="O-GSW", contracts=4, cost_usd=2.0, status="OPEN")]
     await sup.settlement_sweep()
     assert ledger_rows(ledger, "POSITION_MISMATCH")[0]["exchange_contracts"] == 25
-    assert ledger_rows(ledger, "RESTORE")[0]["outcome_id"] == "O-GSW" and sup.total_exposure() == 11.80
+    # the 5 contracts we never saw fill are reserved at the exchange's cost right away: 9.80 + 2.45 + 2.00 (GSW)
+    assert ledger_rows(ledger, "RESTORE")[0]["outcome_id"] == "O-GSW" and sup.total_exposure() == 14.25
+    assert sup.orders[0].contracts == 25
 
 
 # ================================================================ HTTP client

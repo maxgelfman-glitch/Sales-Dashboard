@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ import aiohttp
 from urllib.parse import quote
 from yarl import URL
 
+from execution import kalshi_taker_fee
 from kalshi_feed import auth_headers
 from novig_private import FillSlip
 from settlement import ExchangePosition
@@ -225,7 +227,8 @@ def parse_kalshi_fill(payload: Any) -> Optional[FillSlip]:
     if price is None:                       # a NO-side print: YES price is its complement
         no = _cents(msg, "no_price")
         price = None if no is None else 100 - no
-    return FillSlip(order_id=str(oid), status="PARTIAL", filled_volume=count, price_cents=price, venue="kalshi")
+    return FillSlip(order_id=str(oid), status="PARTIAL", filled_volume=count, price_cents=price, venue="kalshi",
+                    trade_id=str(msg["trade_id"]) if msg.get("trade_id") else None)
 
 
 class KalshiPositionsClient:
@@ -279,6 +282,15 @@ class KalshiPositionsClient:
             if cost is None:
                 cents = _num(s.get("yes_total_cost"))
                 cost = None if cents is None else cents / 100
+            if cost is not None:
+                # the position cost excludes the taker fee (reported separately): add it, else the P&L of this
+                # settlement would leave the fee out. ASSUMED field name; estimated at the order level if absent.
+                fee = _num(s.get("fee_cost_dollars"))
+                if fee is None:
+                    fee = _num(s.get("fee_cost"))
+                if fee is None and yes:
+                    fee = kalshi_taker_fee(int(math.ceil(yes - 1e-9)), 100 * cost / yes)
+                cost = round(cost + (fee or 0.0), 2)
             result = str(s.get("market_result") or "").upper()
             when = s.get("settled_time")
             try:

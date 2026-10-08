@@ -113,7 +113,7 @@ async def test_positions_client_reads_open_and_settled(fake_kalshi):
         [open_pos] = await client.open_positions()                             # the NO position is not ours
         assert (open_pos.outcome_id, open_pos.contracts, open_pos.cost_usd) == (K_NYK, 20, 9.5)
         [settled] = await client.settled_positions()
-        assert (settled.outcome_id, settled.result, settled.payout_usd, settled.cost_usd) == (K_NYK, "WIN", 20.0, 9.5)
+        assert (settled.outcome_id, settled.result, settled.payout_usd, settled.cost_usd) == (K_NYK, "WIN", 20.0, 9.85)   # + the taker fee
         assert settled.is_settled and settled.settlement_id.startswith("kalshi-")
     finally:
         await client.close()

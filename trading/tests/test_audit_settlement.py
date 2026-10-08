@@ -164,3 +164,44 @@ async def test_a_parlay_that_settles_while_the_engine_is_down_is_booked_once(tmp
     settles = [json.loads(x) for x in sup.ledger_path.read_text().splitlines() if '"SETTLE"' in x]
     assert [r["net_profit_usd"] for r in settles] == [-150.0]
     assert sup.cumulative_pnl == -150.0
+
+
+async def test_a_past_day_loss_never_lifts_todays_stop(tmp_path):
+    from datetime import datetime as _dt
+    sup, ledger = engine(tmp_path)
+    sup.daily_loss_limit = 15.0
+    today = sup._utc_day()
+    sup._record_daily_pnl(-19.6)
+    assert sup._loss_halted()
+    sup._record_daily_pnl(-19.6, _dt.now(NY).timestamp() - 2 * 86400)   # a downtime loss from two days ago
+    assert sup._loss_halted() and sup.loss_halted_day == today
+
+
+async def test_a_replayed_fill_is_booked_once(tmp_path):
+    sup, _ = engine(tmp_path)
+    await sup.on_market_update(MarketUpdate(**INFO["O-NYK"], price=0.49, available_volume=5000), None)
+    oid = f"ex-{sup.order_gateway.n}"
+    lo = sup.live_orders[oid]
+    lo.fill_mode = "incremental"
+    for _ in range(2):                                               # the same fill delivered twice
+        await sup.on_fill_slip(FillSlip(order_id=oid, status="PARTIAL", filled_volume=5, price_cents=49,
+                                        trade_id="t-1"))
+    assert lo.filled == 5
+
+
+async def test_an_order_crashed_mid_flight_is_still_in_the_ledger(tmp_path):
+    sup, ledger = engine(tmp_path)
+    await sup.on_market_update(MarketUpdate(**INFO["O-NYK"], price=0.49, available_volume=5000), None)
+    [held] = load_ledger_holdings(ledger).values()                   # before any fill: the provisional holding
+    assert held["contracts"] == 20 and held["cost_usd"] == pytest.approx(9.80)
+
+
+async def test_a_position_the_exchange_holds_more_of_is_reserved_at_once(tmp_path):
+    sup, ledger = engine(tmp_path)
+    await sup.on_market_update(MarketUpdate(**INFO["O-NYK"], price=0.49, available_volume=5000), None)
+    oid = f"ex-{sup.order_gateway.n}"
+    await sup.on_fill_slip(FillSlip(order_id=oid, status="FILLED", filled_volume=20, price_cents=49))
+    sup.positions_client.open = [pos(settlement_id="o", contracts=25, cost_usd=12.25, status="OPEN")]
+    await sup.settlement_sweep()
+    assert sup.total_exposure() == pytest.approx(12.25)
+    assert sup.game_unhedged(("NBA", "New York Knicks", "Boston Celtics")) == pytest.approx(12.25)
