@@ -205,3 +205,19 @@ async def test_parlay_losses_count_toward_the_daily_loss_stop(tmp_path):
     assert sup._combo_block_reason() is None
     sup.novig_rfq.on_settled(-50.0, "b")
     assert sup._combo_block_reason() == "daily loss stop"             # no new parlay quotes today
+
+
+async def test_alternate_line_legs_are_never_priced_as_the_main_line(tmp_path):
+    import time as _t
+    from novig_feed import MarketInfo
+    sup = build_live_supervisor({"NOVIG_RFQ": "qa", "NOVIG_RFQ_ACCESS_TOKEN": "t", "TRADING_LOG_DIR": str(tmp_path),
+                                 "RESEARCH_ENABLED": "0"})
+    alt = MarketInfo(outcome_id="b105", market_id="m", sibling_outcome_id="k105", league="NFL", market_type="spread",
+                     event_id="e1", home_team="Kansas City Chiefs", away_team="Buffalo Bills", outcome="Buffalo Bills",
+                     line=10.5, start_time=_t.time() + 7200)
+    sup.registry.replace_all([alt, alt.model_copy(update={"outcome_id": "k105", "sibling_outcome_id": "b105",
+                                                           "outcome": "Kansas City Chiefs", "line": -10.5})])
+    sup._index_start_times()
+    sup.book.ingest([dict(league="NFL", home_team="Kansas City Chiefs", away_team="Buffalo Bills",
+                          market_type="spread", side="Buffalo Bills", line=3.0, odds_for=-110, odds_against=-110)])
+    assert sup.novig_leg_fair("b105") is None          # Bills +10.5 is NOT Bills +3 at 50%

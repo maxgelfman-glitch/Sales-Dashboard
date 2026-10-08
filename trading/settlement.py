@@ -100,6 +100,7 @@ class ExchangePosition(BaseModel):
     payout_usd: Optional[float] = None
     pnl_usd: Optional[float] = None
     settled_at: Optional[float] = None   # epoch seconds
+    settle_value: Optional[float] = None # fair-market-value settlement: $ per contract (0..1)
 
     @property
     def is_settled(self) -> bool:
@@ -159,6 +160,9 @@ def settlement_pnl(pos: ExchangePosition, stake_usd: float) -> tuple[Optional[fl
         return round(pos.pnl_usd, 2), round(payout, 2), "exchange_pnl"
     if pos.payout_usd is not None:
         return round(pos.payout_usd - stake_usd, 2), round(pos.payout_usd, 2), "exchange_payout"
+    if pos.settle_value is not None and pos.contracts:
+        payout = pos.contracts * pos.settle_value
+        return round(payout - stake_usd, 2), round(payout, 2), "fair_market_value"
     r = (pos.result or "").upper()
     if r in WIN_RESULTS:
         payout = pos.contracts * 1.0

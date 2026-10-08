@@ -30,7 +30,7 @@ FAIRS = {T1: 0.55, T2: 0.60, T3: 0.50}
 
 def leg_fair(leg):
     p = FAIRS.get(leg.market_ticker)
-    return None if p is None else LegFair(prob_yes=p, source="sharp", age_s=1.0)
+    return None if p is None else LegFair(prob_yes=p, source="sharp", age_s=1.0, start=time.time() + 3600)
 
 
 def rfq(rid="r1", legs=((T1, "yes"), (T2, "yes")), contracts=20, ticker="KXMVE-COMBO-1"):
@@ -46,8 +46,9 @@ def pricer(**kw):
 # Pricing
 # ---------------------------------------------------------------------------
 def _yes(fair, margin, rate=0.035):
+    import math
     base = fair * (1 + margin)
-    return round(base + rate * base * (1 - base), 4)
+    return math.ceil((base + rate * base * (1 - base)) * 10_000 - 1e-6) / 10_000     # rounded UP
 
 
 def test_prices_independent_legs_with_margin_growing_per_leg():
@@ -341,7 +342,7 @@ async def test_void_settlement_clears_the_book_and_sharp_legs_need_no_api_calls(
     q.comms.market = counting
     q.comms.rfqs = [rfq()]
     await q.step()
-    assert calls == ["KXMVE-COMBO-1"]                     # only the combo's own expiry lookup, no leg fetches
+    assert calls == []                                    # legs carry start times: no lookups at all
     q.comms.quote_status["q1"] = {"status": "executed"}
     await q.step()
     q.comms.markets["KXMVE-COMBO-1"] = {"status": "settled", "result": ""}
@@ -418,3 +419,86 @@ async def test_open_quotes_are_capped(tmp_path):
     q.comms.rfqs = [rfq(f"r{i}", ticker=f"KXMVE-C{i}") for i in range(5)]
     await q.step()
     assert len(q.comms.created) == 2
+
+
+# ---------------------------------------------------------------------------
+# Review fixes
+# ---------------------------------------------------------------------------
+def test_a_blocked_leg_never_falls_back_to_kalshis_book(tmp_path):
+    from combo_quoter import LEG_BLOCKED
+    q, clock = quoter(tmp_path)
+    q.pricer.leg_fair = q._leg_fair_with_fallback(lambda leg: LEG_BLOCKED)
+    q._book_cache[T1] = (clock["t"], LegFair(0.51, "kalshi_book", 0.0))
+    assert q.pricer.leg_fair(Leg(T1, "", "yes")) is None
+
+
+def test_book_fairs_report_their_real_age(tmp_path):
+    q, clock = quoter(tmp_path)
+    q.pricer.leg_fair = q._leg_fair_with_fallback(lambda leg: None)
+    q._book_cache["KXPROP-X"] = (clock["t"], LegFair(0.5, "kalshi_book", 0.0, spread=0.01))
+    clock["t"] += 600
+    assert q.pricer.leg_fair(Leg("KXPROP-X", "", "yes")).age_s == pytest.approx(600)
+
+
+def test_book_priced_legs_are_shadow_only_live():
+    pr = ComboPricer(ComboConfig(), lambda leg: LegFair(0.5, "kalshi_book", 0.0, start=time.time() + 3600))
+    cp = pr.price(rfq())
+    assert cp.action == "QUOTE" and "Kalshi's own book" in pr.live_allowed(cp)
+
+
+def test_legs_need_an_explicit_side():
+    bad = {**rfq(), "mve_selected_legs": [{"market_ticker": T1, "event_ticker": "E1"},
+                                          {"market_ticker": T2, "event_ticker": "E2", "side": "yes"}]}
+    assert "side" in pricer().price(bad).reason
+
+
+def test_same_game_groups_merge_transitively():
+    a, b, c = "KXNBAGAME-26OCT01BOSNYK-NYK", "KXNBASPREAD-X-1", "KXNBATOTAL-26OCT01BOSNYK-O"
+    game = ("NBA", "NYK", "BOS")
+    fairs = {a: LegFair(0.5, "sharp", 0, start=time.time() + 3600),
+             b: LegFair(0.5, "sharp", 0, game=game, start=time.time() + 3600),
+             c: LegFair(0.5, "sharp", 0, game=game, start=time.time() + 3600)}
+    cp = ComboPricer(ComboConfig(), lambda leg: fairs[leg.market_ticker]).price(
+        rfq(legs=((a, "yes"), (b, "yes"), (c, "yes"))))
+    assert cp.same_game and cp.uncertainty >= 2 * 0.08                   # one game, three legs: two extra
+
+
+async def test_last_look_counts_the_maker_fee(tmp_path):
+    q, clock = quoter(tmp_path, last_look_min_margin=0.09)              # NBA+NFL: fee applies
+    q.comms.rfqs = [rfq()]
+    await q.step()
+    q.comms.quote_status["q1"] = {"status": "accepted", "accepted_side": "yes"}
+    await q.step()                                    # 8.6% margin net of the fee (10.9% if the fee counted)
+    assert q.comms.confirmed == [] and q.comms.deleted == ["q1"]
+
+
+async def test_a_failed_confirm_keeps_the_reservation_and_other_quotes_proceed(tmp_path):
+    q, clock = quoter(tmp_path)
+    q.comms.rfqs = [rfq("r1"), rfq("r2", ticker="KXMVE-COMBO-2")]
+    await q.step()
+
+    async def boom(qid):
+        if qid == "q1":
+            raise RuntimeError("timeout")
+        q.comms.confirmed.append(qid)
+    q.comms.confirm_quote = boom
+    q.comms.quote_status["q1"] = {"status": "accepted", "accepted_side": "yes"}
+    q.comms.quote_status["q2"] = {"status": "accepted", "accepted_side": "yes"}
+    await q.step()
+    assert q.comms.confirmed == ["q2"] and "q1" in q.book.open          # q1 may have gone through: kept
+    await q.step()
+    assert q.comms.confirmed == ["q2"]                                  # never confirmed twice
+
+
+def test_parlays_are_held_to_the_canary_and_hard_ceilings(tmp_path):
+    from main_supervisor import parlay_config
+
+    class Plan:
+        scaled_up = False
+    cfg = parlay_config({"COMBO_MAX_TOTAL_LIABILITY": "5000"}, "live", Plan(), "kalshi")
+    assert cfg.max_total_liability == 100 and cfg.max_loss_per_combo == 10
+    Plan.scaled_up = True
+    assert parlay_config({"COMBO_MAX_TOTAL_LIABILITY": "5000"}, "live", Plan(), "kalshi").max_total_liability == 5000
+    for bad in ("nan", "inf", "20000", "-1"):
+        with pytest.raises(ConfigError):
+            parlay_config({"COMBO_MAX_TOTAL_LIABILITY": bad}, "shadow", None, "kalshi")

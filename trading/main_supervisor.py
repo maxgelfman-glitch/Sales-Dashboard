@@ -475,6 +475,7 @@ class Supervisor:
             self.feed.on_state_change = self.on_feed_state
             self.feed.on_slip = self.on_fill_slip if live else None
             self.feed.on_lifecycle = self.on_novig_lifecycle
+            self.feed.on_private_gap = self.recover_novig_fills
         else:
             self.feed = NovigFeed(url=feed_url, token=token, registry=self.registry,
                                   on_update=self.on_market_update, on_state_change=self.on_feed_state,
@@ -1682,20 +1683,22 @@ class Supervisor:
     # ---------------- combo (parlay) quoting support ----------------
     def combo_leg_fair(self, leg):
         """Fair YES probability of a Kalshi leg from the sharp line, when the leg is a game market we track."""
-        from combo_quoter import LegFair
+        from combo_quoter import LEG_BLOCKED, LegFair
         info = self.kalshi_registry.get(leg.market_ticker)
         if info is None:
-            return None
+            return None                                    # not a market we track: Kalshi's own book may price it
         canon = self._canonical(MarketUpdate.from_info(info))
         if canon is None:
-            return None
+            return LEG_BLOCKED
         key, side = canon
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
-        fair = self._fair(sharp) if sharp is not None else None
-        if fair is None:
-            return None
         if self._trade_blocked(key[:3], "maker"):          # live, started or about to: a pregame price is wrong
-            return None
+            return LEG_BLOCKED
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+        if sharp is None or not self._same_line(info.line, sharp.line, key[3]):
+            return LEG_BLOCKED                             # an alternate line is never priced as the main line
+        fair = self._fair(sharp)
+        if fair is None:
+            return LEG_BLOCKED
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
         spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
         return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread, books=books or None,
@@ -1711,11 +1714,13 @@ class Supervisor:
         if canon is None:
             return None
         key, side = canon
-        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
-        fair = self._fair(sharp) if sharp is not None else None
-        if fair is None:
-            return None
         if self._trade_blocked(key[:3], "maker"):             # live, started or about to: never a leg
+            return None
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+        if sharp is None or not self._same_line(info.line, sharp.line, key[3]):
+            return None                                       # an alternate line is never priced as the main line
+        fair = self._fair(sharp)
+        if fair is None:
             return None
         age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
         spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
@@ -1727,11 +1732,24 @@ class Supervisor:
         self._ledger("SETTLE", venue=venue, kind="PARLAY", position=key, net_profit_usd=pnl)
         self._record_daily_pnl(pnl)
 
+    @staticmethod
+    def _same_line(venue_line: Optional[float], sharp_line: Optional[float], market_type: str) -> bool:
+        """Spreads and totals must be priced at their own number; a missing line on either side is refused."""
+        if market_type not in {"spread", "total"}:
+            return True
+        return venue_line is not None and sharp_line is not None and math.isclose(venue_line, sharp_line)
+
+    def parlay_liability(self) -> float:
+        books = [q.book for q in (self.combo, getattr(self, "novig_rfq", None)) if q is not None]
+        return round(sum(b.total() for b in books), 2)
+
     def _combo_block_reason(self) -> Optional[str]:
         if self._loss_halted():
             return "daily loss stop"
         if self.exposure.taker_halted:
             return "exposure kill-switch"
+        if self.exposure.open_exposure + self.parlay_liability() >= self.exposure.limit:
+            return "global exposure limit (positions + open parlays)"
         return None
 
     # ---------------- correlation + loss controls ----------------
@@ -1850,6 +1868,35 @@ class Supervisor:
         log.warning("GAME_LIVE %s: %s -> no orders, quotes pulled", gid, reason)
         self._ledger("GAME_LIVE", game=list(gid), reason=reason, minutes_to_start=self.minutes_to_start(gid))
         self._spawn(self._pull_game_quotes(gid, f"game live: {reason}"))
+
+    async def recover_novig_fills(self) -> int:
+        """Novig's private stream lost messages: read every working Novig order's record and book fills we
+        missed (at the order's limit: never better than what we paid)."""
+        recovered = 0
+        for lo in list(self.live_orders.values()):
+            if lo.done or lo.venue != "novig":
+                continue
+            gw = self.maker_gateway if lo.kind == "MAKER" else self.order_gateway
+            if not hasattr(gw, "filled_so_far"):
+                continue
+            try:
+                order = await gw.get_order(lo.exchange_order_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("NOVIG fill recovery: order %s unreadable (%s)", lo.exchange_order_id, exc)
+                continue
+            filled = gw.filled_so_far(order)
+            if filled is None or filled <= lo.filled + 1e-9:
+                continue
+            missed = round(filled - lo.filled, 2)
+            log.critical("NOVIG fill recovery: order %s filled %g, stream showed %g -> booking %g at its limit",
+                         lo.exchange_order_id, filled, lo.filled, missed)
+            status = str((order or {}).get("status") or "PARTIAL")
+            await self.on_fill_slip(FillSlip(order_id=lo.exchange_order_id,
+                                             status=status if status in {"FILLED", "CANCELED"} else "PARTIAL",
+                                             filled_volume=missed, price_cents=lo.limit_price * 100, venue="novig",
+                                             price_is_bought_outcome=True))
+            recovered += 1
+        return recovered
 
     async def on_novig_lifecycle(self, info: MarketInfo, transition: str) -> None:
         """Novig v3 lifecycle: GOLIVE / START mean in play; CLOSE near the start means the same."""
@@ -2786,27 +2833,14 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                               "account)")
         base = env.get("KALSHI_REST_BASE") or (KALSHI_PROD_REST_BASE if prod else DEFAULT_KALSHI_REST_BASE)
 
-        def f(name, default):
-            try:
-                return float(env.get(name) or default)
-            except ValueError:
-                raise ConfigError(f"{name} must be a number") from None
-        kinds = tuple(k.strip().lower() for k in (env.get("COMBO_LIVE_KINDS") or "xgame").split(",") if k.strip())
-        if not set(kinds) <= {"xgame", "sgp"}:
-            raise ConfigError("COMBO_LIVE_KINDS must list xgame and/or sgp")
-        live_leagues = tuple(canonical_league(x.strip()) for x in (env.get("COMBO_LIVE_LEAGUES") or "").split(",")
-                             if x.strip()) or None
-        cfg = ComboConfig(mode=combo_mode, max_legs=int(f("COMBO_MAX_LEGS", 6)),
-                          live_max_legs=int(f("COMBO_LIVE_MAX_LEGS", 4)), live_kinds=kinds, live_leagues=live_leagues,
-                          max_disagreement=f("COMBO_MAX_DISAGREEMENT", 0.03),
-                          min_size_factor=f("COMBO_MIN_SIZE_FACTOR", 0.25),
-                          base_margin=f("COMBO_BASE_MARGIN", 0.04),
-                          per_leg_margin=f("COMBO_PER_LEG_MARGIN", 0.02), min_roc=f("COMBO_MIN_ROC", 0.01),
-                          max_loss_per_combo=f("COMBO_MAX_LOSS_PER_COMBO", 25),
-                          max_leg_exposure=f("COMBO_MAX_LEG_EXPOSURE", 150),
-                          max_total_liability=f("COMBO_MAX_TOTAL_LIABILITY", 1000))
+        cfg = parlay_config(env, combo_mode, live_kw.get("live_plan"), venue="kalshi")
+        if combo_mode == "live" and (env.get("KALSHI_LIVE_TRADING") or "0").strip().lower() not in {"1", "true",
+                                                                                                  "yes", "on"}:
+            raise ConfigError("COMBO_QUOTER=live also needs KALSHI_LIVE_TRADING=1 (the second gate for real money "
+                              "on Kalshi)")
         kw["combo_quoter"] = ComboQuoter(cfg, KalshiComms(KalshiOrderGateway(base, key_id, load_private_key(key_path))),
                                          leg_fair=lambda leg: None, research=kw.get("research"))
+        kw["combo_quoter"].requesters.attach(Path(env.get("TRADING_LOG_DIR", "logs")) / "combo_requesters.json")
     rfq_mode = (env.get("NOVIG_RFQ") or "off").strip().lower()
     if rfq_mode not in {"off", "shadow", "qa", "live"}:
         raise ConfigError("NOVIG_RFQ must be off, shadow, qa or live")
@@ -2821,20 +2855,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
             raise ConfigError(f"NOVIG_RFQ: {exc} (Novig gives these at LP onboarding)") from None
         rfq_host = env.get("NOVIG_RFQ_HOST") or (RFQ_QA if rfq_mode == "qa" else RFQ_PROD)
 
-        def g(name, default):
-            try:
-                return float(env.get(name) or default)
-            except ValueError:
-                raise ConfigError(f"{name} must be a number") from None
-        kinds = tuple(k.strip().lower() for k in (env.get("COMBO_LIVE_KINDS") or "xgame").split(",") if k.strip())
-        rcfg = ComboConfig(mode=rfq_mode, max_legs=int(g("COMBO_MAX_LEGS", 6)),
-                           live_max_legs=int(g("COMBO_LIVE_MAX_LEGS", 4)), live_kinds=kinds,
-                           base_margin=g("COMBO_BASE_MARGIN", 0.04), per_leg_margin=g("COMBO_PER_LEG_MARGIN", 0.02),
-                           min_roc=g("COMBO_MIN_ROC", 0.01),
-                           max_loss_per_combo=g("NOVIG_RFQ_MAX_LOSS_PER_COMBO", g("COMBO_MAX_LOSS_PER_COMBO", 25)),
-                           max_leg_exposure=g("NOVIG_RFQ_MAX_LEG_EXPOSURE", g("COMBO_MAX_LEG_EXPOSURE", 150)),
-                           max_total_liability=g("NOVIG_RFQ_MAX_TOTAL_LIABILITY",
-                                                 g("COMBO_MAX_TOTAL_LIABILITY", 1000)))
+        rcfg = parlay_config(env, rfq_mode, live_kw.get("live_plan"), venue="novig")
         kw["novig_rfq"] = NovigRfqQuoter(rcfg, auth, rfq_host)
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
@@ -2864,6 +2885,56 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         v3["positions"].watch = lambda: [leg.outcome_id for pos in sup.positions.values() for leg in pos.legs
                                          if leg.venue == "novig"]
     return sup
+
+
+PARLAY_CEILINGS = dict(max_loss_per_combo=1000.0, max_leg_exposure=5000.0, max_game_exposure=10000.0,
+                       max_total_liability=15000.0)          # hard limits, whatever the settings say
+PARLAY_CANARY = dict(max_loss_per_combo=10.0, max_leg_exposure=50.0, max_game_exposure=50.0,
+                     max_total_liability=100.0)              # until LIVE_SCALE_APPROVED_BY
+
+
+def parlay_config(env, mode: str, plan, venue: str):
+    """ComboConfig for one parlay quoter. Real-money modes start at the canary caps (like every other strategy)
+    until LIVE_SCALE_APPROVED_BY; no setting can exceed the hard ceilings; non-numbers and NaN are refused."""
+    from combo_quoter import ComboConfig
+
+    def num(name, default, lo=0.0, hi=float("inf")):
+        raw = env.get(name)
+        try:
+            v = float(raw) if raw not in (None, "") else float(default)
+        except ValueError:
+            raise ConfigError(f"{name} must be a number") from None
+        if not math.isfinite(v) or not lo <= v <= hi:
+            raise ConfigError(f"{name}={raw!r} must be a finite number in [{lo:g}, {hi:g}]")
+        return v
+
+    def cap(field, name, default):
+        venue_name = f"NOVIG_RFQ_{name[6:]}" if venue == "novig" else None
+        v = num(venue_name, None, 0.01, PARLAY_CEILINGS[field]) if venue_name and env.get(venue_name) else \
+            num(name, default, 0.01, PARLAY_CEILINGS[field])
+        if mode == "live" and not (plan is not None and plan.scaled_up):
+            if v > PARLAY_CANARY[field]:
+                log.warning("PARLAY %s %s=$%g clamped to the canary $%g (LIVE_SCALE_APPROVED_BY not set)",
+                            venue, name, v, PARLAY_CANARY[field])
+            v = min(v, PARLAY_CANARY[field])
+        return v
+
+    kinds = tuple(k.strip().lower() for k in (env.get("COMBO_LIVE_KINDS") or "xgame").split(",") if k.strip())
+    if not kinds or not set(kinds) <= {"xgame", "sgp"}:
+        raise ConfigError("COMBO_LIVE_KINDS must list xgame and/or sgp")
+    live_leagues = tuple(canonical_league(x.strip()) for x in (env.get("COMBO_LIVE_LEAGUES") or "").split(",")
+                         if x.strip()) or None
+    return ComboConfig(
+        mode=mode, max_legs=int(num("COMBO_MAX_LEGS", 6, 2, 20)), live_max_legs=int(num("COMBO_LIVE_MAX_LEGS", 4, 2, 20)),
+        live_kinds=kinds, live_leagues=live_leagues,
+        max_disagreement=num("COMBO_MAX_DISAGREEMENT", 0.03, 0, 0.2),
+        min_size_factor=num("COMBO_MIN_SIZE_FACTOR", 0.25, 0.01, 1),
+        base_margin=num("COMBO_BASE_MARGIN", 0.04, 0, 1), per_leg_margin=num("COMBO_PER_LEG_MARGIN", 0.02, 0, 1),
+        min_roc=num("COMBO_MIN_ROC", 0.01, 0, 1),
+        max_loss_per_combo=cap("max_loss_per_combo", "COMBO_MAX_LOSS_PER_COMBO", 25),
+        max_leg_exposure=cap("max_leg_exposure", "COMBO_MAX_LEG_EXPOSURE", 150),
+        max_game_exposure=cap("max_game_exposure", "COMBO_MAX_GAME_EXPOSURE", 300),
+        max_total_liability=cap("max_total_liability", "COMBO_MAX_TOTAL_LIABILITY", 1000))
 
 
 def novig_v3_from_env(env) -> Optional[dict]:
@@ -2916,9 +2987,9 @@ def novig_v3_from_env(env) -> Optional[dict]:
 
     return dict(client=client, feed=feed, registry=registry,
                 order_gateway=NovigV3OrderGateway(NovigV3Client(host, signer), sibling, "IOC",
-                                                  on_order=feed.own_orders.add),
+                                                  on_order=feed.mark_own),
                 maker_gateway=NovigV3OrderGateway(NovigV3Client(host, signer), sibling, "GTT", ttl_ms=ttl,
-                                                  on_order=feed.own_orders.add),
+                                                  on_order=feed.mark_own),
                 positions=NovigV3PositionsClient(NovigV3Client(host, signer), market_of=market_of))
 
 

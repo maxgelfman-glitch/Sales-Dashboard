@@ -306,7 +306,9 @@ async def test_positions_and_grades():
     assert [(p.outcome_id, p.contracts, p.cost_usd) for p in opened] == [("w", 3.0, 1.95), ("f", 1.0, 0.5)]
     settled = {p.outcome_id: p for p in await pc.settled_positions()}
     assert settled["w"].result == "WIN" and settled["w"].contracts == 3.0
-    assert settled["f"].result == "FMV" and settled["f"].payout_usd == 0.73       # fair value, not a win
+    assert settled["f"].result == "FMV" and settled["f"].settle_value == 0.731     # fair value, not a win
+    from settlement import settlement_pnl
+    assert settlement_pnl(settled["f"], 0.5)[0] == pytest.approx(0.23, abs=0.01)  # 1 x 0.731 - 0.50
     assert await pc.settled_positions() == []                                     # never twice
 
 
@@ -360,3 +362,41 @@ async def test_live_start_cancels_orders_left_from_earlier_sessions(novig_server
         assert seen[-1][:3] == ("DELETE", "/v3/orders", "")
     finally:
         await gw.close()
+
+
+async def test_own_order_seen_after_its_book_add_is_removed_at_once():
+    feed, updates, *_ = _feed()
+    await feed._handle_raw(json.dumps({"snapshot": {"m-ml": {"book": {"seq": 1, "orders": {
+        "o-kc": [{"order": "mine", "price": "0.335", "qty": 180}]}}}}}))
+    assert feed.latest["o-buf"].price == 0.665                           # our bid shows as liquidity...
+    feed.mark_own("mine")
+    await asyncio.sleep(0)
+    assert "o-buf" not in feed.latest                                    # ...until we recognise it
+
+
+def test_spread_names_that_contradict_the_strike_are_skipped():
+    events, markets = _catalog()
+    markets[1]["outcomes"] = [{"outcomeId": "s-kc", "name": "Kansas City Chiefs -3.5"},
+                              {"outcomeId": "s-buf", "name": "Buffalo Bills +3.5"}]    # opposite of strike -3.5 home
+    assert not {"s-kc", "s-buf"} & {r.outcome_id for r in nv.build_market_infos(events, markets)}
+    assert nv._line_in_name("Buffalo Bills -3.5") == -3.5 and nv._line_in_name("Over 48.5") is None
+
+
+async def test_lost_fills_are_recovered_from_order_records(tmp_path):
+    from main_supervisor import LiveOrder
+    sup = build_live_supervisor({"NOVIG_KEY_ID": "kid", "NOVIG_PRIVATE_KEY_PATH": _pem(tmp_path),
+                                 "TRADING_MODE": "live", "LIVE_TRADING_ACKNOWLEDGED": "yes",
+                                 "TRADING_LOG_DIR": str(tmp_path), "RESEARCH_ENABLED": "0"})
+    sup.live_orders["x1"] = LiveOrder(exchange_order_id="x1", kind="MAKER", outcome_id="o", key=("NFL", "a", "b", "m"),
+                                      requested=5, limit_price=0.4, maker_side="buy", fill_mode="incremental")
+    booked = []
+
+    async def get_order(oid):
+        return {"status": "OPEN", "qty": 500, "remaining": 200}           # 3 engine contracts filled
+    sup.maker_gateway.get_order = get_order
+
+    async def capture(slip):
+        booked.append(slip)
+    sup.on_fill_slip = capture
+    assert await sup.recover_novig_fills() == 1
+    assert booked[0].filled_volume == 3.0 and booked[0].price_cents == 40.0 and booked[0].status == "PARTIAL"

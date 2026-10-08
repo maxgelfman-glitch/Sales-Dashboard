@@ -281,6 +281,12 @@ def parse_matchup(description: str) -> Optional[tuple[str, str]]:
     return None
 
 
+def _line_in_name(name: str) -> Optional[float]:
+    """'Buffalo Bills -3.5' -> -3.5; 'Bills +3' -> 3.0; no signed number -> None."""
+    m = re.search(r"(?<![\w.])([+-]\d+(?:\.\d+)?)\s*$", (name or "").strip())
+    return float(m.group(1)) if m else None
+
+
 def _strip_line(name: str) -> str:
     return re.sub(r"[+-]?\d+(\.\d+)?", " ", name or "").replace("(", " ").replace(")", " ").strip()
 
@@ -360,6 +366,9 @@ def build_market_infos(events: list[dict], markets: list[dict]) -> list[MarketIn
                     side = _side_of(league, name, home, away)
                     team = home if side == "home" else away if side == "away" else None
                     line = None if mtype == "MONEY" else (float(strike) if side == "home" else -float(strike))
+                    shown = _line_in_name(name) if mtype == "SPREAD" else None
+                    if shown is not None and line is not None and abs(shown - line) > 1e-9:
+                        side = None                     # the name says otherwise: home/away is wrong, skip it
                     labelled.append((o, side, team, line))
             if len({s for _, s, _, _ in labelled}) != 2 or any(s is None for _, s, _, _ in labelled):
                 skip(f"{mtype} outcomes not matched to sides")
@@ -457,6 +466,13 @@ class NovigV3OrderGateway:
             raise
 
     @staticmethod
+    def filled_so_far(order: Optional[dict]) -> Optional[float]:
+        """Engine contracts filled so far, whatever the order's status (None if unreadable)."""
+        if not order or order.get("qty") is None:
+            return None
+        return from_novig_qty(float(order.get("qty", 0)) - float(order.get("remaining", 0)))
+
+    @staticmethod
     def filled_count(order: Optional[dict]) -> Optional[float]:
         """Engine contracts filled, but only once the order is final (otherwise None)."""
         if not order or order.get("status") not in {"FILLED", "CANCELED", "REJECTED"}:
@@ -489,15 +505,19 @@ class NovigV3PositionsClient:
     async def open_positions(self) -> list[ExchangePosition]:
         data = await self.client.request("GET", "/v3/account/positions") or {}
         out = []
+        seen: set[str] = set()
         for p in data.get("positions") or []:
             qty = float(p.get("qty") or 0)
             if qty <= 0:
                 continue
             oid = str(p["outcomeId"])
+            seen.add(oid)
             self.held[oid] = {"marketId": p.get("marketId"), "qty": qty, "cost": float(p.get("cost") or 0)}
             out.append(ExchangePosition(settlement_id=f"novig-open-{oid}", outcome_id=oid,
                                         market_id=p.get("marketId"), contracts=from_novig_qty(qty),
                                         cost_usd=float(p.get("cost") or 0), status="OPEN"))
+        for oid in set(self.held) - seen:           # gone from the open list: settled, neutralized or sold.
+            self.held[oid]["gone"] = True           # keep it for grading, but its old quantity is no longer trusted
         return out
 
     async def settled_positions(self) -> list[ExchangePosition]:
@@ -522,14 +542,20 @@ class NovigV3PositionsClient:
             if status in (None, "TBD"):
                 continue
             held = self.held.get(oid) or {}
-            contracts = from_novig_qty(held.get("qty", 0))
+            contracts = 0.0 if held.get("gone") else from_novig_qty(held.get("qty", 0))   # 0: the engine's count: the engine's own count is used
+            value = None
             if status in {"WIN", "LOSS", "PUSH"}:
-                result, payout = status, None
+                result = status
             else:                                   # graded at fair market value: a price, not a win
-                result, payout = "FMV", round(contracts * float(status), 2)
+                try:
+                    value = float(status)
+                except ValueError:
+                    log.critical("SETTLEMENT novig outcome %s has an unreadable grade %r", oid, status)
+                    continue
+                result = "FMV"
             out.append(ExchangePosition(settlement_id=f"novig-settle-{oid}", outcome_id=oid, market_id=mid,
                                         contracts=contracts, cost_usd=held.get("cost"), status="SETTLED",
-                                        result=result, payout_usd=payout, settled_at=time.time()))
+                                        result=result, settle_value=value, settled_at=time.time()))
         for p in out:
             self.held.pop(p.outcome_id, None)
         return out
@@ -587,8 +613,23 @@ class NovigV3Feed(ResilientWebSocketFeed):
         self._pending: dict[int, list[str]] = {}            # request nonce -> markets it asked for (until acked)
         self._resync: set[str] = set()                      # markets whose book had a gap: re-snapshot pending
         self._maintenance: Optional[asyncio.Task] = None
+        self.on_private_gap: Optional[Callable[[], Union[None, Awaitable[None]]]] = None   # lost fills: recover
         self._tokens, self._tokens_at = float(STREAM_CAPACITY), time.monotonic()
         self._ws_conn = None
+
+    def mark_own(self, order_id: str) -> None:
+        """Our order (from the 201 or the private stream): never liquidity for us. If its book `add` already
+        arrived, re-publish that market now, without it."""
+        if order_id in self.own_orders:
+            return
+        self.own_orders.add(order_id)
+        for mid, b in self.books.items():
+            if order_id in b.orders:
+                try:
+                    asyncio.get_running_loop().create_task(self._emit_market(mid))
+                except RuntimeError:
+                    pass
+                break
 
     # ---- connection ----
     def _headers(self) -> Optional[dict[str, str]]:
@@ -763,8 +804,11 @@ class NovigV3Feed(ResilientWebSocketFeed):
             seq = hb.get("orders")
             if isinstance(seq, int) and seq > self._orders_seq:
                 log.critical("NOVIG private orders: heartbeat seq %d > last %d — a fill message was lost; "
-                             "re-snapshotting", seq, self._orders_seq)
+                             "re-snapshotting and recovering fills from the order records", seq, self._orders_seq)
+                self._orders_seq = seq
                 await self._request_snapshot({"private": ["orders"]})
+                if self.on_private_gap is not None:
+                    await safe_call(self.on_private_gap, logger=log)
 
     async def _request_snapshot(self, selection: dict) -> None:
         if self._ws_conn is not None:
@@ -863,20 +907,22 @@ class NovigV3Feed(ResilientWebSocketFeed):
         seq = orders.get("seq")
         if "open" in orders:                                     # snapshot
             for o in orders.get("open") or []:
-                self.own_orders.add(str(o.get("orderId")))
+                self.mark_own(str(o.get("orderId")))
             self._orders_seq = seq if isinstance(seq, int) else self._orders_seq
             return
         if isinstance(seq, int):
             if self._orders_seq is not None and seq > self._orders_seq + 1:
-                log.critical("NOVIG private orders gap: seq %d after %d — re-snapshotting; check fills via "
-                             "GET /v3/portfolio/fills", seq, self._orders_seq)
+                log.critical("NOVIG private orders gap: seq %d after %d — re-snapshotting and recovering fills from "
+                             "the order records", seq, self._orders_seq)
                 await self._request_snapshot({"private": ["orders"]})
+                if self.on_private_gap is not None:
+                    await safe_call(self.on_private_gap, logger=log)
             self._orders_seq = seq
         for ev in orders.get("deltas") or []:
             slip = event_to_slip(ev)
             kind = ev.get("kind")
             if kind == "open":
-                self.own_orders.add(str(ev.get("orderId")))
+                self.mark_own(str(ev.get("orderId")))
             elif kind in {"cancel", "reject"} or (kind == "fill" and ev.get("remaining") == 0):
                 self.own_orders.discard(str(ev.get("orderId")))
             if slip is not None and self.on_slip is not None:

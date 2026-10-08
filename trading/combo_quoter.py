@@ -45,6 +45,7 @@ maker fee on RFQ fills. Endpoints and fields are from Kalshi's published OpenAPI
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import re
@@ -55,6 +56,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 log = logging.getLogger("trading.combos")
 
+LEG_BLOCKED = object()       # leg_fair() result: the engine knows this leg and refuses it (live, cut off, line
+                             # mismatch, no fresh sharp line). Never fall back to Kalshi's own book for it.
 MAKER_FEE_RATE = 0.035                                   # combo makers: half the 0.07 taker rate (2026-08-20)
 LEAGUE_LEG_MARGIN = {"NFL": 0.0, "NBA": 0.005, "MLB": 0.005, "NHL": 0.005, "WNBA": 0.01, "NCAAF": 0.01,
                      "NCAAB": 0.01, "TENNIS": 0.01}
@@ -145,6 +148,9 @@ class ComboConfig:
     requester_widen_margin: float = 0.04
     requester_block_roi: float = 0.15        # ... above this -> decline
     max_book_spread: float = 0.03
+    min_book_size: float = 100.0             # contracts on BOTH sides of a Kalshi book before its mid is used
+    live_book_legs: bool = False             # legs priced only from Kalshi's own book: shadow-only by default
+                                             # (a thin book can be painted to move its mid against us)
     max_horizon_h: float = 36.0
     max_loss_per_combo: float = 25.0
     max_leg_exposure: float = 150.0
@@ -153,6 +159,7 @@ class ComboConfig:
     settle_after_start_h: float = 4.0        # a leg's game is decided this long after its start (horizon check)
     book_fetches_per_step: int = 10          # REST budget: Kalshi single-market lookups per poll
     followups_per_step: int = 10             # REST budget: trade-price follow-ups per poll
+    results_per_check: int = 50              # REST budget: settlement lookups per results check
     max_open_quotes: int = 20                # Kalshi: each open quote is polled every step (REST budget, and a
                                              # win must be seen inside the confirm window)
     quote_ttl_s: float = 10.0
@@ -190,7 +197,7 @@ def maker_fee(contracts: int, price: float, rate: float = MAKER_FEE_RATE) -> flo
 
 
 def parse_legs(rfq: dict) -> list[Leg]:
-    return [Leg(str(l.get("market_ticker")), str(l.get("event_ticker") or ""), str(l.get("side") or "yes").lower())
+    return [Leg(str(l.get("market_ticker")), str(l.get("event_ticker") or ""), str(l.get("side") or "").lower())
             for l in rfq.get("mve_selected_legs") or [] if isinstance(l, dict) and l.get("market_ticker")]
 
 
@@ -206,9 +213,22 @@ class RequesterBook:
     """How each RFQ creator has done as a TAKER against our prices (real fills and would-have-won shadow quotes).
     Sportsbooks limit winners; we cannot refuse anyone, so we widen or decline instead."""
 
-    def __init__(self, cfg: ComboConfig) -> None:
+    def __init__(self, cfg: ComboConfig, path=None) -> None:
         self.cfg = cfg
         self.record: dict[str, list[float]] = {}           # creator id -> [n, taker pnl $, taker stake $]
+        self.path = None
+        if path is not None:
+            self.attach(path)
+
+    def attach(self, path) -> None:
+        """Keep the record on disk: a restart must not wipe what we learned about sharp requesters."""
+        from pathlib import Path
+        import json as _json
+        self.path = Path(path)
+        try:
+            self.record.update({k: list(v) for k, v in _json.loads(self.path.read_text()).items()})
+        except (OSError, ValueError):
+            pass
 
     def add(self, creator: Optional[str], taker_pnl: float, taker_stake: float) -> None:
         if not creator:
@@ -217,6 +237,15 @@ class RequesterBook:
         r[0] += 1
         r[1] += taker_pnl
         r[2] += taker_stake
+        if self.path is not None:
+            import json as _json
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(_json.dumps(self.record))
+                tmp.replace(self.path)
+            except OSError as exc:
+                log.warning("COMBO requester record not saved: %s", exc)
 
     def roi(self, creator: Optional[str]) -> Optional[float]:
         r = self.record.get(creator or "")
@@ -248,6 +277,8 @@ class ComboPricer:
         skip = lambda why, **kw: ComboPrice(action="SKIP", reason=why, legs=legs, **kw)  # noqa: E731
         if not legs:
             return skip("not a combo (no legs)")
+        if any(leg.side not in {"yes", "no"} for leg in legs):
+            return skip("a leg has no clear side (yes/no)")
         if len(legs) > cfg.max_legs:
             return skip(f"{len(legs)} legs > max {cfg.max_legs}")
         if expires_at is not None and expires_at - time.time() > cfg.max_horizon_h * 3600:
@@ -255,7 +286,7 @@ class ComboPricer:
         fairs: list[LegFair] = []
         for leg in legs:
             lf = self.leg_fair(leg)
-            if lf is None:
+            if lf is None or lf is LEG_BLOCKED:
                 return skip(f"no fair value for leg {leg.market_ticker}")
             if lf.age_s > cfg.max_leg_age_s:
                 return skip(f"stale fair value for leg {leg.market_ticker} ({lf.age_s:.0f}s)")
@@ -275,11 +306,12 @@ class ComboPricer:
                 ids.add(("c", code))
             if lf.game is not None:
                 ids.add(("g", tuple(lf.game)))
-            hit = next((g for g in groups if g & ids), None)
-            if hit is None:
-                groups.append(set(ids))
-            else:
-                hit |= ids
+            ids.add(("leg", leg.market_ticker, leg.side))
+            merged = set(ids)
+            for g in [g for g in groups if g & ids]:        # a leg can join two groups: merge them all
+                merged |= g
+                groups.remove(g)
+            groups.append(merged)
         same_game_extra = len(legs) - len(groups)
         same_game = same_game_extra > 0
         leagues = [lf.game[0] if lf.game else league_of(leg.market_ticker) for leg, lf in zip(legs, fairs)]
@@ -315,7 +347,7 @@ class ComboPricer:
                             sportsbook_yes=sb)
             if same_game or uncertainty >= cfg.sportsbook_when_uncertain:
                 yes_price = max(yes_price, sb * (1 - cfg.sportsbook_discount))
-        yes_price = round(min(yes_price, 0.99), 4)
+        yes_price = min(math.ceil(yes_price * 10_000 - 1e-6) / 10_000, 0.99)   # round UP: never the user's way
         no_bid = round(1 - yes_price, 4)
         span = max(cfg.uncertainty_full_cut, 1e-9)
         size_factor = round(max(cfg.min_size_factor, 1 - (1 - cfg.min_size_factor) * min(1.0, uncertainty / span)), 3)
@@ -340,6 +372,8 @@ class ComboPricer:
 
     def live_allowed(self, cp: ComboPrice) -> Optional[str]:
         """None if this slice may be quoted for real; otherwise why it stays shadow-only."""
+        if not self.cfg.live_book_legs and any(src != "sharp" for src in cp.sources):
+            return f"slice {cp.slice} is shadow-only (a leg priced from Kalshi's own book)"
         if len(cp.legs) > self.cfg.live_max_legs:
             return f"slice {cp.slice} is shadow-only (more than {self.cfg.live_max_legs} legs)"
         kind = "sgp" if cp.same_game else "xgame"
@@ -470,10 +504,15 @@ class ComboQuoter:
 
         def fair(leg: Leg) -> Optional[LegFair]:
             lf = primary(leg)
+            if lf is LEG_BLOCKED:
+                return None                               # known to the engine and refused: no book fallback
             if lf is not None:
                 return lf
             hit = self._book_cache.get(leg.market_ticker)
-            return None if hit is None else hit[1]
+            if hit is None or hit[1] is None:
+                return None
+            age = self.clock() - hit[0]
+            return dataclasses.replace(hit[1], age_s=age)  # its real age: stale mids fail max_leg_age_s
         return fair
 
     async def _refresh_book_fairs(self, legs: list[Leg]) -> None:
@@ -483,7 +522,7 @@ class ComboQuoter:
         now = self.clock()
         for leg in legs:
             if getattr(self, "_primary", None) is not None and self._primary(leg) is not None:
-                continue                                  # the sharp line prices it: no API call needed
+                continue                                  # the sharp line prices it (or the engine refuses it)
             cached = self._book_cache.get(leg.market_ticker)
             if cached is not None and now - cached[0] < (5 if cached[1] is not None else 60):
                 continue
@@ -496,9 +535,12 @@ class ComboQuoter:
                 log.debug("COMBO leg %s market fetch failed: %s", leg.market_ticker, exc)
                 continue
             bid, ask = _num(m.get("yes_bid_dollars")), _num(m.get("yes_ask_dollars"))
+            bid_n, ask_n = _num(m.get("yes_bid_size_fp")), _num(m.get("yes_ask_size_fp"))
+            deep = (bid_n is None or bid_n >= self.cfg.min_book_size) and (ask_n is None or ask_n >= self.cfg.min_book_size)
             lf = None
-            if bid and ask and 0 < bid < ask < 1 and ask - bid <= self.cfg.max_book_spread:
-                lf = LegFair(prob_yes=(bid + ask) / 2, source="kalshi_book", age_s=0.0)
+            if bid and ask and 0 < bid < ask < 1 and ask - bid <= self.cfg.max_book_spread and deep:
+                # the width counts as disagreement, so a wider book adds margin
+                lf = LegFair(prob_yes=(bid + ask) / 2, source="kalshi_book", age_s=0.0, spread=ask - bid)
             self._book_cache[leg.market_ticker] = (now, lf)
 
     async def restore(self) -> float:
@@ -513,7 +555,15 @@ class ComboQuoter:
             if not ticker.startswith("KXMVE") or not held or held >= 0:
                 continue
             exposure = _num(p.get("market_exposure_dollars")) or 0.0
-            self.book.open[f"restored-{ticker}"] = ([], exposure)
+            key = f"restored-{ticker}"
+            if key in self.book.open:
+                continue
+            self.book.open[key] = ([], exposure)
+            n = abs(held)
+            no = min(max(exposure / n, 0.0001), 0.9999)
+            cp = ComboPrice(action="QUOTE", reason="restored", contracts=n, no_bid=round(no, 4),
+                            yes_price=round(1 - no, 4), fee=0.0, slice="restored")
+            self.positions[key] = dict(price=cp, ticker=ticker, at=self.clock(), creator=None)   # settles normally
             total += exposure
         if total:
             log.warning("COMBO restored $%.2f of open short-parlay liability from Kalshi (legs unknown: total cap "
@@ -557,12 +607,15 @@ class ComboQuoter:
         await self._refresh_book_fairs(legs)
         cp = self.pricer.price(rfq)                    # horizon from the legs' start times when all are known
         if cp.action == "QUOTE" and not all((self.pricer.leg_fair(l) or LegFair(0.5, "", 0)).start for l in legs):
-            try:                                       # some leg has no start time: ask Kalshi when it settles
-                expires = _ts((await self.comms.market(rfq.get("market_ticker"))).get("expected_expiration_time"))
-            except Exception:  # noqa: BLE001
-                expires = None
-            if expires is not None:
-                cp = self.pricer.price(rfq, expires)
+            expires = None                             # some leg has no start time: ask Kalshi when it settles
+            if self._fetch_budget > 0:
+                self._fetch_budget -= 1
+                try:
+                    expires = _ts((await self.comms.market(rfq.get("market_ticker"))).get("expected_expiration_time"))
+                except Exception:  # noqa: BLE001
+                    expires = None
+            cp = self.pricer.price(rfq, expires) if expires is not None else dataclasses.replace(
+                cp, action="SKIP", reason="settlement time unknown (horizon cannot be checked)")
         blocked = self.allowed()
         if cp.action == "QUOTE" and blocked:
             cp.action, cp.reason = "SKIP", blocked
@@ -581,7 +634,7 @@ class ComboQuoter:
                     fee_exempt=cp.fee_exempt, uncertainty=cp.uncertainty, size_factor=cp.size_factor,
                     sportsbook_yes=cp.sportsbook_yes, creator_id=rfq.get("creator_id"))
         if cp.action == "QUOTE":
-            self.priced[str(rfq.get("id"))] = dict(rfq=rfq, price=cp, at=self.clock(), followed=False)
+            self.priced[str(rfq.get("id"))] = dict(rfq=rfq, price=cp, at=self.clock(), followed=False, sent=False)
             if self.cfg.mode in {"demo", "live"}:
                 try:
                     qid = await self.comms.create_quote(str(rfq.get("id")), 0.0, cp.no_bid)
@@ -593,30 +646,32 @@ class ComboQuoter:
                 # how many we can have out at once. The caps are enforced at the last look, where the liability
                 # becomes real (and one event loop confirms one at a time, so two wins cannot both slip under).
                 self.quotes[qid] = dict(rfq=rfq, price=cp, created=self.clock())
+                self.priced[str(rfq.get("id"))]["sent"] = True   # a real quote settles as a position, not shadow
                 self._count("quotes_sent")
         return cp
 
     async def _manage_quotes(self) -> None:
         now = self.clock()
         for qid, q in list(self.quotes.items()):
-            try:
+            try:                                       # one quote's failure never stops the others
                 info = await self.comms.get_quote(qid)
+                status = str(info.get("status") or "").lower()
+                if status == "accepted" and not q.get("confirm_sent"):
+                    await self._last_look(qid, q, info)
+                elif status == "executed":
+                    self._executed(qid, q, info)
+                elif status in {"cancelled", "canceled", "expired"}:
+                    self._drop(qid, f"{status} by venue/requester")
+                elif q.get("confirm_sent"):
+                    pass                               # confirmed: waiting for execution; reservation stays
+                elif now - q["created"] > self.cfg.quote_ttl_s:
+                    try:
+                        await self.comms.delete_quote(qid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._drop(qid, "expired (TTL)")
             except Exception as exc:  # noqa: BLE001
-                log.debug("COMBO quote %s status failed: %s", qid, exc)
-                continue
-            status = str(info.get("status") or "").lower()
-            if status == "accepted":
-                await self._last_look(qid, q, info)
-            elif status in {"executed", "confirmed"}:
-                self._executed(qid, q, info)
-            elif status == "cancelled":
-                self._drop(qid, "cancelled by venue/requester")
-            elif now - q["created"] > self.cfg.quote_ttl_s:
-                try:
-                    await self.comms.delete_quote(qid)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._drop(qid, "expired (TTL)")
+                log.warning("COMBO quote %s handling failed (continuing with the others): %s", qid, exc)
 
     async def _last_look(self, qid: str, q: dict, info: dict) -> None:
         """Re-price every leg NOW. Confirm only if the combo still clears the last-look margin on fresh data."""
@@ -624,17 +679,19 @@ class ComboQuoter:
         old: ComboPrice = q["price"]
         await self._refresh_book_fairs(old.legs)
         fresh = self.pricer.price({**q["rfq"]})
-        ok = (side == "yes" and fresh.fair is not None and old.yes_price is not None
-              and old.yes_price >= fresh.fair * (1 + self.cfg.last_look_min_margin)
-              and not fresh.reason.startswith(("stale", "no fair")))
+        net_yes = None if old.yes_price is None else old.yes_price - (old.fee / old.contracts if old.contracts else 0)
+        ok = (side == "yes" and fresh.fair is not None and net_yes is not None
+              and net_yes >= fresh.fair * (1 + self.cfg.last_look_min_margin)        # after the maker fee
+              and not fresh.reason.startswith(("stale", "no fair", "sharp books disagree", "a leg has no")))
         blocked = self.allowed() or self.book.check(old, exclude=qid)
         if ok and not blocked:
             self.book.add(qid, old)                    # reserved BEFORE the await: the next last look sees it
+            q["confirm_sent"] = True                   # never confirm twice; the status poll resolves the outcome
             try:
                 await self.comms.confirm_quote(qid)
-            except Exception:
-                self.book.remove(qid)
-                raise
+            except Exception as exc:  # noqa: BLE001 — it may have gone through: keep the reservation
+                log.critical("COMBO confirm of %s failed (%s): reservation kept until its status resolves", qid, exc)
+                return
             self._count("confirmed")
             self._write("COMBO_CONFIRM", quote_id=qid, rfq_id=q["rfq"].get("id"), yes_price=old.yes_price,
                         fair_then=old.fair, fair_now=fresh.fair, contracts=old.contracts)
@@ -690,8 +747,8 @@ class ComboQuoter:
                         our_yes_price=cp.yes_price, fair=cp.fair, n_trades=len(prices), slice=cp.slice,
                         would_win=None if traded is None else cp.yes_price <= traded + 1e-9,
                         margin_vs_winner=None if traded is None or not cp.fair else round(traded / cp.fair - 1, 4))
-            if traded is None or cp.yes_price > traded + 1e-9:
-                self.priced.pop(rid, None)            # no trade, or ours would have lost: nothing to settle
+            if traded is None or cp.yes_price > traded + 1e-9 or p.get("sent"):
+                self.priced.pop(rid, None)            # nothing to settle in shadow (a real quote settles as a position)
             else:
                 p["await_result"] = True
 
@@ -701,7 +758,7 @@ class ComboQuoter:
         items = [(k, v["rfq"].get("market_ticker"), v["price"], "shadow", v["rfq"].get("creator_id"))
                  for k, v in self.priced.items() if v.get("await_result")]
         items += [(k, v["ticker"], v["price"], "position", v.get("creator")) for k, v in self.positions.items()]
-        for key, ticker, cp, kind, creator in items:
+        for key, ticker, cp, kind, creator in items[:self.cfg.results_per_check]:
             try:
                 m = await self.comms.market(ticker)
             except Exception:  # noqa: BLE001

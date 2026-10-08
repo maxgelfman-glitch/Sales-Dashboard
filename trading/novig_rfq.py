@@ -115,9 +115,20 @@ class NovigRfqRest:
     async def pricer(self) -> dict:
         return await self._req("GET", "/rfq/pricer")
 
-    async def executions(self, status: Optional[str] = None, limit: int = 500) -> list[dict]:
-        q = f"/rfq/executions?limit={limit}" + (f"&status={status}" if status else "")
-        return await self._req("GET", q) or []
+    async def executions(self, status: Optional[str] = None, limit: int = 500, max_rows: int = 50_000) -> list[dict]:
+        """Every execution (newest first), paged with offset; duplicates (rows shifting while paging) removed."""
+        rows, seen, offset = [], set(), 0
+        while offset <= max_rows:
+            q = f"/rfq/executions?limit={limit}&offset={offset}" + (f"&status={status}" if status else "")
+            page = await self._req("GET", q) or []
+            for r in page:
+                if r.get("rfq_id") not in seen:
+                    seen.add(r.get("rfq_id"))
+                    rows.append(r)
+            if len(page) < limit:
+                break
+            offset += limit
+        return rows
 
     async def collateral(self) -> dict:
         return await self._req("GET", "/rfq/collateral")
@@ -172,6 +183,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         self.clock = clock
         self.rounds: dict[str, dict] = {}            # rfq_id -> {legs, price, wager, quoted, closed_at}
         self.positions: dict[str, dict] = {}         # rfq_id -> {price, wager, liability}
+        self._max_wager: dict[str, float] = {}
+        self.confirmed: dict[str, float] = {}        # rfq_id -> when we confirmed (until executed or reconciled)
         self.stats: dict[str, int] = {}
         self._ws_conn = None
 
@@ -257,7 +270,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         if max_wager < max(min_wager, 0.01):
             cp.action, cp.reason = "SKIP", f"caps allow ${max_wager:.2f} < round minimum ${min_wager:.2f}"
             return cp
-        cp.contracts = round(max_wager / price, 4)                      # payout if the parlay hits
+        cp.contracts = max_wager / price                                # payout if the parlay hits
+        self._max_wager[rid] = max_wager                                # sent exactly as computed
         cp.expected_profit = round(cp.contracts * (price - cp.fair), 4)
         cp.roc = round(cp.expected_profit / (cp.contracts * cp.no_bid), 5)
         if cp.roc < self.cfg.min_roc:
@@ -298,7 +312,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                     min_wager=min_wager, expected_profit=cp.expected_profit, roc=cp.roc, slice=cp.slice,
                     same_game=cp.same_game, uncertainty=cp.uncertainty, size_factor=cp.size_factor)
         if cp.action == "QUOTE" and live:
-            wager = math.floor(cp.contracts * cp.yes_price * 100) / 100
+            wager = self._max_wager.pop(rid, math.floor(cp.contracts * cp.yes_price * 100) / 100)
             await self._send("create_quote", {"rfq_id": rid, "price": f"{cp.yes_price:.3f}",
                                               "max_wager": f"{wager:.2f}", "quote_id": f"q-{rid[:8]}"})
             self.rounds[rid]["quoted"] = True               # liability is reserved at the last look, not here:
@@ -345,6 +359,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                 ok = why is None
                 if ok:
                     self.book.add(rid, held)            # before the await: the next last look counts it
+                    self.confirmed[rid] = self.clock()
         await self._send("confirm", {"rfq_id": rid, "quote_id": qid, "confirmed": ok})
         elapsed = time.monotonic() - started
         self._count("confirmed" if ok else "declined_last_look")
@@ -368,6 +383,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                                                    no_bid=round(1 - price, 4), fee=0.0))
         else:
             self.book.open[rid] = ([], liability)         # unknown round (e.g. after a restart): total cap only
+        self.confirmed.pop(rid, None)
         self.positions[rid] = dict(price=price, wager=wager, liability=liability,
                                    fair=None if cp is None else cp.fair, slice=None if cp is None else cp.slice)
         self.rounds.pop(rid, None)
@@ -387,11 +403,32 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
             closed = r.get("closed_at") or (r["created"] + 3.0)
             if now - closed > ACCEPT_GRACE_S:
                 self.rounds.pop(rid, None)
-                if rid not in self.positions:
+                if rid not in self.positions and rid not in self.confirmed:   # a confirm waits for reconcile
                     self.book.remove(rid)
 
     # ------------------------------------------------------------ settlement
+    async def reconcile(self) -> None:
+        """Confirmed trades whose `quote_executed` was lost (dropped frame, reconnect): find them among our open
+        executions; a confirm with no execution after 10 minutes did not trade, so its reservation goes."""
+        if not self.confirmed:
+            return
+        open_ids = {str(r.get("rfq_id")) for r in await self.rest.executions(status="open")}
+        for rid, at in list(self.confirmed.items()):
+            if rid in open_ids:
+                self.confirmed.pop(rid, None)
+                if rid not in self.positions:
+                    self.book.remove(rid)
+                    await self.restore()               # reloads it with its legs, price and wager
+            elif self.clock() - at > 600:
+                self.confirmed.pop(rid, None)
+                self.book.remove(rid)
+                log.warning("NOVIG_RFQ confirm on %s never executed: reservation released", rid)
+
     async def check_results(self) -> int:
+        try:
+            await self.reconcile()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("NOVIG_RFQ reconcile failed: %s", exc)
         if not self.positions:
             return 0
         done = 0
