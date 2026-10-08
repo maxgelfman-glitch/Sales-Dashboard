@@ -59,19 +59,15 @@ def win_fee(venue: str, price: float) -> float:
     return 0.0
 
 
-TIE_LEAGUES = frozenset({"NFL", "MLB", "NHL"})   # moneylines that can end tied (or whose OT rules are unconfirmed)
+TIE_LEAGUES = frozenset({"NFL"})   # moneylines that can end tied (NHL has shootouts; MLB resumes suspended games)
 
 
 def venue_tie_payout(venue: str, price: float) -> float:
     """What one team contract bought at `price` is assumed to pay if the game ends tied, per venue.
-    Kalshi: $1 / number of tied teams = 50c when no Tie market is listed (Kalshi contract terms, NFLGAME/MLBGAME).
-    Novig: UNCONFIRMED; its exchange's filing points to "void at fair value": modelled as a refund of the price
-    paid, never 50c. Every other venue: unconfirmed, so $0 (the worst case)."""
-    if venue == "kalshi":
-        return 0.5
-    if venue == "novig":
-        return price
-    return 0.0
+    Kalshi: $1 / number of tied teams = 50c when no Tie market is listed (Kalshi contract terms, NFLGAME).
+    Every other venue: UNCONFIRMED. Novig's filings describe binary contracts paying $1 or $0 ("void" only under
+    its rules), so a tie may pay nothing: $0, the worst case, until a venue confirms its rule in writing."""
+    return 0.5 if venue == "kalshi" else 0.0
 
 
 def locked_profit(a_venue: str, a_price: float, b_venue: str, b_price: float,

@@ -888,7 +888,8 @@ class ComboQuoter:
             self._write("COMBO_TRADE", rfq_id=rid, market_ticker=ticker, mode=self.cfg.mode, traded_yes_price=traded,
                         our_yes_price=cp.yes_price, fair=cp.fair, n_trades=len(prices), slice=cp.slice,
                         would_win=None if traded is None else cp.yes_price <= traded + 1e-9,
-                        our_margin=None if not cp.fair else round(cp.yes_price / cp.fair - 1, 4),   # what we'd earn
+                        our_margin=None if not cp.fair or not cp.contracts else          # what we'd earn, net of fee
+                        round((cp.yes_price - cp.fee / cp.contracts) / cp.fair - 1, 4),
                         margin_vs_winner=None if traded is None or not cp.fair else round(traded / cp.fair - 1, 4))
             if traded is None or cp.yes_price > traded + 1e-9 or p.get("sent"):
                 self.priced.pop(rid, None)            # nothing to settle in shadow (a real quote settles as a position)

@@ -389,7 +389,7 @@ async def evaluate_kalshi_edge(price_cents: float, sharp_data: Union[SharpQuote,
         base = await evaluate_market_edge(
             NovigQuote(price=cents_to_probability(price_cents), fee_per_contract=fee_pc, line=line, label=label),
             sharp_data)
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         return EdgeDecision(action="PASS", reason=f"invalid input: {exc}")
     if base.action != "BET":
         return base.model_copy(update=dict(reason=f"after Kalshi fee: {base.reason}"))

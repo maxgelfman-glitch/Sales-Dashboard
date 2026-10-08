@@ -194,15 +194,21 @@ def test_pairs_and_hedges_never_join_two_games():
 
 def test_a_broken_or_disagreeing_book_never_creates_a_consensus_edge():
     # Bovada with the teams swapped: averaging it in made a -6.6% bet look like +4.6%
-    book = SharpBook(weights={"*": 1})
+    p = {o: devig_multiplicative([american_to_decimal(o[0]), american_to_decimal(o[1])])[0][0]
+         for o in ((-150, 130), (-155, 135))}
+    book = SharpBook(weights={"pinnacle": 2, "*": 1})
     book.ingest([line("Pinnacle", -150, 130), line("DraftKings", -155, 135), line("Bovada", 130, -150)])
-    assert book.lookup(*KEY) is None
+    got = book.lookup(*KEY)                                            # swapped Bovada dropped, never averaged in
+    assert got.source == "consensus:draftkings+pinnacle"
+    assert fair_of(got) == pytest.approx((2 * p[(-150, 130)] + p[(-155, 135)]) / 3, abs=1e-4)
     # a -1000/-1000 book (overround 1.82) is left out instead of being blended into a clean-looking line
-    book = SharpBook(weights={"*": 1})
+    book = SharpBook(weights={"pinnacle": 2, "*": 1})
     book.ingest([line("Pinnacle", -150, 130), line("Junk", -1000, -1000)])
-    assert book.lookup(*KEY).source == "consensus:junk+pinnacle"
-    assert fair_of(book.lookup(*KEY)) == pytest.approx(
-        devig_multiplicative([american_to_decimal(-150), american_to_decimal(130)])[0][0], abs=1e-4)
+    assert book.lookup(*KEY).source == "Pinnacle"
+    # the anchor itself broken: no price at all
+    book = SharpBook(weights={"pinnacle": 2, "*": 1})
+    book.ingest([line("Pinnacle", -1000, -1000), line("Circa", -150, 130)])
+    assert book.lookup(*KEY) is None
 
 
 def test_an_extreme_longshot_consensus_is_refused_not_clamped():

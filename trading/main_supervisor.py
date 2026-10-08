@@ -314,7 +314,8 @@ GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — ve
 
 
 SAME_GAME_WINDOW_SECONDS = 2 * 3600       # two venues' start times for one game agree within this
-DOUBLEHEADER_SECONDS = 20 * 3600          # one matchup with two start times further apart but within this: refused
+DOUBLEHEADER_SECONDS = 10 * 3600          # two games of one matchup at one venue this close: a doubleheader
+STALE_GAME_SECONDS = 6 * 3600             # a game that started this long ago is over
 DEFAULT_LEAGUE_MIN_EDGE = {"NCAAF": 0.045, "NCAAB": 0.045, "WNBA": 0.04, "TENNIS": 0.045}   # vs 2.5% elsewhere
 
 
@@ -581,6 +582,7 @@ class Supervisor:
         self.require_start_time = live if require_start_time is None else require_start_time
         self.game_start: dict[tuple, float] = {}          # (league, home, away) -> scheduled start (epoch)
         self.ambiguous_games: dict[tuple, tuple] = {}     # matchups with two starts hours apart: never traded
+        self._start_events: dict[tuple, dict] = {}         # gid -> {(venue, event id): start}
         self.cutoff_phases: dict[tuple, set[str]] = {}     # gid -> {"maker", "taker", "start"} already run
         self._cutoff_noted: set[tuple] = set()
         self.live_games: dict[tuple, str] = {}             # gid -> why we believe it is in play (never trade)
@@ -948,7 +950,7 @@ class Supervisor:
         key, side = canon
         gid = key[:3]
         if update.start_time:
-            self._note_start(gid, update.start_time)
+            self._note_start(gid, update.start_time, (update.venue, update.event_id))
         if previous is None or previous.price != update.price:
             self.last_price_change[(update.venue, update.outcome_id)] = time.time()
         if self.gaps is not None:
@@ -1004,8 +1006,11 @@ class Supervisor:
                              source=sharp.source)
         label = f"{update.venue}/{update.event_id}/{update.market_type}/{side}"
         decision = await self._evaluate(update.venue, update.price, sharp_q, update.line, label, league=key[0])
+        whole = key[3] in {"spread", "total"} and not _is_half_point(update.line)
         if self.research is not None:
-            self._research_decision(update, key, side, decision, blocked=blocked if shadow else None)
+            # a whole-number bet never executes: research must not count it as a bet that could have
+            self._research_decision(update, key, side, decision,
+                                    blocked="whole-number line" if whole else blocked if shadow else None)
             if decision.action == "BET":
                 self._watch_edge(update, decision)
         if shadow:
@@ -1017,7 +1022,7 @@ class Supervisor:
                  decision.fee_usd, decision.reason)
         if decision.action != "BET":
             return
-        if key[3] in {"spread", "total"} and not _is_half_point(update.line):
+        if whole:
             # A whole number can push: the de-vigged price is P(win | no push), not what the contract pays, and
             # the venues' push rules are unconfirmed (a push settled as a loss turns +4% into -5%).
             self.stats["whole_number_blocked"] += 1
@@ -2154,17 +2159,50 @@ class Supervisor:
                     self._record_daily_pnl(charge, at, replay=True)
 
     # ---------------- pregame cutoff ----------------
-    def _note_start(self, gid: tuple, start: float) -> None:
+    def _note_start(self, gid: tuple, start: float, event: Optional[tuple] = None) -> None:
+        """
+        Learn a game's scheduled start from one venue market (`event` = (venue, event id)).
+        * The same event with a new start REPLACES its old start (a reschedule is not a second game).
+        * Two different events of one matchup at ONE venue 2-10h apart = a doubleheader: never traded (positions
+          are keyed by matchup, so the two games could not be kept apart). Venues disagreeing on a start do not
+          block the game (the pair/hedge checks compare the two markets' own start times).
+        * Once a game is 6h past its start, the matchup starts clean for its next game (a series): its live flag,
+          cutoff phases and starts are dropped, so a 24/7 session never blocks game 2 because game 1 happened.
+        """
+        now = time.time()
+        events = self._start_events.setdefault(gid, {})
         prev = self.game_start.get(gid)
-        if prev is not None and SAME_GAME_WINDOW_SECONDS < abs(prev - start) <= DOUBLEHEADER_SECONDS \
-                and gid not in self.ambiguous_games:
-            # one matchup, two start times hours apart: a doubleheader (or venues disagree). Positions are keyed by
-            # matchup, so the two games cannot be kept apart: never trade either (a "pair" could span both).
-            self.ambiguous_games[gid] = (min(prev, start), max(prev, start))
-            log.warning("DOUBLEHEADER %s: start times %.1fh apart -> no orders, quotes or parlay legs",
-                        gid, abs(prev - start) / 3600)
-            self._ledger("DOUBLEHEADER", game=list(gid), starts=[prev, start])
-        self.game_start[gid] = start if prev is None else min(prev, start)
+        if prev is not None and prev < now - STALE_GAME_SECONDS and start > prev + SAME_GAME_WINDOW_SECONDS:
+            self._reset_game(gid)
+            events = self._start_events.setdefault(gid, {})
+            for k in [k for k, v in events.items() if v < now - STALE_GAME_SECONDS]:
+                del events[k]
+        key = event or ("?", f"start-{round(start)}")
+        events[key] = start
+        if gid not in self.ambiguous_games:
+            per_venue: dict[str, list[float]] = {}
+            for (venue, _), st in events.items():
+                per_venue.setdefault(venue, []).append(st)
+            for venue, starts in per_venue.items():
+                starts.sort()
+                if any(SAME_GAME_WINDOW_SECONDS < b - a <= DOUBLEHEADER_SECONDS for a, b in zip(starts, starts[1:])):
+                    self.ambiguous_games[gid] = (starts[0], starts[-1])
+                    log.warning("DOUBLEHEADER %s: two %s games %.1fh apart -> no orders, quotes or parlay legs",
+                                gid, venue, (starts[-1] - starts[0]) / 3600)
+                    self._ledger("DOUBLEHEADER", game=list(gid), venue=venue, starts=starts)
+                    break
+        upcoming = [v for v in events.values() if v >= now - STALE_GAME_SECONDS] or list(events.values())
+        prev = self.game_start.get(gid)                       # (None after a reset)
+        self.game_start[gid] = min(upcoming + ([prev] if prev is not None else []))   # cutoffs err early
+
+    def _reset_game(self, gid: tuple) -> None:
+        """The matchup's previous game is over: forget its per-game state so the next game can be traded."""
+        self.game_start.pop(gid, None)
+        self.live_games.pop(gid, None)
+        self.cutoff_phases.pop(gid, None)
+        self.ambiguous_games.pop(gid, None)
+        self._cutoff_noted = {n for n in self._cutoff_noted if n[0] != gid}
+        log.info("GAME_RESET %s: previous game over; tracking the next one", gid)
 
     def _register_dynamic_games(self) -> None:
         """College leagues: register every listed game (Novig first, so its spellings become canonical)."""
@@ -2182,7 +2220,7 @@ class Supervisor:
                 if info.start_time:
                     canon = self._canonical(MarketUpdate.from_info(info))
                     if canon is not None:
-                        self._note_start(canon[0][:3], info.start_time)
+                        self._note_start(canon[0][:3], info.start_time, (info.venue, info.event_id))
 
     def minutes_to_start(self, gid: tuple) -> Optional[float]:
         start = self.game_start.get(gid)

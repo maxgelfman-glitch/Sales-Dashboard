@@ -70,3 +70,35 @@ async def test_a_hedge_is_priced_against_every_leg_on_the_held_side():
     sup.positions[("NBA", h, a, "moneyline")] = MarketPosition(legs=[first, second])
     await show(sup, nov[1], 0.57, 1000)                  # 0.40 + 0.57 locks; the 0.45 average + 0.57 does not
     assert sup.stats["arbs"] == 0 and len(sup.orders) == 2
+
+
+def test_only_a_real_doubleheader_blocks_a_matchup():
+    h, a = "New York Yankees", "Boston Red Sox"
+    gid = ("MLB", h, a)
+    # Saturday 7:15pm then Sunday 1:35pm: a series, 18h apart -> both tradeable (Saturday first)
+    sat = START
+    sup = make_sup(novig=ml_market("novig", "SAT", "MLB", h, a, start=sat)
+                   + ml_market("novig", "SUN", "MLB", h, a, start=sat + 18.3 * 3600))
+    assert gid not in sup.ambiguous_games and sup.game_start[gid] == sat
+    # venues disagreeing by 3h on ONE game: not a doubleheader (the pair check compares the two markets)
+    sup = make_sup(novig=ml_market("novig", "G", "MLB", h, a, start=sat),
+                   kalshi=ml_market("kalshi", "G", "MLB", h, a, start=sat + 3 * 3600))
+    assert gid not in sup.ambiguous_games
+    # one event rescheduled 4h later: replaced, not a second game
+    sup = make_sup(novig=ml_market("novig", "G", "MLB", h, a, start=sat))
+    sup._note_start(gid, sat + 4 * 3600, ("novig", "novig-G-moneyline"))
+    assert gid not in sup.ambiguous_games
+    # a second event at the same venue 5h after it: a doubleheader
+    sup._note_start(gid, sat + 9 * 3600, ("novig", "novig-G2-moneyline"))
+    assert gid in sup.ambiguous_games
+
+
+async def test_a_24_7_session_trades_game_two_of_a_series():
+    import time as _t
+    h, a = "New York Yankees", "Boston Red Sox"
+    gid = ("MLB", h, a)
+    sup = make_sup(novig=ml_market("novig", "G1", "MLB", h, a, start=_t.time() - 8 * 3600))   # game 1 is over
+    sup.mark_game_live(gid, "started")
+    assert sup._trade_blocked(gid)
+    sup._note_start(gid, _t.time() + 20 * 3600, ("novig", "G2"))                             # game 2 listed
+    assert sup._trade_blocked(gid) is None and gid not in sup.live_games

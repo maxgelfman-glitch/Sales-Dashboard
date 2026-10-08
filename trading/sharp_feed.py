@@ -78,6 +78,7 @@ class SharpLine(BaseModel):
     is_main: bool = True               # False = alternate line (stored by its exact number only)
     is_live: bool = False              # True = in-play price: never used as fair value; the game stops trading
     start_time: Optional[float] = None # scheduled start (epoch s): tells two games of the same matchup apart
+    event_id: Optional[str] = None     # the provider's event id: a reschedule keeps it, a doubleheader has two
 
     @field_validator("is_live", mode="before")
     @classmethod
@@ -136,6 +137,7 @@ class SharpBook:
         # priced against it when their start times agree.
         self._game_start: dict[tuple[str, str, str], float] = {}
         self._ambiguous: set[tuple[str, str, str]] = set()     # matchups with two games close together
+        self._game_event: dict[tuple[str, str, str], str] = {}  # the provider event id of the game held
 
     def __len__(self) -> int:
         return len(self._lines)
@@ -196,7 +198,7 @@ class SharpBook:
                 rejected += 1                           # a side that is not in this game/market
                 continue
             gk = (league, home, away)
-            if (line.start_time is not None and not self._accept_game(gk, line.start_time, now)) \
+            if (line.start_time is not None and not self._accept_game(gk, line.start_time, now, line.event_id)) \
                     or gk in self._ambiguous:
                 rejected += 1                           # another day's game, or a doubleheader: not this game
                 continue
@@ -223,6 +225,11 @@ class SharpBook:
             src = (canon.source or "sharp").strip().lower()
             # a "move" is the SAME book changing its price, never one book replacing another
             old = self._main_src.get(key, {}).get(src) if canon.is_main else None
+            if old is not None and old[0].line != canon.line:
+                # this book's main number moved: its old number's price is the PRE-move price, gone at once
+                for item in (old[0], old[0].mirrored()):
+                    ik = (league, home, away, item.market_type, item.side)
+                    self._src.get((ik, item.line), {}).pop(src, None)
             for item in (canon, canon.mirrored()):
                 item_key = (league, home, away, item.market_type, item.side)
                 self._by_line[(item_key, item.line)] = (item, observed_at)
@@ -244,10 +251,10 @@ class SharpBook:
         return stored, rejected
 
     GAME_WINDOW_SECONDS = 2 * 3600          # two start times of one matchup this close are the same game
-    DOUBLEHEADER_SECONDS = 20 * 3600        # ... further apart but within this: maybe two games the same day
+    DOUBLEHEADER_SECONDS = 10 * 3600        # ... further apart but within this: two games the same day
     STALE_GAME_SECONDS = 6 * 3600           # a game that started this long ago is over
 
-    def _accept_game(self, gk: tuple, start: float, now: float) -> bool:
+    def _accept_game(self, gk: tuple, start: float, now: float, event_id: Optional[str] = None) -> bool:
         """Keep lines of the NEAREST upcoming game of a matchup. A nearer game replaces a later one; a game
         that ended long ago is replaced by the next. Two games of one matchup on the same day (an MLB
         doubleheader) cannot be told apart by team names: the matchup is refused until one of them is over."""
@@ -257,7 +264,12 @@ class SharpBook:
             held = None
         if held is None or abs(held - start) <= self.GAME_WINDOW_SECONDS:
             self._game_start[gk] = start if held is None else min(held, start)
+            if held is None and event_id is not None:
+                self._game_event[gk] = event_id
             return gk not in self._ambiguous
+        if event_id is not None and self._game_event.get(gk) == event_id and gk not in self._ambiguous:
+            self._game_start[gk] = start                        # the SAME event rescheduled: not a second game
+            return True
         if abs(held - start) <= self.DOUBLEHEADER_SECONDS:
             if gk not in self._ambiguous:
                 sharp_log.warning("SHARP %s has two games %.1fh apart (doubleheader?): refused until one is over",
@@ -279,6 +291,7 @@ class SharpBook:
 
     def _forget_game(self, gk: tuple) -> None:
         self._ambiguous.discard(gk)
+        self._game_event.pop(gk, None)
         for store in (self._lines, self._main_src):
             for k in [k for k in store if k[:3] == gk]:
                 del store[k]
@@ -351,13 +364,16 @@ class SharpBook:
         return self.weights.get(book, 1.0 if not self.weights else self.weights.get("*", 0.0))
 
     def _consensus(self, pool: dict[str, tuple[SharpLine, float]]) -> Optional[SharpLine]:
-        """Weighted average of each book's de-vigged probability, returned as a zero-margin line.
-        A book with a broken market (overround outside the sane range, e.g. teams swapped or -1000/-1000) is left
-        out, and books that disagree by more than CONSENSUS_MAX_SPREAD give NO line: averaging a bad book in
-        hides it (the blended line always looks clean) and creates edges that are not there."""
+        """
+        Weighted average of the books' de-vigged probabilities, anchored on the heaviest book (Pinnacle):
+        * a book whose own market is broken (overround outside the sane range: teams swapped, -1000/-1000) is
+          left out; if the ANCHOR is broken there is no price at all;
+        * a book more than CONSENSUS_MAX_SPREAD from the anchor is left out (lagging or wrong), never averaged in:
+          a blended line always looks clean and would hide it.
+        Returned as a zero-margin line; refused outside 1-99% (never clamped into an invented longshot edge).
+        """
         from execution import MAX_OVERROUND, MIN_OVERROUND, american_to_decimal, fair_devig   # local: no cycle
-        num = den = 0.0
-        probs = []
+        probs: dict[str, float] = {}
         for book, (ln, _) in pool.items():
             try:
                 d = [american_to_decimal(ln.odds_for), american_to_decimal(ln.odds_against)]
@@ -367,19 +383,24 @@ class SharpBook:
                 (p, _), _ = fair_devig(d)
             except (ValueError, ZeroDivisionError):
                 continue
-            w = self._weight(book)
-            probs.append(p)
-            num, den = num + w * p, den + w
-        if den <= 0 or max(probs) - min(probs) > CONSENSUS_MAX_SPREAD:
+            probs[book] = p
+        anchor = max(pool, key=lambda b: (self._weight(b), b))
+        if anchor not in probs:
             return None
-        p = num / den
-        if not 0.01 <= p <= 0.99:                  # never clamp: a clamped longshot is an invented edge
+        used = {b: p for b, p in probs.items() if abs(p - probs[anchor]) <= CONSENSUS_MAX_SPREAD}
+        dropped = sorted(set(pool) - set(used))
+        if dropped:
+            sharp_log.debug("SHARP consensus left out %s (broken or > %.0f pts from %s)", dropped,
+                            CONSENSUS_MAX_SPREAD * 100, anchor)
+        den = sum(self._weight(b) for b in used)
+        p = sum(self._weight(b) * q for b, q in used.items()) / den
+        if not 0.01 <= p <= 0.99:
             return None
-        first = next(iter(pool.values()))[0]
+        first = pool[anchor][0]
         return first.model_copy(update=dict(
             odds_for=decimal_to_american(1 / p), odds_against=decimal_to_american(1 / (1 - p)),
-            source="consensus:" + "+".join(sorted(pool)),
-            updated_at=min(t for _, t in pool.values())))
+            source="consensus:" + "+".join(sorted(used)) if len(used) > 1 else first.source,
+            updated_at=min(pool[b][1] for b in used)))
 
     def age_of(self, league: str, home: str, away: str, market_type: str, side: str) -> Optional[float]:
         hit = self._lines.get((league, home, away, market_type, side))

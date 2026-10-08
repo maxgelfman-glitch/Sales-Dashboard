@@ -564,7 +564,7 @@ def test_slice_verdicts_need_statistical_evidence():
     lo, hi = wilson(12, 200)
     assert lo < 0.06 < hi                                             # 6% of 200 is not "confidently above 5%"
     base = dict(traded=1000, wins=120, win_ci=wilson(120, 1000), median_margin=0.10, settled=2000, pnl=500.0,
-                calibration_z=-0.5, roc_lower95=0.01, settled_needed=1500, below=5)
+                calibration_z=0.3, price_z=-2.4, roc_lower95=0.01, settled_needed=1500, below=5)
     assert slice_verdict(base) == "PASS"
     assert slice_verdict({**base, "traded": 150}) == "WAIT"
     assert slice_verdict({**base, "settled": 1000}) == "WAIT"           # under the power-based sample size
@@ -572,6 +572,7 @@ def test_slice_verdicts_need_statistical_evidence():
     assert slice_verdict({**base, "calibration_z": 2.5}) == "FAIL"     # parlays hit more often than we priced
     assert slice_verdict({**base, "roc_lower95": -0.02, "pnl": -50.0}) == "FAIL"
     assert slice_verdict({**base, "roc_lower95": -0.001}) == "WATCH"   # positive so far, not conclusive
+    assert slice_verdict({**base, "price_z": -1.0}) == "WATCH"         # hits not clearly below our price yet
     # the pieces: a fair model is calibrated; one that is 20% too cheap is caught
     import random
     rng = random.Random(1)

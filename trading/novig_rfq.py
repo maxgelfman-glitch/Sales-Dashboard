@@ -450,7 +450,7 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
                 continue
             res = str(row.get("result") or "").lower()
             self._write("COMBO_RESULT", venue="novig", key=rid, position_type="position", result=row.get("result"),
-                        pnl=pnl, slice=pos.get("slice"), fair=pos.get("fair"),
+                        pnl=pnl, slice=pos.get("slice"), fair=pos.get("fair"), yes_price=pos.get("price"),
                         hit=1 if res == "win" else 0 if res == "loss" else None,   # the bettor's parlay hit
                         collateral=round(pos.get("liability") or 0.0, 2),
                         expected_profit=None if pos.get("fair") is None else

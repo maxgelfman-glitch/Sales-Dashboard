@@ -232,3 +232,14 @@ def test_a_one_sided_update_waits_for_the_other_side():
     assert by(s.lines(), "moneyline", "draftkings")                     # another book is unaffected
     s.clock.t += 2.0                                                    # the other side never moved: now pair
     assert by(s.lines(), "moneyline")
+
+
+def test_a_frozen_feed_is_detected_even_though_every_poll_restamps_rows():
+    clock = Clock()
+    s = source(clock)
+    ev = {**EVENT, "event_date": "2026-01-15T06:00:00Z"}               # a game 6 hours away
+    s.load_events([ev])
+    for _ in range(4):                                                  # the same prices, re-polled for 20 min
+        clock.t += 300
+        s.load_events([ev])
+    assert s.frozen()

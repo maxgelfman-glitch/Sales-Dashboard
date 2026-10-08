@@ -257,23 +257,23 @@ async def test_arbitrage_99_cent_boundary(price, expected_arb):
 
 
 # ---------------- NFL ties (dead heat at 50c on Novig)
-async def test_nfl_moneyline_novig_pair_is_refused_because_a_tie_may_only_refund():
-    # Novig's tie rule is unconfirmed ("void at fair value" in its exchange's filing): modelled as a refund of the
-    # price paid, so 0.36 + 0.63 returns exactly $0.99 on a tie: no locked profit, no hedge.
+async def test_nfl_moneyline_novig_pair_is_refused_because_a_tie_may_pay_nothing():
+    # Novig's tie rule is unconfirmed (its filings describe binary $1/$0 contracts): a tie is modelled as $0, so
+    # 0.36 + 0.63 can lose $990 on a tie: never a lock.
     sup = make_sup()
     await sup.on_market_update(upd("O-NYG", 0.36, volume=1000), None)   # NYG +7.9% -> 1000 contracts $360
     await sup.on_market_update(upd("O-NYJ", 0.63), None)
     assert sup.stats["arbs"] == 0
     first = sup.orders[0]
     s = arbitrage_scenarios(first, "novig", 1000, 630.0, "NFL", "moneyline", hedge_price=0.63)
-    assert s == {"first_side_wins": 10.0, "other_side_wins": 10.0, "tie": 0.0}
+    assert s == {"first_side_wins": 10.0, "other_side_wins": 10.0, "tie": -990.0}
 
 
 async def test_nfl_moneyline_cross_venue_pair_must_survive_the_tie_by_each_venues_rule():
     """
-    Kalshi pays 50c per team on a tie (its contract terms); Novig is modelled as refunding the 36c paid.
-    Novig NYG 1000 @ 0.36 + Kalshi NYJ @ 0.55 ($550 + $17.33 fee): a tie returns 360 + 500 = $860 < $927.33,
-    so it is refused. At 0.45 ($450 + ceil(0.07*1000*.45*.55)=$17.33) a tie returns $860 vs $827.33: locked.
+    Kalshi pays 50c per team on a tie (its contract terms); Novig's tie rule is unconfirmed, so $0.
+    Novig NYG 1000 @ 0.36 + Kalshi NYJ @ 0.55 ($550 + $17.33 fee): a tie returns $500 < $927.33: refused.
+    Even at 0.45 ($467.33) a tie returns $500 vs $827.33: refused.
     """
     sup = make_sup()
     sup.kalshi_registry.register(INFO[K_NYG])
@@ -283,9 +283,9 @@ async def test_nfl_moneyline_cross_venue_pair_must_survive_the_tie_by_each_venue
     assert sup.stats["arbs"] == 0
     first = sup.orders[0]
     s = arbitrage_scenarios(first, "kalshi", 1000, 567.33, "NFL", "moneyline", hedge_price=0.55)
-    assert s == {"first_side_wins": 72.67, "other_side_wins": 72.67, "tie": -67.33}
+    assert s == {"first_side_wins": 72.67, "other_side_wins": 72.67, "tie": -427.33}
     s = arbitrage_scenarios(first, "kalshi", 1000, 467.33, "NFL", "moneyline", hedge_price=0.45)
-    assert min(s.values()) == 32.67
+    assert s["tie"] == -327.33
 
 
 def test_tie_scenario_still_refuses_venues_without_dead_heat(monkeypatch):
@@ -293,7 +293,7 @@ def test_tie_scenario_still_refuses_venues_without_dead_heat(monkeypatch):
     class Leg:
         venue, stake_usd, price = "novig", 360.0, 0.36
     s = arbitrage_scenarios(Leg, "other_exchange", 1000, 567.33, "NFL", "moneyline", hedge_price=0.55)
-    assert s["tie"] == round(360 - 927.33, 2) < 0          # Novig refunds 36c; an unconfirmed venue pays $0
+    assert s["tie"] == round(0 - 927.33, 2) < 0            # neither venue's tie rule is confirmed: $0 each
 
 
 def test_scenarios_for_nba_have_no_tie():

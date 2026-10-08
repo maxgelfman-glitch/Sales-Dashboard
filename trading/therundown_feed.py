@@ -205,7 +205,9 @@ class TheRundownSource:
                                                    name=part.get("name"), at=self.clock())
                         if books:
                             new_prices[key] = books
-        if new_prices != self.prices and new_prices:
+        def strip(table):                    # the load stamp is not a price change (frozen() must still fire)
+            return {k: {a: (v["price"], v["main"]) for a, v in b.items()} for k, b in table.items()}
+        if new_prices and strip(new_prices) != strip(self.prices):
             self.last_change = self.clock()
         self.events, self.prices = new_events, new_prices
 
@@ -286,7 +288,7 @@ class TheRundownSource:
             # in play if the provider says so OR the scheduled start has passed (status refreshes only every 5 min)
             live = ev["status"] not in PREGAME_STATUSES or bool(ev.get("start") and self.clock() >= ev["start"])
             base = dict(league=ev["league"], home_team=ev["home"], away_team=ev["away"],
-                        market_type=MARKETS[mid], is_live=live, start_time=ev.get("start"))
+                        market_type=MARKETS[mid], is_live=live, start_time=ev.get("start"), event_id=str(eid))
             for aff in {a for _, _, books in rows for a in books}:
                 src = AFFILIATE_NAMES.get(aff, f"affiliate-{aff}")
                 out += self._pair(ev, mid, rows, aff, base, src)

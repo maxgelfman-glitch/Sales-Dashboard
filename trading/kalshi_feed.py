@@ -409,7 +409,7 @@ class KalshiRestClient:
         path = "/markets"
         sign_path = "/trade-api/v2/markets"
         for series, league in self.series.items():
-            cursor = None
+            cursor, markets = None, []
             for _ in range(20):   # pagination guard
                 params = {"series_ticker": series, "status": "open", "limit": "1000"}
                 if cursor:
@@ -419,10 +419,13 @@ class KalshiRestClient:
                 async with self._session.get(self.base_url + path, params=params, headers=headers) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
-                rows.extend(parse_kalshi_markets(data, league))
+                markets += (data.get("markets") or []) if isinstance(data, dict) else []
                 cursor = data.get("cursor") if isinstance(data, dict) else None
                 if not cursor:
                     break
+            # parse once ALL pages are in: an event split across pages (e.g. its Tie market on the next page) must
+            # be seen whole, or a three-market game would pass as two
+            rows.extend(parse_kalshi_markets({"markets": markets}, league))
         log.info("BOOTSTRAP kalshi loaded %d game-winner outcomes", len(rows))
         return rows
 

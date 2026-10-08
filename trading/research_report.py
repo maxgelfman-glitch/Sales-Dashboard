@@ -211,6 +211,7 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
         d["below"] += r["our_yes_price"] < r["traded_yes_price"] * (1 - FAR_BELOW)
     roc: dict[str, list[float]] = {}
     calib: dict[str, list[tuple[float, int]]] = {}
+    at_price: dict[str, list[tuple[float, int]]] = {}
     for r in results:
         d = out.get(_slice_key(r))
         if d is None:
@@ -222,12 +223,15 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
             roc.setdefault(_slice_key(r), []).append(float(r.get("pnl") or 0) / float(r["collateral"]))
         if r.get("fair") is not None and r.get("hit") in (0, 1):
             calib.setdefault(_slice_key(r), []).append((float(r["fair"]), int(r["hit"])))
+        if r.get("yes_price") and r.get("hit") in (0, 1):
+            at_price.setdefault(_slice_key(r), []).append((float(r["yes_price"]), int(r["hit"])))
     for name, d in out.items():
         d["win_rate"] = d["wins"] / d["traded"] if d["traded"] else None
         d["median_margin"] = _median(d.pop("margins"))
         d["win_ci"] = wilson(d["wins"], d["traded"])
         d["roc_lower95"] = bootstrap_mean_lower(roc.get(name, []))
-        d["calibration_z"] = calibration_z(calib.get(name, []))
+        d["calibration_z"] = calibration_z(calib.get(name, []))          # vs our FAIR: the tripwire
+        d["price_z"] = calibration_z(at_price.get(name, []))             # vs our PRICE: the edge test
         d["settled_needed"] = settled_needed(calib.get(name, []), d["median_margin"])
         d["verdict"] = slice_verdict(d)
     return dict(sorted(out.items(), key=lambda kv: -kv[1]["rfqs"]))
@@ -243,14 +247,14 @@ def wilson(k: int, n: int, z: float = 1.96) -> Optional[tuple[float, float]]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
-def bootstrap_mean_lower(xs: list[float], level: float = 0.95, n_boot: int = 4000, seed: int = 7) -> Optional[float]:
+def bootstrap_mean_lower(xs: list[float], level: float = 0.95, n_boot: int = 2000, seed: int = 7) -> Optional[float]:
     """One-sided lower confidence bound on the MEAN (percentile bootstrap, fixed seed so a report is reproducible).
     Short-parlay P&L is lopsided (many small wins, rare large losses): a t-test on it is not trustworthy."""
     if len(xs) < 30:
         return None
     import random as _random
     rng, n = _random.Random(seed), len(xs)
-    means = sorted(sum(xs[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
+    means = sorted(sum(rng.choices(xs, k=n)) / n for _ in range(n_boot))
     return means[int((1 - level) * n_boot)]
 
 
@@ -290,11 +294,12 @@ def slice_verdict(d: dict) -> str:
     The win rate (how often our price would have won the auction) is a CAPACITY gate, not evidence of edge: a
     model that is too cheap wins more. Edge is judged on the model and on realised return, with a sample size
     fixed by statistical power (not "100"), evaluated only once it is reached.
-    PASS  traded >= 200 with a win rate confidently >= 5%; OUR median margin >= 8%; settled >= max(300, the
-          power-based number needed); calibration Z <= 0 (parlays did not hit more often than we priced); the 95%
-          lower bound of return on collateral > 0; fewer than 20% of wins came 10%+ under the market.
-    FAIL  confidently < 5% wins; calibration Z >= 2 (we price too cheap); return-on-collateral bound < 0 at the
-          required sample; or mostly suspiciously cheap wins.
+    PASS  traded >= 200 with a win rate confidently >= 5%; OUR median margin (net of fee) >= 8%; settled >=
+          max(300, the power-based number needed); parlays hit significantly LESS often than our price implies
+          (price Z <= -1.645: the edge is real, one-sided 5%); the 95% lower bound of return on collateral > 0;
+          fewer than 20% of wins came 10%+ under the market.
+    FAIL  confidently < 5% wins; parlays hit more often than our FAIR (fair Z >= 2: we price too cheap); a
+          negative return-on-collateral bound with negative P&L at the required sample; or mostly cheap wins.
     WAIT  not enough data yet. WATCH  enough data, not conclusive.
     """
     ci, wins = d.get("win_ci"), d.get("wins", 0)
@@ -309,7 +314,8 @@ def slice_verdict(d: dict) -> str:
         return "WAIT"
     if lower is not None and lower < 0 and d.get("pnl", 0) < 0:
         return "FAIL"
-    if (ci and ci[0] >= 0.05 and (d.get("median_margin") or 0) >= 0.08 and z is not None and z <= 0
+    pz = d.get("price_z")
+    if (ci and ci[0] >= 0.05 and (d.get("median_margin") or 0) >= 0.08 and pz is not None and pz <= -1.645
             and lower is not None and lower > 0 and cheap <= 0.2):
         return "PASS"
     return "WATCH"
@@ -666,12 +672,13 @@ def build_report(rows: list[dict]) -> str:
             out.append(f"  WARNING {c['far_below_market']} quote(s) were 10%+ cheaper than where the parlay traded: "
                        "usually our model, not a gift")
         out.append(f"  {'venue slice':<28}{'rfqs':>7}{'quote':>7}{'traded':>7}{'win%':>7}{'margin':>8}{'settled':>8}"
-                   f"{'needed':>8}{'calib z':>8}{'ROC lo95':>9}{'P&L':>10}  verdict")
+                   f"{'needed':>8}{'fair z':>8}{'price z':>8}{'ROC lo95':>9}{'P&L':>10}  verdict")
         for name, d in list(c["by_slice"].items())[:15]:
             out.append(f"  {name:<28}{d['rfqs']:>7,}{d['quotable']:>7,}{d['traded']:>7,}"
                        f"{_fmt(d['win_rate'] and d['win_rate'] * 100, '.1f'):>7}"
                        f"{_fmt(d['median_margin'] and d['median_margin'] * 100, '+.1f'):>8}{d['settled']:>8,}"
                        f"{_fmt(d.get('settled_needed'), 'd'):>8}{_fmt(d.get('calibration_z'), '+.2f'):>8}"
+                       f"{_fmt(d.get('price_z'), '+.2f'):>8}"
                        f"{_fmt(None if d.get('roc_lower95') is None else d['roc_lower95'] * 100, '+.2f'):>9}"
                        f"{d['pnl']:>10,.2f}  {d['verdict']}")
         out.append("  (a slice goes live only on PASS: enough auctions won (capacity), our margin >= 8%, the "
