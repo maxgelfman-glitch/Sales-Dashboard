@@ -41,7 +41,7 @@ from typing import Any, Callable, Optional
 
 import aiohttp
 
-from combo_quoter import ComboConfig, ComboPrice, ComboPricer, Leg, LegFair, RiskBook
+from combo_quoter import ComboConfig, ComboPrice, ComboPricer, Leg, LegFair, RiskBook, leg_game
 from ws_base import ResilientWebSocketFeed, StateCallback, safe_call
 
 log = logging.getLogger("trading.novig_rfq")
@@ -266,6 +266,8 @@ class NovigRfqQuoter(ResilientWebSocketFeed):
         room = min(room, self.cfg.max_total_liability - self.book.total())
         for leg in cp.legs:
             room = min(room, self.cfg.max_leg_exposure - self.book.leg_exposure(leg))
+        for game in {leg_game(l) for l in cp.legs}:                     # never win a round the last look refuses
+            room = min(room, self.cfg.max_game_exposure - self.book.game_exposure(game))
         max_wager = math.floor(max(room, 0.0) * price / (1 - price) * 100) / 100
         if max_wager < max(min_wager, 0.01):
             cp.action, cp.reason = "SKIP", f"caps allow ${max_wager:.2f} < round minimum ${min_wager:.2f}"

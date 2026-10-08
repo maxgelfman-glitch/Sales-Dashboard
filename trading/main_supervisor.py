@@ -3305,8 +3305,9 @@ def parlay_config(env, mode: str, plan, venue: str):
         return v
 
     kinds = tuple(k.strip().lower() for k in (env.get("COMBO_LIVE_KINDS") or "xgame").split(",") if k.strip())
-    if not kinds or not set(kinds) <= {"xgame", "sgp"}:
-        raise ConfigError("COMBO_LIVE_KINDS must list xgame and/or sgp")
+    if kinds != ("xgame",):
+        raise ConfigError("COMBO_LIVE_KINDS must be xgame: same-game parlays have no joint probability model, and "
+                          "pricing them as independent legs underprices them by up to 40%")
     live_leagues = tuple(canonical_league(x.strip()) for x in (env.get("COMBO_LIVE_LEAGUES") or "").split(",")
                          if x.strip()) or None
     return ComboConfig(

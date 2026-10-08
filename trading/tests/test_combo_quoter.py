@@ -79,16 +79,43 @@ def test_rejections(legs, reason):
     assert cp.action == "SKIP" and reason in cp.reason
 
 
-def test_same_game_legs_are_priced_wide_and_stay_shadow_only():
+def test_same_game_legs_are_never_priced_as_independent():
     prop = "KXNBAPTS-26OCT01BOSNYK-TATUM25"
     pr = ComboPricer(ComboConfig(), lambda leg: LegFair(prob_yes=0.5, source="sharp", age_s=1.0))
     cp = pr.price(rfq(legs=((T1, "yes"), (prop, "yes"))))     # prop + moneyline of one game
-    assert cp.action == "QUOTE" and cp.same_game and cp.slice == "NBA:2L:sgp"
-    assert cp.uncertainty >= 0.08 and cp.size_factor < 1                # wide AND small
-    assert "shadow-only" in pr.live_allowed(cp)
+    assert cp.action == "SKIP" and "joint probability" in cp.reason
     assert pr.live_allowed(pr.price(rfq())) is None                      # different games: may go live
-    sgp_ok = ComboPricer(ComboConfig(live_kinds=("xgame", "sgp")), pr.leg_fair)
-    assert sgp_ok.live_allowed(cp) is None
+
+
+@pytest.mark.parametrize("legs", [
+    (("KXNFLGAME-26OCT04KCBUF-KC", "yes"), ("KXNFLGAME-26OCT04KCBUF-BUF", "no")),   # the same outcome twice
+    (("KXNFLGAME-26OCT04KCBUF-KC", "yes"), ("KXNFLGAME-26OCT04KCBUF-KC", "yes")),   # a duplicate leg
+    (("KXNFLGAME-26OCT04KCBUF-KC", "yes"), ("KXNFLSPREAD-26OCT04KCBUF-KC3", "yes")),  # ML + covering spread
+])
+def test_nested_duplicate_and_mirrored_legs_are_declined(legs):
+    # Product of fairs: 0.6*0.6 = 0.36 vs the true 0.60 for the same outcome twice: a -32% return if quoted
+    pr = ComboPricer(ComboConfig(), lambda leg: LegFair(prob_yes=0.6, source="sharp", age_s=1.0))
+    assert pr.price(rfq(legs=legs)).action == "SKIP"
+
+
+def test_same_game_parlays_cannot_be_enabled():
+    from main_supervisor import ConfigError, parlay_config
+    with pytest.raises(ConfigError, match="joint probability"):
+        parlay_config({"COMBO_LIVE_KINDS": "xgame,sgp"}, "shadow", None, "kalshi")
+
+
+def test_games_of_different_leagues_with_the_same_code_are_different_games():
+    from combo_quoter import Leg, leg_game
+    nfl, nhl = Leg("KXNFLGAME-26NOV01DETMIN-DET", "", "yes"), Leg("KXNHLGAME-26NOV01DETMIN-DET", "", "yes")
+    assert leg_game(nfl) != leg_game(nhl)
+    pr = ComboPricer(ComboConfig(), lambda leg: LegFair(prob_yes=0.5, source="sharp", age_s=1.0))
+    assert pr.price(rfq(legs=((nfl.market_ticker, "yes"), (nhl.market_ticker, "yes")))).action == "QUOTE"
+
+
+def test_a_fractional_rfq_size_is_never_booked_as_a_smaller_one():
+    from combo_quoter import rfq_contracts
+    assert rfq_contracts({"contracts_fp": "10.5"}, 0.4) == 0             # skipped, not booked as 10
+    assert rfq_contracts({"contracts_fp": "10.00"}, 0.4) == 10
 
 
 def test_nfl_cross_game_parlays_pay_no_maker_fee():
@@ -379,7 +406,7 @@ def test_one_game_cannot_carry_more_than_its_cap_across_parlays():
     FAIRS[other_nyk] = 0.45
     try:
         b = pr.price(rfq(legs=((other_nyk, "yes"), (T3, "yes")), contracts=20))
-        assert "game 26OCT01BOSNYK exposure" in book.check(b)
+        assert "game NBA:26OCT01BOSNYK exposure" in book.check(b)
     finally:
         FAIRS.pop(other_nyk)
 
@@ -464,9 +491,9 @@ def test_same_game_groups_merge_transitively():
     fairs = {a: LegFair(0.5, "sharp", 0, start=time.time() + 3600),
              b: LegFair(0.5, "sharp", 0, game=game, start=time.time() + 3600),
              c: LegFair(0.5, "sharp", 0, game=game, start=time.time() + 3600)}
-    cp = ComboPricer(ComboConfig(), lambda leg: fairs[leg.market_ticker]).price(
-        rfq(legs=((a, "yes"), (b, "yes"), (c, "yes"))))
-    assert cp.same_game and cp.uncertainty >= 2 * 0.08                   # one game, three legs: two extra
+    pr = ComboPricer(ComboConfig(), lambda leg: fairs[leg.market_ticker])
+    # b shares the canonical game with c, c shares the ticker game code with a: all one game, so declined
+    assert pr.price(rfq(legs=((a, "yes"), (b, "yes"), (c, "yes")))).action == "SKIP"
 
 
 async def test_last_look_counts_the_maker_fee(tmp_path):

@@ -204,9 +204,11 @@ def parse_legs(rfq: dict) -> list[Leg]:
 
 
 def rfq_contracts(rfq: dict, yes_price: Optional[float]) -> int:
+    """Whole contracts only: a fractional size (contracts_fp 10.5) returns 0 so the RFQ is skipped, never booked as
+    10 while we are on the hook for 10.5."""
     n = _num(rfq.get("contracts_fp")) or _num(rfq.get("contracts"))
     if n:
-        return int(n)
+        return int(n) if abs(n - round(n)) < 1e-9 else 0
     cost = _num(rfq.get("target_cost_dollars"))
     return int(cost / yes_price) if cost and yes_price else 0
 
@@ -304,8 +306,8 @@ class ComboPricer:
         for leg, lf in zip(legs, fairs):
             ids = {("e", leg.event_ticker)} if leg.event_ticker else set()
             code = game_code(leg.market_ticker) or game_code(leg.event_ticker)
-            if code:
-                ids.add(("c", code))
+            if code:                                   # league too: NFL and NHL "DET at MIN" share a date code
+                ids.add(("c", league_of(leg.market_ticker or leg.event_ticker), code))
             if lf.game is not None:
                 ids.add(("g", tuple(lf.game)))
             ids.add(("leg", leg.market_ticker, leg.side))
@@ -316,6 +318,11 @@ class ComboPricer:
             groups.append(merged)
         same_game_extra = len(legs) - len(groups)
         same_game = same_game_extra > 0
+        if same_game:
+            # Legs of one game move together, and some are nested (ML + covering spread) or the same outcome twice
+            # (A yes + B no): the product of fairs underprices them by up to 40% and no flat margin fixes that.
+            # Without a joint (correlation) model they are never priced, not even in shadow (its EV would lie).
+            return skip("same-game legs: no joint probability model (product of fairs underprices them)")
         leagues = [lf.game[0] if lf.game else league_of(leg.market_ticker) for leg, lf in zip(legs, fairs)]
         fair, sources, uncertainty = 1.0, [], 0.0
         for leg, lf, league in zip(legs, fairs, leagues):
@@ -387,8 +394,11 @@ class ComboPricer:
 
 
 def leg_game(leg: Leg) -> str:
-    """The game a leg belongs to: the date+teams code inside Kalshi tickers, else the event (Novig: event id)."""
-    return game_code(leg.market_ticker) or game_code(leg.event_ticker) or leg.event_ticker or leg.market_ticker
+    """The game a leg belongs to: league + the date+teams code inside Kalshi tickers, else the event (Novig: id)."""
+    code = game_code(leg.market_ticker) or game_code(leg.event_ticker)
+    if code:
+        return f"{league_of(leg.market_ticker or leg.event_ticker)}:{code}"
+    return leg.event_ticker or leg.market_ticker
 
 
 class RiskBook:

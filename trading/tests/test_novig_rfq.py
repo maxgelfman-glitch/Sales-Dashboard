@@ -107,7 +107,7 @@ async def test_same_game_parlays_and_tiny_caps_are_declined_live(tmp_path):
     q = quoter(tmp_path)
     await q._handle_raw(created(legs=("kc", "kc-over")))                  # same game: shadow-only
     assert q._ws_conn.sent[-1]["event"] == "decline"
-    assert "shadow-only" in rows(tmp_path, "COMBO_RFQ")[-1]["reason"]
+    assert "joint probability" in rows(tmp_path, "COMBO_RFQ")[-1]["reason"]
     small = quoter(tmp_path / "s")
     small.cfg.max_loss_per_combo = 2                                     # caps allow < the $10 minimum stake
     await small._handle_raw(created())
