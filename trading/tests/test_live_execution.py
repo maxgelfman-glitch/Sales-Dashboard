@@ -355,7 +355,7 @@ async def test_end_to_end_live_single_socket(tmp_path):
     assert (leg.contracts, leg.stake_usd, leg.pending, leg.exchange_order_id) == (20, 9.80, False, "srv-1")
     assert sup.total_exposure() == 9.80 and sup.orders_channel_confirmed
     events = [json.loads(line) for line in ledger.read_text().splitlines()]
-    assert [e["event"] for e in events] == ["SESSION_START", "ORDER", "SLIP", "FILL", "DONE"]
+    assert [e["event"] for e in events] == ["SESSION_START", "ORDER", "SLIP", "FILL", "DONE", "HOLD"]
     assert events[1]["payload"] == posted[0]                                           # exact body sent
     assert (events[3]["filled_total"], events[3]["cost_total_usd"]) == (20, 9.8)
     for h in logging.getLogger("trading").handlers:
@@ -521,3 +521,51 @@ async def test_a_timed_out_order_keeps_its_lock_and_reservation():
     await sup.on_market_update(upd("O-NYK", 0.49), None)
     assert sup.total_exposure() > 0 and sup.unconfirmed_legs                # may have filled: never released blind
     assert sup.stats["live_rejected"] == 0
+
+
+async def test_a_position_that_settled_while_the_engine_was_down_is_booked_at_startup(tmp_path):
+    from settlement import ExchangePosition
+    ledger = tmp_path / "l.jsonl"
+    ledger.write_text(json.dumps({"ts": 1, "event": "HOLD", "venue": "novig", "outcome_id": "O-NYK",
+                                  "contracts": 100, "cost_usd": 45.0}) + "\n")
+
+    class Positions:
+        url, status_param, open_status, settled_status = "x", "s", "o", "c"
+
+        async def open_positions(self):
+            return []                                                     # gone: it settled overnight
+
+        async def settled_positions(self):
+            return [ExchangePosition(settlement_id="novig-settle-O-NYK", outcome_id="O-NYK", contracts=100,
+                                     status="SETTLED", result="WIN")]
+    sup = live_sup(ledger_path=ledger)
+    sup.positions_client = Positions()
+    assert await sup.startup_sync()
+    settle = [json.loads(l) for l in ledger.read_text().splitlines() if '"SETTLE"' in l]
+    assert settle and settle[0]["net_profit_usd"] == pytest.approx(55.0)   # $100 payout - $45 cost
+    assert sup.total_exposure() == 0
+
+
+async def test_an_unconfirmed_leg_takes_only_what_other_legs_do_not_hold():
+    from settlement import ExchangePosition
+    sup = live_sup()
+    await sup.on_market_update(upd("O-NYK", 0.49), None)                    # leg 1, fills 2040 below
+    await sup.on_fill_slip(slip("ex-1", "FILLED", 2040, 49))
+    key = next(iter(sup.positions))
+    from main_supervisor import PaperOrder
+    ghost = PaperOrder(order_id=len(sup.orders) + 1, kind="ARB_HEDGE", venue="novig", outcome_id="O-NYK",
+                       event_id="e", league="NBA", market_type="moneyline", side="New York Knicks", line=None,
+                       price=0.49, contracts=0, stake_usd=0, edge=None, capped=False, placed_at=0, live=True)
+    sup.orders.append(ghost)
+    sup.positions[key].legs.append(ghost)
+    sup.unconfirmed_legs[ghost.order_id] = 0
+
+    class Positions:
+        async def settled_positions(self):
+            return []
+
+        async def open_positions(self):
+            return [ExchangePosition(settlement_id="s", outcome_id="O-NYK", contracts=2040, cost_usd=999.6,
+                                     status="OPEN")]
+    await sup._sweep_venue("novig", Positions())
+    assert ghost.contracts == 0                                              # the 2040 already belong to leg 1

@@ -177,6 +177,37 @@ def settlement_pnl(pos: ExchangePosition, stake_usd: float) -> tuple[Optional[fl
     return round(payout - stake_usd, 2), round(payout, 2), f"result_{r.lower()}"
 
 
+def load_ledger_holdings(path: Optional[Path]) -> dict[tuple[str, str], dict]:
+    """What the ledger says we still hold, per (venue, outcome): HOLD rows add, a RESTORE row replaces (the
+    exchange's own snapshot), a SETTLE row clears. Used after a restart to find positions that settled while the
+    engine was down (they are no longer in the exchange's open list, so nothing else would book them)."""
+    held: dict[tuple[str, str], dict] = {}
+    if path is None or not Path(path).exists():
+        return held
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev, oid = row.get("event"), row.get("outcome_id")
+            if not oid:
+                continue
+            k = (str(row.get("venue") or "novig"), str(oid))
+            if ev == "HOLD":
+                h = held.setdefault(k, dict(contracts=0.0, cost_usd=0.0, market_id=None))
+                h["contracts"] += float(row.get("contracts") or 0)
+                h["cost_usd"] += float(row.get("cost_usd") or 0)
+                h["market_id"] = row.get("market_id") or h["market_id"]
+            elif ev == "RESTORE":
+                prev = held.get(k, {})
+                held[k] = dict(contracts=float(row.get("contracts") or 0), cost_usd=float(row.get("exposure_usd") or 0),
+                               market_id=row.get("market_id") or prev.get("market_id"))
+            elif ev == "SETTLE":
+                held.pop(k, None)
+    return {k: v for k, v in held.items() if v["contracts"] > 1e-9}
+
+
 def load_ledger_settlements(path: Optional[Path]) -> tuple[set[str], float]:
     """(already-processed settlement ids, cumulative net profit) from an existing ledger."""
     ids: set[str] = set()

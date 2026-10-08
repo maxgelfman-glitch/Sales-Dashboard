@@ -169,6 +169,8 @@ def parse_kalshi_fill(payload: Any) -> Optional[FillSlip]:
     count = _num(msg.get("count_fp")) if msg.get("count_fp") is not None else _num(msg.get("count"))
     if not oid or count is None or count <= 0:
         return None
+    if str(msg.get("market_ticker") or msg.get("ticker") or "").startswith("KXMVE"):
+        return None                         # a parlay fill: the combo quoter books it, not the straight engine
     price = _cents(msg, "yes_price")
     if price is None:                       # a NO-side print: YES price is its complement
         no = _cents(msg, "no_price")

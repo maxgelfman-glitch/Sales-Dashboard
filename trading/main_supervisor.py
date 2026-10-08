@@ -139,6 +139,8 @@ from kalshi_trading import session_tag
 from novig_private import FillSlip
 from research import DEPTH_SAMPLE_SECONDS, MARKOUT_DELAYS, GapTracker, ResearchRecorder
 from settlement import (
+    ExchangePosition,
+    load_ledger_holdings,
     BASELINE_CAPITAL_USD,
     DEFAULT_POSITIONS_PATH,
     SETTLEMENT_SWEEP_SECONDS,
@@ -261,6 +263,9 @@ class LiveOrder(BaseModel):
     venue: str = "novig"
     fill_mode: str = "cumulative"           # Kalshi fills arrive as increments
     exchange_confirmed_zero: bool = False    # the exchange's own order record says nothing filled
+    stream_filled: float = 0.0              # incremental fills seen on the socket (summed)
+    exchange_filled: Optional[float] = None  # the exchange's own record (authoritative once read)
+    cancel_attempts: int = 0
     fees: float = 0.0                        # Kalshi taker fees included in fill_cost
     expected_price: Optional[float] = None   # best ask when we decided (slippage is measured against it)
     edge: Optional[float] = None
@@ -540,6 +545,7 @@ class Supervisor:
         self.settlement_interval = settlement_interval
         self.sync_retries, self.sync_retry_delay = sync_retries, sync_retry_delay
         self.processed_settlements, self.cumulative_pnl = load_ledger_settlements(self.ledger_path)
+        self._ledger_held = load_ledger_holdings(self.ledger_path)
         self.synced = positions_client is None and kalshi_positions_client is None   # nothing to sync without one
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         self._early_slips: dict[str, list] = {}           # exchange order id -> [(received, slip)] before its ack
@@ -633,6 +639,13 @@ class Supervisor:
         task = asyncio.get_running_loop().create_task(coro)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        task.add_done_callback(self._log_task_failure)
+
+    @staticmethod
+    def _log_task_failure(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.critical("BACKGROUND task %s failed: %r — the step it was doing did not finish",
+                         task.get_coro().__name__ if task.get_coro() else task, task.exception())
 
     # ---------------- bootstrap ----------------
     async def bootstrap(self) -> None:
@@ -641,6 +654,7 @@ class Supervisor:
                 n = self.registry.replace_all(await self.novig_rest.fetch_open_markets())
                 log.info("BOOTSTRAP novig registry now holds %d outcomes", n)
                 self._index_start_times()
+                self._rekey_unmapped()
                 self._check_vanished_games(n)
                 if hasattr(self.feed, "sync_subscriptions"):
                     await self.feed.sync_subscriptions()
@@ -652,6 +666,7 @@ class Supervisor:
                 n = self.kalshi_registry.replace_all(await self.kalshi_rest.fetch_open_markets())
                 log.info("BOOTSTRAP kalshi registry now holds %d outcomes", n)
                 self._index_start_times()
+                self._rekey_unmapped()
                 if set(self.kalshi.tickers()) != before and self.kalshi._ws is not None:
                     log.info("BOOTSTRAP kalshi ticker set changed: reconnecting to resubscribe")
                     await self.kalshi._ws.close()
@@ -1421,6 +1436,19 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001
             log.critical("LIVE_ORDER could not cancel remainder of %s (%s); reservation KEPT", oid, exc)
             self._ledger("CANCEL_FAILED", exchange_order_ids=[oid], error=str(exc))
+            lo.cancel_attempts += 1
+            if hasattr(gateway, "get_order"):          # an IOC is usually finished anyway: its record decides
+                await self._reconcile_kalshi_order(lo, gateway)
+                order_final = lo.exchange_filled is not None
+                if order_final and not lo.done:
+                    self._finalize(lo, "order record final (cancel failed)")
+                    return
+            if lo.cancel_attempts < 5 and not lo.done:
+                async def retry() -> None:
+                    await asyncio.sleep(30)
+                    if not lo.done:
+                        await self._taker_timeout(oid)
+                self._spawn(retry())
             return
         if (lo.venue == "kalshi" or getattr(gateway, "reconciles", False)) and hasattr(gateway, "get_order"):
             await self._reconcile_kalshi_order(lo, gateway)
@@ -1437,14 +1465,41 @@ class Supervisor:
         filled = gateway.filled_count(order) if order else None
         if filled is None:
             return
+        lo.exchange_filled = filled
         if filled > lo.filled + 1e-9:
             missed = filled - lo.filled
             log.critical("%s order %s: exchange reports %g filled, fill channel showed %g — booking %g at the "
                          "limit %.4f", lo.venue.upper(), lo.exchange_order_id, filled, lo.filled, missed,
                          lo.limit_price)
-            await self.on_fill_slip(FillSlip(order_id=lo.exchange_order_id, status="PARTIAL", filled_volume=missed,
-                                             price_cents=lo.limit_price * 100, venue=lo.venue))
+            await self.on_fill_slip(FillSlip(order_id=lo.exchange_order_id, status="PARTIAL", filled_volume=0,
+                                             price_cents=lo.limit_price * 100, venue=lo.venue,
+                                             price_is_bought_outcome=True))
         lo.exchange_confirmed_zero = filled <= 1e-9
+
+    def _rekey_unmapped(self) -> int:
+        """A position restored while its market was unknown (bootstrap failed) sits under an UNMAPPED key: the
+        game is not locked and its per-game cap misses it. Move it to its real key once the market is known."""
+        moved = 0
+        for key in [k for k in self.positions if k[0] == "UNMAPPED"]:
+            pos = self.positions[key]
+            for leg in list(pos.legs):
+                info = self._registry_for(leg.venue).get(leg.outcome_id)
+                canon = self._canonical(MarketUpdate.from_info(info)) if info is not None else None
+                if canon is None:
+                    continue
+                real, side = canon
+                pos.legs.remove(leg)
+                leg.side, leg.league, leg.market_type, leg.line = side, info.league, info.market_type, info.line
+                leg.event_id, leg.start_time = info.event_id, info.start_time
+                self.positions.setdefault(real, MarketPosition(legs=[])).legs.append(leg)
+                moved += 1
+                log.warning("RESTORE %s re-keyed to %s now that its market is known", leg.outcome_id, real)
+            if not pos.legs:
+                del self.positions[key]
+        return moved
+
+    def _registry_for(self, venue: str) -> MarketRegistry:
+        return self.kalshi_registry if venue == "kalshi" else self.registry
 
     def _leg(self, leg_id: Optional[int]) -> Optional[PaperOrder]:
         return self.orders[leg_id - 1] if leg_id and 0 < leg_id <= len(self.orders) else None
@@ -1522,6 +1577,9 @@ class Supervisor:
                      reason=reason, avg_fill_price=round(lo.fill_cost / lo.filled, 6),
                      expected_avg_price=_sweep_avg(lo.expected_levels, lo.filled) if lo.expected_levels else None)
         self._check_price_improvement(lo)
+        info = self._registry_for(lo.venue).get(lo.outcome_id)
+        self._ledger("HOLD", venue=lo.venue, outcome_id=lo.outcome_id, market_id=info.market_id if info else None,
+                     contracts=round(lo.filled, 4), cost_usd=round(lo.fill_cost, 2))
 
     def _check_price_improvement(self, lo: LiveOrder) -> None:
         """
@@ -1594,7 +1652,11 @@ class Supervisor:
         if lo.fill_mode == "cumulative":
             delta = slip.filled_volume - lo.filled
         else:
-            delta = slip.filled_volume
+            # socket increments and the exchange's own record are two views of ONE total: book up to the larger,
+            # so a socket fill arriving after a reconcile already booked it is not counted twice
+            lo.stream_filled += slip.filled_volume
+            delta = max(lo.stream_filled, lo.exchange_filled or 0.0) - lo.filled
+        delta = min(delta, max(0.0, lo.requested - lo.filled)) if lo.requested else delta
         if delta > 1e-9:
             if slip.price_cents is not None:
                 # a legacy sell slip carries the SOLD outcome's price; Novig v3 routes a sell as a buy of the other
@@ -1651,6 +1713,8 @@ class Supervisor:
             self.exposure.record_fill(f"maker-{lo.exchange_order_id}-{self.stats['fills']}", round(delta * price, 2))
             return
         key, side = canon
+        self._ledger("HOLD", venue=lo.venue, outcome_id=info.outcome_id, market_id=info.market_id,
+                     contracts=round(delta, 4), cost_usd=round(delta * price, 2))
         leg = self._leg(lo.leg_id)
         if leg is None:
             upd = MarketUpdate.from_info(info, price=min(max(price, 0.0001), 0.9999))
@@ -1743,6 +1807,7 @@ class Supervisor:
     def _on_parlay_settled(self, venue: str, pnl: float, key: str) -> None:
         """A real parlay settled: its P&L counts toward the daily loss stop, and survives a restart (ledger)."""
         self._ledger("SETTLE", venue=venue, kind="PARLAY", position=key, net_profit_usd=pnl)
+        self.cumulative_pnl = round(self.cumulative_pnl + pnl, 2)    # same capital pool as before a restart
         self._record_daily_pnl(pnl)
 
     @staticmethod
@@ -1904,9 +1969,11 @@ class Supervisor:
             log.critical("NOVIG fill recovery: order %s filled %g, stream showed %g -> booking %g at its limit",
                          lo.exchange_order_id, filled, lo.filled, missed)
             status = str((order or {}).get("status") or "PARTIAL")
+            lo.exchange_filled = filled
             await self.on_fill_slip(FillSlip(order_id=lo.exchange_order_id,
                                              status=status if status in {"FILLED", "CANCELED"} else "PARTIAL",
-                                             filled_volume=missed, price_cents=lo.limit_price * 100, venue="novig",
+                                             filled_volume=0 if lo.fill_mode != "cumulative" else filled,
+                                             price_cents=lo.limit_price * 100, venue="novig",
                                              price_is_bought_outcome=True))
             recovered += 1
         return recovered
@@ -2170,6 +2237,7 @@ class Supervisor:
         self.orders.append(leg)
         self.positions.setdefault(key, MarketPosition(legs=[])).legs.append(leg)
         self._ledger("RESTORE", source=source, venue=venue, restore_id=leg.position_id, outcome_id=pos.outcome_id,
+                     market_id=pos.market_id or (info.market_id if info else None),
                      game_id=leg.event_id, market_type=leg.market_type, side=side, contracts=leg.contracts,
                      exposure_usd=stake, mapped=canon is not None, open_exposure_usd=self.exposure.open_exposure)
         if canon is None:
@@ -2195,7 +2263,32 @@ class Supervisor:
                                      error=f"{type(exc).__name__}: {exc}")
                         return False
                     await asyncio.sleep(self.sync_retry_delay)
-            restored += [self._restore(p, "startup", venue) for p in open_positions if not p.is_settled]
+            # settled ones first: an open list that lags its settlements must not resurrect a settled position
+            try:
+                settled = await client.settled_positions()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("SYNC %s settled list unavailable at startup (%s): the sweep will catch up", venue, exc)
+                settled = []
+            settled_outcomes = {p.outcome_id for p in settled if p.is_settled}
+            open_now = {p.outcome_id for p in open_positions if not p.is_settled}
+            restored += [self._restore(p, "startup", venue) for p in open_positions
+                         if not p.is_settled and p.outcome_id not in settled_outcomes]
+            # held when the engine stopped, gone from the open list now: settled while we were down
+            for (v, oid), h in self._ledger_held.items():
+                if v != venue or oid in open_now:
+                    continue
+                pos = next((p for p in settled if p.outcome_id == oid and p.is_settled
+                            and p.settlement_id not in self.processed_settlements), None)
+                if pos is None:
+                    log.warning("SYNC %s %s was held at shutdown and is no longer open; no settlement seen yet "
+                                "(the sweep keeps looking)", venue, oid)
+                    continue
+                leg = self._restore(ExchangePosition(settlement_id=f"ledger-{oid}", outcome_id=oid,
+                                                     market_id=h.get("market_id"), contracts=h["contracts"],
+                                                     cost_usd=h["cost_usd"], status="OPEN"), "ledger", venue)
+                key = next((k for k, mp in self.positions.items() if leg in mp.legs), None)
+                self._apply_settlement(pos, [(key, leg)])
+                log.warning("SYNC %s %s settled while the engine was down: booked now", venue, oid)
         self.synced = True
         total = round(sum(l.stake_usd for l in restored), 2)
         log.warning("SYNC restored %d open exchange position(s) worth $%.2f; open exposure $%.2f of $%.2f%s",
@@ -2280,8 +2373,12 @@ class Supervisor:
             key = next((k for k, pos in self.positions.items() if leg in pos.legs), None)
             if leg.outcome_id in open_by_outcome:
                 exch = open_by_outcome[leg.outcome_id]
-                leg.contracts = int(round(exch.contracts))
-                leg.stake_usd = round(exch.cost_usd if exch.cost_usd is not None else leg.contracts * leg.price, 2)
+                others = [l for _, l in self._legs_for_outcome(leg.outcome_id) if l is not leg]
+                tracked = sum(l.contracts for l in others)
+                mine = max(0.0, exch.contracts - tracked)        # the exchange total minus what other legs hold
+                share = mine / exch.contracts if exch.contracts else 0.0
+                leg.contracts = round(mine, 2)
+                leg.stake_usd = round(exch.cost_usd * share if exch.cost_usd is not None else mine * leg.price, 2)
                 self.exposure.adjust(leg.position_id, leg.stake_usd)
                 self.unconfirmed_legs.pop(leg_id)
                 self._ledger("UNCONFIRMED_RESOLVED", exchange_order_id=leg.exchange_order_id, filled=leg.contracts,
@@ -2788,7 +2885,7 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
             positions, fill_mode = v3["positions"], "incremental"     # v3 fill events carry each fill's own size
         live_kw = dict(live=True, order_gateway=gateway, fill_volume_mode=fill_mode,
                        max_stake=plan.max_stake, ledger_path=ledger, live_plan=plan, positions_client=positions,
-                       settlement_interval=float(env.get("SETTLEMENT_SWEEP_SECONDS", SETTLEMENT_SWEEP_SECONDS)))
+                       settlement_interval=_sweep_seconds(env))
         if v3 is not None:
             live_kw["maker_gateway"] = v3["maker_gateway"]
     elif v3 is None:
@@ -2816,6 +2913,9 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                 raise ConfigError("KALSHI_LIVE_TRADING=1 needs KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH")
             from kalshi_trading import KalshiOrderGateway, KalshiPositionsClient
             tif = (env.get("KALSHI_TIME_IN_FORCE") or "immediate_or_cancel").strip()
+            if tif.lower() not in {"immediate_or_cancel", "fill_or_kill"}:
+                raise ConfigError("KALSHI_TIME_IN_FORCE must be immediate_or_cancel or fill_or_kill: taker orders "
+                                  "must never rest on the book")
             kw.update(kalshi_gateway=KalshiOrderGateway(rest_base, key_id, pk,
                                                         time_in_force=None if tif.lower() == "none" else tif),
                       kalshi_positions_client=KalshiPositionsClient(rest_base, key_id, pk))
@@ -2895,8 +2995,12 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                      maker_enabled=maker_enabled, exposure=exposure, subscribe_messages=subscribe,
                      **kw, **live_kw)
     if v3 is not None:
-        v3["positions"].watch = lambda: [leg.outcome_id for pos in sup.positions.values() for leg in pos.legs
-                                         if leg.venue == "novig"]
+        pc = v3["positions"]
+        pc.watch = lambda: ([leg.outcome_id for pos in sup.positions.values() for leg in pos.legs
+                             if leg.venue == "novig"] + [o for v, o in sup._ledger_held if v == "novig"])
+        registry_market = pc.market_of
+        pc.market_of = lambda oid: registry_market(oid) or (sup._ledger_held.get(("novig", oid)) or {}).get(
+            "market_id")                               # a finished game is no longer in the open catalog
     return sup
 
 
@@ -2948,6 +3052,16 @@ def parlay_config(env, mode: str, plan, venue: str):
         max_leg_exposure=cap("max_leg_exposure", "COMBO_MAX_LEG_EXPOSURE", 150),
         max_game_exposure=cap("max_game_exposure", "COMBO_MAX_GAME_EXPOSURE", 300),
         max_total_liability=cap("max_total_liability", "COMBO_MAX_TOTAL_LIABILITY", 1000))
+
+
+def _sweep_seconds(env) -> float:
+    try:
+        v = float(env.get("SETTLEMENT_SWEEP_SECONDS") or SETTLEMENT_SWEEP_SECONDS)
+    except ValueError:
+        raise ConfigError("SETTLEMENT_SWEEP_SECONDS must be a number") from None
+    if not math.isfinite(v) or v < 30:
+        raise ConfigError("SETTLEMENT_SWEEP_SECONDS must be at least 30")
+    return v
 
 
 def novig_v3_from_env(env) -> Optional[dict]:

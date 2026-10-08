@@ -389,14 +389,14 @@ async def test_lost_fills_are_recovered_from_order_records(tmp_path):
                                  "TRADING_LOG_DIR": str(tmp_path), "RESEARCH_ENABLED": "0"})
     sup.live_orders["x1"] = LiveOrder(exchange_order_id="x1", kind="MAKER", outcome_id="o", key=("NFL", "a", "b", "m"),
                                       requested=5, limit_price=0.4, maker_side="buy", fill_mode="incremental")
-    booked = []
 
     async def get_order(oid):
         return {"status": "OPEN", "qty": 500, "remaining": 200}           # 3 engine contracts filled
     sup.maker_gateway.get_order = get_order
-
-    async def capture(slip):
-        booked.append(slip)
-    sup.on_fill_slip = capture
     assert await sup.recover_novig_fills() == 1
-    assert booked[0].filled_volume == 3.0 and booked[0].price_cents == 40.0 and booked[0].status == "PARTIAL"
+    lo = sup.live_orders["x1"]
+    assert lo.filled == 3.0 and lo.fill_cost == pytest.approx(1.2)        # booked at the 40c limit
+    from novig_private import FillSlip
+    await sup.on_fill_slip(FillSlip(order_id="x1", status="PARTIAL", filled_volume=3.0, price_cents=40.0,
+                                    venue="novig", price_is_bought_outcome=True))
+    assert lo.filled == 3.0                                               # the late socket fill is not double counted

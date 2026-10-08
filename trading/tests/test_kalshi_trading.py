@@ -268,3 +268,18 @@ def test_signature_covers_the_path_without_the_query_string():
     gw = KalshiOrderGateway("https://api.elections.kalshi.com/trade-api/v2", "kid", object())
     assert gw._sign_path("/portfolio/settlements?limit=200&cursor=abc%2B") == "/trade-api/v2/portfolio/settlements"
     assert gw._sign_path("/communications/rfqs?status=open") == "/trade-api/v2/communications/rfqs"
+
+
+def test_parlay_fills_are_left_to_the_combo_quoter():
+    from kalshi_trading import parse_kalshi_fill
+    msg = {"type": "fill", "msg": {"order_id": "o", "count_fp": "5", "yes_price_dollars": "0.30",
+                                   "market_ticker": "KXMVE-COMBO-1"}}
+    assert parse_kalshi_fill(msg) is None
+
+
+def test_taker_orders_can_never_be_set_to_rest(tmp_path):
+    from main_supervisor import ConfigError, build_live_supervisor
+    with pytest.raises(ConfigError):
+        build_live_supervisor({"SETTLEMENT_SWEEP_SECONDS": "0", "TRADING_MODE": "live",
+                               "LIVE_TRADING_ACKNOWLEDGED": "yes", "NOVIG_BEARER_TOKEN": "t",
+                               "TRADING_LOG_DIR": str(tmp_path)})
