@@ -360,5 +360,5 @@ def test_report_breaks_results_down_by_slice_and_flags_suspiciously_cheap_quotes
     ]
     c = combo_summary(rows_)
     assert c["far_below_market"] == 1                                    # 0.30 vs a 0.40 trade
-    assert c["by_slice"]["NFL:2L:x"]["win_rate"] == 1 and c["by_slice"]["NFL:2L:x"]["pnl"] == 7.5
-    assert c["by_slice"]["NBA:2L:sgp"]["below"] == 1
+    assert c["by_slice"]["kalshi NFL:2L:x"]["win_rate"] == 1 and c["by_slice"]["kalshi NFL:2L:x"]["pnl"] == 7.5
+    assert c["by_slice"]["kalshi NBA:2L:sgp"]["below"] == 1

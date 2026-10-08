@@ -172,6 +172,10 @@ def combo_summary(rows: list[dict]) -> dict:
     }
 
 
+def _slice_key(r: dict) -> str:
+    return f"{r.get('venue') or 'kalshi'} {r.get('slice') or '?'}"
+
+
 FAR_BELOW = 0.10           # our price 10%+ under the price the parlay actually traded at: suspect our model
 
 
@@ -180,12 +184,12 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
     and what it paid. Slices go live one by one, only when their own numbers hold up."""
     out: dict[str, dict] = {}
     for r in rfqs:
-        d = out.setdefault(r.get("slice") or "?", dict(rfqs=0, quotable=0, traded=0, wins=0, margins=[], below=0,
+        d = out.setdefault(_slice_key(r), dict(rfqs=0, quotable=0, traded=0, wins=0, margins=[], below=0,
                                                          settled=0, pnl=0.0, expected=0.0))
         d["rfqs"] += 1
         d["quotable"] += r.get("action") == "QUOTE"
     for r in trades:
-        d = out.get(r.get("slice") or "?")
+        d = out.get(_slice_key(r))
         if d is None:
             continue
         d["traded"] += 1
@@ -195,7 +199,7 @@ def combo_slices(rfqs: list[dict], trades: list[dict], results: list[dict]) -> d
                 d["margins"].append(r["margin_vs_winner"])
         d["below"] += r["our_yes_price"] < r["traded_yes_price"] * (1 - FAR_BELOW)
     for r in results:
-        d = out.get(r.get("slice") or "?")
+        d = out.get(_slice_key(r))
         if d is None:
             continue
         d["settled"] += 1
@@ -494,7 +498,7 @@ def build_report(rows: list[dict]) -> str:
         out.append("  no filled orders yet")
 
     c = combo_summary(rows)
-    out += ["", "[COMBO QUOTING]  (Kalshi parlays via RFQ; shadow = priced but not sent)"]
+    out += ["", "[COMBO QUOTING]  (Kalshi + Novig parlays via RFQ; shadow = priced but not sent)"]
     if c["rfqs"]:
         out.append(f"  RFQs {c['rfqs']:,}   we would quote {c['quotable']:,}   traded after pricing "
                    f"{c['traded_after_pricing']:,}   ours would have won {c['would_win']:,} "
@@ -508,10 +512,10 @@ def build_report(rows: list[dict]) -> str:
         if c["far_below_market"]:
             out.append(f"  WARNING {c['far_below_market']} quote(s) were 10%+ cheaper than where the parlay traded: "
                        "usually our model, not a gift")
-        out.append(f"  {'slice':<22}{'rfqs':>7}{'quote':>7}{'traded':>7}{'win%':>7}{'margin':>8}{'settled':>8}"
+        out.append(f"  {'venue slice':<28}{'rfqs':>7}{'quote':>7}{'traded':>7}{'win%':>7}{'margin':>8}{'settled':>8}"
                    f"{'P&L':>10}{'expected':>10}")
         for name, d in list(c["by_slice"].items())[:15]:
-            out.append(f"  {name:<22}{d['rfqs']:>7,}{d['quotable']:>7,}{d['traded']:>7,}"
+            out.append(f"  {name:<28}{d['rfqs']:>7,}{d['quotable']:>7,}{d['traded']:>7,}"
                        f"{_fmt(d['win_rate'] and d['win_rate'] * 100, '.1f'):>7}"
                        f"{_fmt(d['median_margin'] and d['median_margin'] * 100, '+.1f'):>8}{d['settled']:>8,}"
                        f"{d['pnl']:>10,.2f}{d['expected']:>10,.2f}")

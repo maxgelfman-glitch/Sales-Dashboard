@@ -199,6 +199,30 @@ quote them. Kalshi prices combos by **Request For Quote**: a user builds a combo
   the combo maker fee and its NFL exemption (from news reports); that makers can list other members' open RFQs
   and see their `creator_id`.
 
+## Novig parlays (`NOVIG_RFQ`) and Novig's public data
+**Is it worth it? Measure first:** `python novig_data.py --days 7` downloads Novig's free daily trade files
+(data.novig.com) on your machine and prints a short summary to paste back: parlays per day, retail stake,
+typical price and legs, how many quoters split each trade, busiest hours, and straight volume by league and
+market type. No installs needed (standard library).
+
+**Quoting:** `novig_rfq.py` answers Novig's parlay auctions as a registered pricer (liquidity provider), over
+Novig's RFQ websocket. The auction lasts 3 seconds, the lowest price wins, and the winner has 1 second to confirm.
+Quoters pay no fee. Pricing is the Kalshi quoter's (same per-leg uncertainty margins, same-game parlays
+shadow-only, size shrinking with doubt) with its own risk book.
+* **Access:** email developers@novig.com to become an LP (W-9; QA test access within ~2 business days;
+  production generally needs a $30,000 deposit). Novig then gives you API credentials: put
+  `NOVIG_RFQ_ACCESS_TOKEN` (or `NOVIG_RFQ_CLIENT_ID`, `NOVIG_RFQ_CLIENT_SECRET`, `NOVIG_RFQ_TOKEN_URL`) in
+  `live.env`, then register once: `python novig_rfq.py register` (`status` shows the registration and your
+  open collateral).
+* **Modes:** `shadow` (prices every auction, sends nothing; Novig reports every auction's winning price, so it
+  learns where we would have won), `qa` (real quotes on Novig's test exchange), `live` (`TRADING_MODE=live`).
+* **Caps:** `NOVIG_RFQ_MAX_LOSS_PER_COMBO`, `NOVIG_RFQ_MAX_LEG_EXPOSURE`, `NOVIG_RFQ_MAX_TOTAL_LIABILITY`
+  (default to the `COMBO_*` values). Our max stake per quote is set so the collateral fits the caps; below the
+  round's minimum stake we decline.
+* **Results** appear in the report's [COMBO QUOTING] table under `novig <slice>`.
+* **To confirm on QA:** that `result` on `GET /rfq/executions` is the parlay's result from the bettor's side;
+  the token URL Novig gives you.
+
 ## Realistic paper execution and the size ladder
 Paper trading defaults to `PAPER_EXECUTION=simulated`. Every paper order goes through the **same order path
 as live trading** (reservations, tranches, fees, positions) against a simulated exchange (`sim_exchange.py`):

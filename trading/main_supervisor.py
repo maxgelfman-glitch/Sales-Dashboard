@@ -418,6 +418,7 @@ class Supervisor:
         sim_depth_haircut: float = 0.5,
         combo_quoter=None,
         novig_feed=None,
+        novig_rfq=None,
     ) -> None:
         if live and order_gateway is None:
             raise ValueError("live mode needs an order_gateway")
@@ -555,6 +556,13 @@ class Supervisor:
             combo_quoter.allowed = self._combo_block_reason
             self._task_factories["combo_quoter"] = combo_quoter.run
             self._task_factories["combo_results"] = combo_quoter.results_loop
+        self.novig_rfq = novig_rfq
+        if novig_rfq is not None:
+            novig_rfq.leg_lookup = self.novig_leg_fair
+            novig_rfq.allowed = self._combo_block_reason
+            novig_rfq.on_state_change = self.on_feed_state
+            self._task_factories["novig_rfq"] = novig_rfq.run
+            self._task_factories["novig_rfq_results"] = novig_rfq.results_loop
         if self.kalshi is not None:
             self._task_factories["kalshi_feed"] = self.kalshi.run
         if self.maker is not None:
@@ -1604,6 +1612,27 @@ class Supervisor:
         spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
         return LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread, books=books or None)
 
+    def novig_leg_fair(self, outcome_id: str):
+        """(event id, LegFair) for a Novig outcome used as a parlay leg: P(this outcome wins) from the sharp line."""
+        from combo_quoter import LegFair
+        info = self.registry.get(outcome_id)
+        if info is None:
+            return None
+        canon = self._canonical(MarketUpdate.from_info(info))
+        if canon is None:
+            return None
+        key, side = canon
+        sharp = self.book.lookup(key[0], key[1], key[2], key[3], side, line=info.line)
+        fair = self._fair(sharp) if sharp is not None else None
+        if fair is None:
+            return None
+        if self._trade_blocked(key[:3], "taker"):             # live, cut off, or no start time: never a leg
+            return None
+        age = self.book.age_of(key[0], key[1], key[2], key[3], side) or 0.0
+        spread, books = self.book.dispersion(key[0], key[1], key[2], key[3], side, line=info.line)
+        return info.event_id, LegFair(prob_yes=fair, source="sharp", age_s=age, game=key[:3], spread=spread,
+                                      books=books or None)
+
     def _combo_block_reason(self) -> Optional[str]:
         if self._loss_halted():
             return "daily loss stop"
@@ -2276,6 +2305,7 @@ class Supervisor:
                                          self.order_gateway, self.positions_client, self.kalshi_gateway,
                                          self.kalshi_positions_client,
                                          self.prophetx.client if self.prophetx is not None else None,
+                                         self.novig_rfq.rest if self.novig_rfq is not None else None,
                                          *self.sim_gateways.values())
                       if c is not None}
         for closeable in closeables.values():
@@ -2677,6 +2707,35 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                           max_total_liability=f("COMBO_MAX_TOTAL_LIABILITY", 1000))
         kw["combo_quoter"] = ComboQuoter(cfg, KalshiComms(KalshiOrderGateway(base, key_id, load_private_key(key_path))),
                                          leg_fair=lambda leg: None, research=kw.get("research"))
+    rfq_mode = (env.get("NOVIG_RFQ") or "off").strip().lower()
+    if rfq_mode not in {"off", "shadow", "qa", "live"}:
+        raise ConfigError("NOVIG_RFQ must be off, shadow, qa or live")
+    if rfq_mode != "off":
+        from combo_quoter import ComboConfig
+        from novig_rfq import PROD_HOST as RFQ_PROD, QA_HOST as RFQ_QA, NovigRfqQuoter, auth_from_env
+        if rfq_mode == "live" and not live:
+            raise ConfigError("NOVIG_RFQ=live needs TRADING_MODE=live (use shadow or qa otherwise)")
+        try:
+            auth = auth_from_env(env)
+        except ValueError as exc:
+            raise ConfigError(f"NOVIG_RFQ: {exc} (Novig gives these at LP onboarding)") from None
+        rfq_host = env.get("NOVIG_RFQ_HOST") or (RFQ_QA if rfq_mode == "qa" else RFQ_PROD)
+
+        def g(name, default):
+            try:
+                return float(env.get(name) or default)
+            except ValueError:
+                raise ConfigError(f"{name} must be a number") from None
+        kinds = tuple(k.strip().lower() for k in (env.get("COMBO_LIVE_KINDS") or "xgame").split(",") if k.strip())
+        rcfg = ComboConfig(mode=rfq_mode, max_legs=int(g("COMBO_MAX_LEGS", 6)),
+                           live_max_legs=int(g("COMBO_LIVE_MAX_LEGS", 4)), live_kinds=kinds,
+                           base_margin=g("COMBO_BASE_MARGIN", 0.04), per_leg_margin=g("COMBO_PER_LEG_MARGIN", 0.02),
+                           min_roc=g("COMBO_MIN_ROC", 0.01),
+                           max_loss_per_combo=g("NOVIG_RFQ_MAX_LOSS_PER_COMBO", g("COMBO_MAX_LOSS_PER_COMBO", 25)),
+                           max_leg_exposure=g("NOVIG_RFQ_MAX_LEG_EXPOSURE", g("COMBO_MAX_LEG_EXPOSURE", 150)),
+                           max_total_liability=g("NOVIG_RFQ_MAX_TOTAL_LIABILITY",
+                                                 g("COMBO_MAX_TOTAL_LIABILITY", 1000)))
+        kw["novig_rfq"] = NovigRfqQuoter(rcfg, auth, rfq_host)
     mode = (env.get("NOVIG_MULTI_LEVEL_MODE") or "staggered").strip().lower()
     if mode not in MULTI_LEVEL_MODES:
         raise ConfigError(f"NOVIG_MULTI_LEVEL_MODE={mode!r} must be one of {', '.join(MULTI_LEVEL_MODES)}")
@@ -2694,6 +2753,8 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
               **risk_controls_from_env(env), **fair_value_from_env(env), **taker_filters_from_env(env))
     if kw.get("combo_quoter") is not None:
         kw["combo_quoter"].research = kw["research"]
+    if kw.get("novig_rfq") is not None:
+        kw["novig_rfq"].research = kw["research"]
     kw.setdefault("novig_rest", None if registry is not None else NovigRestClient(events_url, token))
     sup = Supervisor(feed_url=feed_url, registry=registry, token=token,
                       sharp_fetch=sharp_source_from_env(env),
@@ -2793,6 +2854,7 @@ def describe_state(sup: Supervisor) -> dict:
             if sup.live else "paper execution"),
         "kalshi_socket": None if sup.kalshi is None else sup.kalshi.url,
         "prophetx": "off" if sup.prophetx is None else f"price feed (paper + research only) {sup.prophetx.url}",
+        "novig_rfq": "off" if sup.novig_rfq is None else f"{sup.novig_rfq.cfg.mode} ({sup.novig_rfq.url})",
         "combo": "off" if sup.combo is None else (
             f"{sup.combo.cfg.mode.upper()}: <= {sup.combo.cfg.max_legs} legs, margin {sup.combo.cfg.base_margin:.0%} + "
             f"{sup.combo.cfg.per_leg_margin:.0%}/leg, min return {sup.combo.cfg.min_roc:.0%}, caps "
@@ -2883,6 +2945,7 @@ def format_state_report(sup: Supervisor) -> str:
         ("HTTP timeout / poll / freshness", f"{st['sharp_http_timeout_s']}s / {st['sharp_poll_s']}s / {st['sharp_max_age_s']}s"),
         ("COMBOS (parlay quoting)", None),
         ("Mode", st["combo"]),
+        ("Novig parlays (NOVIG_RFQ)", st["novig_rfq"]),
         ("PROPHETX", None),
         ("Status", st["prophetx"]),
         ("KALSHI", None),
