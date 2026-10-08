@@ -204,6 +204,10 @@ class FakeComms:
     async def trades(self, ticker, min_ts=None):
         return self.trade_rows.get(ticker, [])
 
+    async def get_rfq(self, rid):
+        self.rfq_lookups = getattr(self, "rfq_lookups", 0) + 1
+        return next((r for r in self.rfqs if r["id"] == rid), {})
+
 
 def quoter(tmp_path, mode="demo", **kw):
     clock = {"t": 1_000_000.0}
@@ -398,7 +402,9 @@ async def test_restart_restores_open_short_parlays_into_the_total_cap(tmp_path):
         return [{"ticker": "KXMVE-COMBO-9", "position_fp": "-40", "market_exposure_dollars": "26.40"},
                 {"ticker": "KXNBAGAME-26OCT01BOSNYK-NYK", "position_fp": "10", "market_exposure_dollars": "5"}]
     q.comms.positions = positions
+    q.comms.markets["KXMVE-COMBO-9"] = {"mve_selected_legs": [{"market_ticker": T1, "event_ticker": "E", "side": "yes"}]}
     assert await q.restore() == pytest.approx(26.40) and q.book.total() == pytest.approx(26.40)
+    assert q.book.leg_exposure(Leg(T1, "E", "yes")) == pytest.approx(26.40)      # the leg cap sees it
 
 
 async def test_unpriceable_legs_are_looked_up_within_a_budget(tmp_path):
@@ -502,3 +508,25 @@ def test_parlays_are_held_to_the_canary_and_hard_ceilings(tmp_path):
     for bad in ("nan", "inf", "20000", "-1"):
         with pytest.raises(ConfigError):
             parlay_config({"COMBO_MAX_TOTAL_LIABILITY": bad}, "shadow", None, "kalshi")
+
+
+
+async def test_websocket_pushes_rfqs_wins_and_executions_without_polling(tmp_path):
+    import json as _json
+    from combo_quoter import KalshiCommsFeed
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    ws = KalshiCommsFeed("wss://demo/trade-api/ws/v2", "kid", rsa.generate_private_key(public_exponent=65537,
+                                                                                       key_size=2048))
+    clock = {"t": 1_000_000.0}
+    q = ComboQuoter(ComboConfig(mode="demo", followup_after_s=10), FakeComms(), leg_fair,
+                    research=ResearchRecorder(tmp_path, clock=lambda: clock["t"]), clock=lambda: clock["t"], ws=ws)
+    ws.feed.connected.set()                                          # push mode: no polling of open RFQs
+    q.comms.rfqs = [rfq("r1")]
+    await ws.dispatch(_json.dumps({"type": "rfq_created", "msg": {"rfq_id": "r1", "market_ticker": "KXMVE-COMBO-1"}}))
+    assert q.comms.rfq_lookups == 1 and len(q.comms.created) == 1     # legs read once, then quoted
+    await ws.dispatch(_json.dumps({"type": "quote_accepted", "msg": {"quote_id": "q1", "accepted_side": "yes"}}))
+    assert q.comms.confirmed == ["q1"]                                # last look on the event itself
+    await ws.dispatch(_json.dumps({"type": "quote_executed", "msg": {"quote_id": "q1"}}))
+    assert "q1" in q.positions and "q1" not in q.quotes
+    await q.step()                                                    # a poll in push mode reads no RFQ list
+    assert len(q.comms.created) == 1

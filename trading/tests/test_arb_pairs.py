@@ -10,6 +10,7 @@ import pytest
 from execution import kalshi_taker_fee
 from main_supervisor import DEMO_KALSHI_MARKETS, DEMO_MARKETS, Supervisor
 from novig_feed import MarketRegistry
+from novig_private import FillSlip
 from research import ResearchRecorder
 from tests.test_kalshi_trading import K_BOS, FakeKalshiGateway, kalshi_sup
 from tests.test_live_execution import live_sup, slip, upd
@@ -74,6 +75,10 @@ async def test_live_pair_sends_both_legs_on_their_venues():
     await show(sup, upd("O-NYK", 0.51, volume=500))
     assert sup.order_gateway.placed == []                                     # 2.3% edge alone: no bet
     await show(sup, upd(K_BOS, 0.46, volume=400))
+    assert sup.order_gateway.placed == []                                     # second leg waits for the first's fill
+    await sup.on_fill_slip(FillSlip(order_id="k1", status="FILLED", filled_volume=400, price_cents=46,
+                                    venue="kalshi"))
+    await asyncio.sleep(0.01)
     [novig] = sup.order_gateway.placed
     [kalshi] = sup.kalshi_gateway.placed
     assert (novig["outcome_id"], kalshi["outcome_id"]) == ("O-NYK", K_BOS)
@@ -90,13 +95,23 @@ async def test_live_without_kalshi_execution_never_pairs_across_venues():
     assert sup.order_gateway.placed == [] and sup.stats["arb_pairs"] == 0
 
 
-async def test_one_leg_missing_leaves_a_plain_position_that_can_still_be_hedged():
+async def test_a_first_leg_that_fills_nothing_sends_no_second_leg_and_the_gap_is_retried():
     sup = kalshi_sup(FakeKalshiGateway(reported_fill=0), timeout=0.05)
     await show(sup, upd("O-NYK", 0.51, volume=400))
-    await show(sup, upd(K_BOS, 0.46, volume=400))
-    await sup.on_fill_slip(slip("ex-1", "FILLED", 400, 51))                   # Novig leg fills
-    await asyncio.sleep(0.2)                                                   # Kalshi leg: nothing (IOC)
-    pos = sup.positions[KEY]
-    assert [l.venue for l in pos.legs] == ["novig"] and not pos.hedged and pos.unhedged() == 400
+    await show(sup, upd(K_BOS, 0.46, volume=400))                              # Kalshi leg first: fills nothing
+    await asyncio.sleep(0.2)
+    assert sup.order_gateway.placed == [] and KEY not in sup.positions         # nothing naked, nothing held
     await show(sup, upd(K_BOS, 0.46, volume=400))                              # the gap is still there
-    assert len(sup.kalshi_gateway.placed) == 2                                 # normal hedge path retries
+    assert len(sup.kalshi_gateway.placed) == 2                                 # tried again
+
+
+async def test_a_partial_first_leg_gets_a_second_leg_of_the_same_size():
+    sup = kalshi_sup()
+    await show(sup, upd("O-NYK", 0.51, volume=500))
+    await show(sup, upd(K_BOS, 0.46, volume=400))
+    await sup.on_fill_slip(FillSlip(order_id="k1", status="PARTIAL", filled_volume=150, price_cents=46,
+                                    venue="kalshi"))
+    await sup.on_fill_slip(FillSlip(order_id="k1", status="CANCELED", filled_volume=0, venue="kalshi"))
+    await asyncio.sleep(0.01)
+    [novig] = sup.order_gateway.placed
+    assert novig["contracts"] == 150                                           # never over-hedged

@@ -283,3 +283,13 @@ def test_taker_orders_can_never_be_set_to_rest(tmp_path):
         build_live_supervisor({"SETTLEMENT_SWEEP_SECONDS": "0", "TRADING_MODE": "live",
                                "LIVE_TRADING_ACKNOWLEDGED": "yes", "NOVIG_BEARER_TOKEN": "t",
                                "TRADING_LOG_DIR": str(tmp_path)})
+
+
+async def test_the_rate_limiter_paces_calls_instead_of_hitting_429():
+    import time as _t
+    from kalshi_trading import _Bucket
+    b = _Bucket(rate=50.0, burst=2.0)
+    t0 = _t.monotonic()
+    for _ in range(5):
+        await b.acquire()
+    assert _t.monotonic() - t0 >= (5 - 2) / 50.0 - 0.01      # the burst, then paced at the rate

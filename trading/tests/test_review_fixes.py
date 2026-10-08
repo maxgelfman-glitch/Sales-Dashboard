@@ -87,9 +87,13 @@ async def test_a_failed_second_pair_leg_never_leaves_the_first_marked_hedged():
 
     async def down(*a, **k):
         raise RuntimeError("novig down")
+    from novig_private import FillSlip
     await show(sup, upd("O-NYK", 0.51, volume=500))
     sup.order_gateway.place_limit = down                                 # the second leg's venue fails
     await show(sup, upd(K_BOS, 0.46, volume=400))                       # pair: Kalshi leg first, then Novig
+    await sup.on_fill_slip(FillSlip(order_id="k1", status="FILLED", filled_volume=400, price_cents=46,
+                                    venue="kalshi"))
+    await asyncio.sleep(0.01)
     pos = sup.positions.get(KEY)
     assert pos is not None and not pos.hedged                            # the Kalshi leg stands alone: SEEN as naked
     assert sup.game_unhedged(KEY[:3]) > 0

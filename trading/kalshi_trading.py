@@ -26,6 +26,7 @@ until Novig's canary has been reconciled.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -66,6 +67,41 @@ class KalshiError(RuntimeError):
         self.status = status
 
 
+class _Bucket:
+    """Token bucket shared by every gateway of one API key (Kalshi limits per key, separately for reads and
+    writes). acquire() waits instead of letting Kalshi answer 429."""
+
+    def __init__(self, rate: float, burst: float) -> None:
+        self.rate, self.burst = rate, burst
+        self.tokens, self.at = burst, time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self, cost: float = 1.0) -> None:
+        async with self.lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.burst, self.tokens + (now - self.at) * self.rate)
+                self.at = now
+                if self.tokens >= cost:
+                    self.tokens -= cost
+                    return
+                await asyncio.sleep((cost - self.tokens) / self.rate)
+
+    def pause(self, seconds: float) -> None:
+        self.tokens = -seconds * self.rate          # Kalshi said "wait": nothing goes out until then
+
+
+_BUCKETS: dict[tuple[str, str], _Bucket] = {}
+READ_RPS, WRITE_RPS = 20.0, 10.0                    # Kalshi Basic tier; raise via KALSHI_READ_RPS / KALSHI_WRITE_RPS
+
+
+def _bucket(key_id: str, kind: str) -> _Bucket:
+    if (key_id, kind) not in _BUCKETS:
+        rate = READ_RPS if kind == "read" else WRITE_RPS
+        _BUCKETS[(key_id, kind)] = _Bucket(rate, rate)
+    return _BUCKETS[(key_id, kind)]
+
+
 class KalshiOrderGateway:
     """Same interface as NovigOrderGateway: place_limit / cancel_orders / close (+ get_order)."""
 
@@ -90,14 +126,28 @@ class KalshiOrderGateway:
     async def _request(self, method: str, path: str, json_body: Optional[dict] = None) -> tuple[int, Any]:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self.timeout)
-        headers = auth_headers(self.key_id, self.private_key, method, self._sign_path(path))
-        headers["Content-Type"] = "application/json"
-        async with self._session.request(method, self.api_base + path, json=json_body, headers=headers) as resp:
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:  # noqa: BLE001
-                data = await resp.text()
-            return resp.status, data
+        bucket = _bucket(self.key_id, "read" if method == "GET" else "write")
+        for attempt in range(2):
+            await bucket.acquire()
+            headers = auth_headers(self.key_id, self.private_key, method, self._sign_path(path))
+            headers["Content-Type"] = "application/json"
+            async with self._session.request(method, self.api_base + path, json=json_body, headers=headers) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:  # noqa: BLE001
+                    data = await resp.text()
+                if resp.status == 429 and attempt == 0:
+                    try:
+                        wait = float(resp.headers.get("Retry-After") or 1.0)
+                    except ValueError:
+                        wait = 1.0
+                    bucket.pause(min(wait, 10.0))
+                    log.warning("KALSHI rate limited on %s %s: backing off %.1fs", method, path.split("?")[0], wait)
+                    if method != "GET":
+                        return resp.status, data    # never auto-resend an order: the caller decides
+                    continue
+                return resp.status, data
+        return resp.status, data
 
     @staticmethod
     def order_body(ticker: str, price_cents: float, contracts: int, client_id: str,

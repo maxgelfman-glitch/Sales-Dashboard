@@ -45,6 +45,7 @@ maker fee on RFQ fills. Endpoints and fields are from Kalshi's published OpenAPI
 from __future__ import annotations
 
 import asyncio
+import json
 import dataclasses
 import logging
 import math
@@ -448,6 +449,10 @@ class KalshiComms:
     async def open_rfqs(self) -> list[dict]:
         return (await self._ok("GET", "/communications/rfqs?status=open&limit=100") or {}).get("rfqs") or []
 
+    async def get_rfq(self, rfq_id: str) -> dict:
+        data = await self._ok("GET", f"/communications/rfqs/{rfq_id}")
+        return (data or {}).get("rfq") or data or {}
+
     async def create_quote(self, rfq_id: str, yes_bid: float, no_bid: float) -> str:
         data = await self._ok("POST", "/communications/quotes",
                               {"rfq_id": rfq_id, "yes_bid": f"{yes_bid:.4f}", "no_bid": f"{no_bid:.4f}",
@@ -477,10 +482,64 @@ class KalshiComms:
         return (await self._ok("GET", q) or {}).get("trades") or []
 
 
+class KalshiCommsFeed:
+    """
+    Kalshi's `communications` websocket: rfq_created (every member), quote_accepted / quote_executed (ours only).
+    Pushes instead of polling: a win reaches the last look in milliseconds, and RFQs are not sampled 100 at a time.
+    `shard_factor` N delivers 1/N of all RFQs to this connection (Kalshi sees ~100+/s; each one we price may need
+    a REST call), so volume is chosen, not imposed. Message fields per Kalshi's docs (verify on demo).
+    """
+
+    def __init__(self, url: str, key_id: str, private_key, shard_factor: int = 10, shard_key: int = 0) -> None:
+        from ws_base import ResilientWebSocketFeed
+
+        outer = self
+
+        class _Feed(ResilientWebSocketFeed):
+            venue = "kalshi_rfq"
+
+            def _headers(self):
+                from kalshi_feed import WS_SIGN_PATH, auth_headers
+                return auth_headers(key_id, private_key, "GET", WS_SIGN_PATH)
+
+            async def _on_open(self, ws):
+                params: dict[str, Any] = {"channels": ["communications"]}
+                if shard_factor > 1:
+                    params.update(shard_factor=shard_factor, shard_key=shard_key)
+                await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": params}))
+                log.info("COMBO websocket subscribed to communications (shard %d/%d)", shard_key, shard_factor)
+
+            async def _handle_raw(self, raw):
+                await outer.dispatch(raw)
+
+        self.feed = _Feed(url, None, stale_after=120.0)
+        self.handlers: dict[str, Callable[[dict], Awaitable[None]]] = {}
+
+    @property
+    def connected(self) -> bool:
+        return self.feed.connected.is_set()
+
+    async def dispatch(self, raw) -> None:
+        try:
+            msg = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        handler = self.handlers.get(str(msg.get("type") or ""))
+        if handler is not None and isinstance(msg.get("msg"), dict):
+            try:
+                await handler(msg["msg"])
+            except Exception:  # noqa: BLE001
+                log.exception("COMBO websocket handler failed (continuing)")
+
+    async def run(self) -> None:
+        await self.feed.run()
+
+
 class ComboQuoter:
     def __init__(self, cfg: ComboConfig, comms: KalshiComms, leg_fair: Callable[[Leg], Optional[LegFair]],
                  research=None, allowed: Callable[[], Optional[str]] = lambda: None, clock=time.time,
-                 sportsbook_price: Optional[Callable[[list], Optional[float]]] = None) -> None:
+                 sportsbook_price: Optional[Callable[[list], Optional[float]]] = None,
+                 ws: Optional[KalshiCommsFeed] = None) -> None:
         self.cfg = cfg
         self.comms = comms
         self.requesters = RequesterBook(cfg)
@@ -497,6 +556,10 @@ class ComboQuoter:
         self._book_cache: dict[str, tuple[float, Optional[LegFair]]] = {}
         self._fetch_budget = cfg.book_fetches_per_step
         self.stats: dict[str, int] = {}
+        self.ws = ws
+        if ws is not None:
+            ws.handlers.update(rfq_created=self.on_ws_rfq, quote_accepted=self.on_ws_accepted,
+                               quote_executed=self.on_ws_executed)
 
     # ------------------------------------------------------------------ fair values
     def _leg_fair_with_fallback(self, primary):
@@ -544,8 +607,8 @@ class ComboQuoter:
             self._book_cache[leg.market_ticker] = (now, lf)
 
     async def restore(self) -> float:
-        """After a restart: count every short parlay we still hold toward the total cap (legs unknown, so the
-        per-leg and per-game caps cannot include them: logged)."""
+        """After a restart: every short parlay we still hold counts toward the caps again, with its legs (read from
+        the combo market) so the per-leg and per-game caps include it."""
         if self.cfg.mode == "shadow" or not hasattr(self.comms, "positions"):
             return 0.0
         total = 0.0
@@ -558,7 +621,12 @@ class ComboQuoter:
             key = f"restored-{ticker}"
             if key in self.book.open:
                 continue
-            self.book.open[key] = ([], exposure)
+            legs: list[Leg] = []
+            try:                                       # the combo market lists its legs: per-leg/game caps see it
+                legs = parse_legs(await self.comms.market(ticker))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("COMBO restored %s without its legs (%s): total cap only", ticker, exc)
+            self.book.open[key] = (legs, exposure)
             n = abs(held)
             no = min(max(exposure / n, 0.0001), 0.9999)
             cp = ComboPrice(action="QUOTE", reason="restored", contracts=n, no_bid=round(no, 4),
@@ -566,8 +634,7 @@ class ComboQuoter:
             self.positions[key] = dict(price=cp, ticker=ticker, at=self.clock(), creator=None)   # settles normally
             total += exposure
         if total:
-            log.warning("COMBO restored $%.2f of open short-parlay liability from Kalshi (legs unknown: total cap "
-                        "only)", total)
+            log.warning("COMBO restored $%.2f of open short-parlay liability from Kalshi", total)
         return total
 
     # ------------------------------------------------------------------ main loop
@@ -578,18 +645,27 @@ class ComboQuoter:
             log.critical("COMBO could not restore open parlay liability (%s): quoting anyway would ignore it; "
                          "stopping the combo quoter", exc)
             return
-        while True:
-            try:
-                await self.step()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001
-                log.exception("COMBO step failed (continuing)")
-            await asyncio.sleep(self.cfg.poll_s)
+        ws_task = asyncio.get_running_loop().create_task(self.ws.run()) if self.ws is not None else None
+        try:
+            while True:
+                try:
+                    await self.step()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    log.exception("COMBO step failed (continuing)")
+                await asyncio.sleep(self.cfg.poll_s)
+        finally:
+            if ws_task is not None:
+                ws_task.cancel()
+
+    def _push_mode(self) -> bool:
+        return self.ws is not None and self.ws.connected
 
     async def step(self) -> None:
         self._fetch_budget = self.cfg.book_fetches_per_step
-        rfqs = await self.comms.open_rfqs()
+        # with the websocket up, RFQs and wins arrive as events; polling is the fallback when it is down
+        rfqs = [] if self._push_mode() else await self.comms.open_rfqs()
         for rfq in rfqs:
             rid = str(rfq.get("id"))
             if rid in self.seen:
@@ -601,6 +677,37 @@ class ComboQuoter:
         if self.cfg.mode != "shadow":
             await self._manage_quotes()
         await self._followup()
+
+    # ---------------------------------------------------------------- websocket events
+    async def on_ws_rfq(self, msg: dict) -> None:
+        rid = str(msg.get("rfq_id") or msg.get("id") or "")
+        if not rid or rid in self.seen:
+            return
+        self.seen.add(rid)
+        rfq = {**msg, "id": rid}
+        if not rfq.get("mve_selected_legs"):             # the event may not carry the legs: read the RFQ once
+            if self._fetch_budget <= 0:
+                self._count("rfq_skipped_budget")
+                return
+            self._fetch_budget -= 1
+            try:
+                rfq = {**rfq, **await self.comms.get_rfq(rid), "id": rid}
+            except Exception as exc:  # noqa: BLE001
+                log.debug("COMBO rfq %s lookup failed: %s", rid, exc)
+                return
+        await self.on_rfq(rfq)
+
+    async def on_ws_accepted(self, msg: dict) -> None:
+        qid = str(msg.get("quote_id") or "")
+        q = self.quotes.get(qid)
+        if q is not None and not q.get("confirm_sent"):
+            await self._last_look(qid, q, msg)            # milliseconds after the accept, not on the next poll
+
+    async def on_ws_executed(self, msg: dict) -> None:
+        qid = str(msg.get("quote_id") or "")
+        q = self.quotes.get(qid)
+        if q is not None:
+            self._executed(qid, q, msg)
 
     async def on_rfq(self, rfq: dict) -> ComboPrice:
         legs = parse_legs(rfq)
@@ -652,7 +759,16 @@ class ComboQuoter:
 
     async def _manage_quotes(self) -> None:
         now = self.clock()
+        push = self._push_mode()
         for qid, q in list(self.quotes.items()):
+            if push and not q.get("confirm_sent"):     # wins arrive as events: only expire stale quotes here
+                if now - q["created"] > self.cfg.quote_ttl_s:
+                    try:
+                        await self.comms.delete_quote(qid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._drop(qid, "expired (TTL)")
+                continue
             try:                                       # one quote's failure never stops the others
                 info = await self.comms.get_quote(qid)
                 status = str(info.get("status") or "").lower()

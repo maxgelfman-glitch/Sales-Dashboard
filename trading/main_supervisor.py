@@ -554,6 +554,7 @@ class Supervisor:
         self.synced = positions_client is None and kalshi_positions_client is None   # nothing to sync without one
         self.unconfirmed_legs: dict[int, float] = {}     # leg order_id -> time it became UNCONFIRMED
         self._early_slips: dict[str, list] = {}           # exchange order id -> [(received, slip)] before its ack
+        self._pending_pairs: dict[tuple, tuple] = {}      # game key -> second leg waiting for the first's fill
         self.venue_halts: dict[str, tuple[float, str]] = {}   # venue -> (halted until, reason)
         self.league_min_edge = dict(DEFAULT_LEAGUE_MIN_EDGE if league_min_edge is None else league_min_edge)
         self.heartbeat_url = heartbeat_url                  # dead-man switch (e.g. healthchecks.io): pinged while healthy
@@ -1247,21 +1248,40 @@ class Supervisor:
             held = self.positions.get(key)
             if held is None:                              # first leg rejected / not sent: nothing to pair
                 return True
-            held.hedged = True                            # the second leg is on its way
-            try:
-                await self._send_live_taker("ARB_HEDGE", other, key, other_side, n, cost_b, None, False, held=held,
-                                            locked_per_contract=locked / n)
-            except Exception as exc:  # noqa: BLE001 — never leave the first leg marked as hedged
-                held.hedged = held.unhedged() <= 0 and len(held.legs) > 1
-                log.critical("ARB_PAIR second leg on %s failed (%s: %s): first leg is NAKED; normal hedging "
-                             "will keep trying", other.venue, type(exc).__name__, exc)
-                self._ledger("PAIR_LEG_FAILED", game=list(key), venue=other.venue, error=str(exc))
+            # The second leg is sized from what the FIRST leg actually filled (an IOC can fill partly), so the
+            # pair is never over-hedged: it goes out the moment the first leg's fill is final (_finalize).
+            held.hedged = True                            # nothing else hedges it meanwhile
+            self._pending_pairs[key] = (other.venue, other.outcome_id, other_side, other)
+            if not held.primary.pending:                  # already final (instant fill): complete now
+                await self._complete_pair(key)
             return True
         leg_a = self._record("ARB_PAIR", update, side, n, cost_a, fee_a, None, False)
         leg_b = self._record("ARB_PAIR", other, other_side, n, cost_b, fee_b, None, False)
         self.positions[key] = MarketPosition(legs=[leg_a, leg_b], hedged=True)
         await self._after_taker(key)
         return True
+
+    async def _complete_pair(self, key: GameKey) -> None:
+        """Second leg of a locked pair, sized to the first leg's real fill and re-checked at the current price."""
+        pending = self._pending_pairs.pop(key, None)
+        held = self.positions.get(key)
+        if pending is None or held is None:
+            return
+        venue, outcome_id, other_side, fallback = pending
+        held.hedged = False
+        if held.unhedged() <= 0:
+            return
+        latest = self._latest_for(venue, outcome_id) or fallback
+        try:
+            await self._try_arbitrage(latest, key, other_side, held)
+        except Exception as exc:  # noqa: BLE001 — never leave the first leg marked as hedged
+            held.hedged = held.unhedged() <= 0 and len(held.legs) > 1
+            log.critical("ARB_PAIR second leg on %s failed (%s: %s): first leg is NAKED; normal hedging will keep "
+                         "trying", venue, type(exc).__name__, exc)
+            self._ledger("PAIR_LEG_FAILED", game=list(key), venue=venue, error=str(exc))
+        if not held.hedged and held.unhedged() > 0:
+            log.warning("ARB_PAIR %s: the second leg could not be completed at a locked price; %g contracts stay "
+                        "directional until a hedge locks", key, held.unhedged())
 
     # ---------------- arbitrage ----------------
     async def _try_arbitrage(self, update: MarketUpdate, key: GameKey, side: str, held: MarketPosition) -> None:
@@ -1615,6 +1635,14 @@ class Supervisor:
                 del self.positions[key]
 
     def _finalize(self, lo: LiveOrder, reason: str) -> None:
+        self._finalize_order(lo, reason)
+        key = tuple(lo.key)
+        if key in self._pending_pairs:
+            pos = self.positions.get(key)
+            if pos is None or not pos.primary.pending:      # the first leg's fill is final: send the second
+                self._spawn(self._complete_pair(key))
+
+    def _finalize_order(self, lo: LiveOrder, reason: str) -> None:
         """Order finished: exposure = what actually filled; nothing filled -> release the lock."""
         lo.done = True
         leg = self._leg(lo.leg_id)
@@ -3060,6 +3088,16 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
         if registry is None:
             registry = v3["registry"]
             kw["novig_rest"] = v3["client"]
+    import kalshi_trading
+    for name, attr in (("KALSHI_READ_RPS", "READ_RPS"), ("KALSHI_WRITE_RPS", "WRITE_RPS")):
+        if env.get(name):
+            try:
+                v = float(env[name])
+            except ValueError:
+                raise ConfigError(f"{name} must be a number") from None
+            if not 0.5 <= v <= 500:
+                raise ConfigError(f"{name} must be between 0.5 and 500 (your Kalshi API tier's limit)")
+            setattr(kalshi_trading, attr, v)
     if env.get("KALSHI_ENABLED", "0") == "1":
         prod = env.get("KALSHI_ENV", "demo").lower() == "prod"
         key_id, key_path = env.get("KALSHI_KEY_ID"), env.get("KALSHI_PRIVATE_KEY_PATH")
@@ -3114,8 +3152,20 @@ def build_live_supervisor(env: Optional[dict] = None, url: Optional[str] = None)
                                                                                                   "yes", "on"}:
             raise ConfigError("COMBO_QUOTER=live also needs KALSHI_LIVE_TRADING=1 (the second gate for real money "
                               "on Kalshi)")
+        ws = None
+        if (env.get("COMBO_WS") or "1").strip().lower() not in {"0", "false", "off"}:
+            from combo_quoter import KalshiCommsFeed
+            try:
+                shards = int(env.get("COMBO_WS_SHARD_FACTOR") or 10)
+                shard_key = int(env.get("COMBO_WS_SHARD_KEY") or 0)
+            except ValueError:
+                raise ConfigError("COMBO_WS_SHARD_FACTOR and COMBO_WS_SHARD_KEY must be whole numbers") from None
+            if not 1 <= shards <= 100 or not 0 <= shard_key < shards:
+                raise ConfigError("COMBO_WS_SHARD_FACTOR must be 1-100 and COMBO_WS_SHARD_KEY 0..factor-1")
+            ws = KalshiCommsFeed(env.get("KALSHI_WS_URL") or (KALSHI_PROD_WS_URL if prod else DEFAULT_KALSHI_WS_URL),
+                                 key_id, load_private_key(key_path), shards, shard_key)
         kw["combo_quoter"] = ComboQuoter(cfg, KalshiComms(KalshiOrderGateway(base, key_id, load_private_key(key_path))),
-                                         leg_fair=lambda leg: None, research=kw.get("research"))
+                                         leg_fair=lambda leg: None, research=kw.get("research"), ws=ws)
         kw["combo_quoter"].requesters.attach(Path(env.get("TRADING_LOG_DIR", "logs")) / "combo_requesters.json")
     rfq_mode = (env.get("NOVIG_RFQ") or "off").strip().lower()
     if rfq_mode not in {"off", "shadow", "qa", "live"}:
