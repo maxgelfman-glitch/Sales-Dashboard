@@ -59,6 +59,21 @@ def win_fee(venue: str, price: float) -> float:
     return 0.0
 
 
+TIE_LEAGUES = frozenset({"NFL", "MLB", "NHL"})   # moneylines that can end tied (or whose OT rules are unconfirmed)
+
+
+def venue_tie_payout(venue: str, price: float) -> float:
+    """What one team contract bought at `price` is assumed to pay if the game ends tied, per venue.
+    Kalshi: $1 / number of tied teams = 50c when no Tie market is listed (Kalshi contract terms, NFLGAME/MLBGAME).
+    Novig: UNCONFIRMED; its exchange's filing points to "void at fair value": modelled as a refund of the price
+    paid, never 50c. Every other venue: unconfirmed, so $0 (the worst case)."""
+    if venue == "kalshi":
+        return 0.5
+    if venue == "novig":
+        return price
+    return 0.0
+
+
 def locked_profit(a_venue: str, a_price: float, b_venue: str, b_price: float,
                   tie_payout: Optional[float] = None) -> float:
     """
@@ -68,8 +83,8 @@ def locked_profit(a_venue: str, a_price: float, b_venue: str, b_price: float,
     """
     cost = a_price + upfront_fee(a_venue, a_price) + b_price + upfront_fee(b_venue, b_price)
     scenarios = [1.0 - win_fee(a_venue, a_price) - cost, 1.0 - win_fee(b_venue, b_price) - cost]
-    if tie_payout is not None:
-        scenarios.append(2 * tie_payout - cost)
+    if tie_payout is not None:                     # a tie is possible: each venue pays by its own rule
+        scenarios.append(venue_tie_payout(a_venue, a_price) + venue_tie_payout(b_venue, b_price) - cost)
     return min(scenarios)
 
 

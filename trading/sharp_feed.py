@@ -133,6 +133,7 @@ class SharpBook:
         # series, doubleheaders) is a DIFFERENT game: only the nearest one is kept, and a venue market is only
         # priced against it when their start times agree.
         self._game_start: dict[tuple[str, str, str], float] = {}
+        self._ambiguous: set[tuple[str, str, str]] = set()     # matchups with two games close together
 
     def __len__(self) -> int:
         return len(self._lines)
@@ -192,8 +193,9 @@ class SharpBook:
                 rejected += 1                           # a side that is not in this game/market
                 continue
             gk = (league, home, away)
-            if line.start_time is not None and not self._accept_game(gk, line.start_time, now):
-                rejected += 1                           # the same matchup on another day: not this game
+            if (line.start_time is not None and not self._accept_game(gk, line.start_time, now)) \
+                    or gk in self._ambiguous:
+                rejected += 1                           # another day's game, or a doubleheader: not this game
                 continue
             canon = line.model_copy(update=dict(league=league, home_team=home, away_team=away, side=side))
             if canon.is_live:
@@ -238,22 +240,42 @@ class SharpBook:
                               stale, self.max_age)
         return stored, rejected
 
-    GAME_WINDOW_SECONDS = 6 * 3600
+    GAME_WINDOW_SECONDS = 2 * 3600          # two start times of one matchup this close are the same game
+    DOUBLEHEADER_SECONDS = 20 * 3600        # ... further apart but within this: maybe two games the same day
+    STALE_GAME_SECONDS = 6 * 3600           # a game that started this long ago is over
 
     def _accept_game(self, gk: tuple, start: float, now: float) -> bool:
         """Keep lines of the NEAREST upcoming game of a matchup. A nearer game replaces a later one; a game
-        that ended long ago is replaced by the next."""
+        that ended long ago is replaced by the next. Two games of one matchup on the same day (an MLB
+        doubleheader) cannot be told apart by team names: the matchup is refused until one of them is over."""
         held = self._game_start.get(gk)
+        if held is not None and held < now - self.STALE_GAME_SECONDS and start > held:
+            self._forget_game(gk)                                  # the old game is over: the next one starts clean
+            held = None
         if held is None or abs(held - start) <= self.GAME_WINDOW_SECONDS:
             self._game_start[gk] = start if held is None else min(held, start)
-            return True
-        if held < now - self.GAME_WINDOW_SECONDS or start < held:
+            return gk not in self._ambiguous
+        if abs(held - start) <= self.DOUBLEHEADER_SECONDS:
+            if gk not in self._ambiguous:
+                sharp_log.warning("SHARP %s has two games %.1fh apart (doubleheader?): refused until one is over",
+                                  gk, abs(held - start) / 3600)
+            self._ambiguous.add(gk)
+            self._game_start[gk] = min(held, start)
+            for store in (self._lines, self._main_src):
+                for k in [k for k in store if k[:3] == gk]:
+                    del store[k]
+            for store in (self._by_line, self._src):
+                for k in [k for k in store if k[0][:3] == gk]:
+                    del store[k]
+            return False
+        if start < held:
             self._forget_game(gk)
             self._game_start[gk] = start
             return True
         return False
 
     def _forget_game(self, gk: tuple) -> None:
+        self._ambiguous.discard(gk)
         for store in (self._lines, self._main_src):
             for k in [k for k in store if k[:3] == gk]:
                 del store[k]
@@ -263,6 +285,8 @@ class SharpBook:
 
     def same_game(self, league: str, home: str, away: str, start: Optional[float]) -> bool:
         """False when the venue market's start time says it is a different game from the one we hold."""
+        if (league, home, away) in self._ambiguous:
+            return False
         held = self._game_start.get((league, home, away))
         return start is None or held is None or abs(held - start) <= self.GAME_WINDOW_SECONDS
 

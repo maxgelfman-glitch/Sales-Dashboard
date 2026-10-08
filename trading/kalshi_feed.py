@@ -360,7 +360,14 @@ def parse_kalshi_markets(payload: Any, league: str) -> list[MarketInfo]:
         if home is None or away is None:
             log.info("BOOTSTRAP kalshi %s: unmapped teams %r", event_ticker, teams)
             continue
+        if len(ms) != 2:
+            # A listed Tie/Draw market makes BOTH team contracts settle No on a tie (Kalshi contract terms), and
+            # a two-way de-vig no longer prices them: only clean two-market games are used.
+            log.info("BOOTSTRAP kalshi %s: %d markets (tie/draw or extra market listed): skipped", event_ticker,
+                     len(ms))
+            continue
         tickers = [m["ticker"] for m in ms]
+        event_rows: list[MarketInfo] = []
         for m in ms:
             raw = m.get("yes_sub_title") or m.get("subtitle") or ""
             if dynamic:
@@ -374,10 +381,15 @@ def parse_kalshi_markets(payload: Any, league: str) -> list[MarketInfo]:
             # ASSUMED field: Kalshi's scheduled occurrence time. Novig's start time for the same game is used when
             # this is missing (the supervisor keys the cutoff on the canonical game, across venues).
             start = parse_start_time(m.get("occurrence_datetime") or m.get("expected_start_time"))
-            rows.append(MarketInfo(venue="kalshi", outcome_id=m["ticker"], market_id=event_ticker,
-                                   sibling_outcome_id=sibling, league=league, market_type="moneyline",
-                                   event_id=event_ticker, home_team=home, away_team=away, outcome=team,
-                                   start_time=start))
+            event_rows.append(MarketInfo(venue="kalshi", outcome_id=m["ticker"], market_id=event_ticker,
+                                         sibling_outcome_id=sibling, league=league, market_type="moneyline",
+                                         event_id=event_ticker, home_team=home, away_team=away, outcome=team,
+                                         start_time=start))
+        if len(event_rows) == 2 and {r.outcome for r in event_rows} == {home, away}:
+            rows.extend(event_rows)                   # one market per team, both mapped: nothing else is safe
+        else:
+            log.info("BOOTSTRAP kalshi %s: team markets do not map one-to-one to %s / %s: skipped", event_ticker,
+                     home, away)
     return rows
 
 

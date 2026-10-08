@@ -485,7 +485,7 @@ def test_check_config_report_is_plain_text_and_offline(sharp_env, tmp_path):
     report = format_state_report(sup)
     for needle in ("Trading mode", "LIVE", "wss://api.novig.com/tape", '{"event": "subscribe", "channel": "orders"}',
                    "https://api.novig.us/v1/orders", "$10.00", "$100.00", "Taker fill timeout", "2.0s",
-                   "Maker                                  off", "kalshi, novig", "UNVERIFIED"):
+                   "Maker                                  off", "kalshi", "UNVERIFIED"):
         assert needle in report, needle
     assert not sup.feed.connected.is_set()                                          # nothing was opened
 

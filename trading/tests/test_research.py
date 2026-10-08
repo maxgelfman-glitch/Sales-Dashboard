@@ -429,8 +429,9 @@ def test_partial_hedge_scenarios_are_pro_rated():
     ("novig", 0.48, "novig", 0.51, None, 0.01),
     ("novig", 0.48, "kalshi", 0.50, None, 0.0025),           # Kalshi taker fee 0.07*.5*.5 = 1.75c
     ("prophetx", 0.48, "novig", 0.50, None, 0.0096),         # ProphetX 2% of the 52c win
-    ("novig", 0.48, "novig", 0.51, 0.5, 0.01),               # dead heat pays 2 x 50c = $1: same
-    ("novig", 0.48, "novig", 0.51, 0.0, -0.99),              # a tie that pays nothing on either leg
+    ("novig", 0.48, "novig", 0.51, 0.5, 0.0),                # Novig tie modelled as a refund: 0.99 back, no lock
+    ("kalshi", 0.40, "novig", 0.55, 0.5, 0.0332),            # wins: 1 - 0.9668; tie: 0.5 + 0.55 refund - 0.9668
+    ("prophetx", 0.48, "novig", 0.50, 0.5, -0.48),           # ProphetX tie rule unconfirmed: $0
 ])
 def test_locked_profit(a, pa, b, pb, tie, expected):
     assert locked_profit(a, pa, b, pb, tie) == pytest.approx(expected)

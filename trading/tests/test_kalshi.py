@@ -178,3 +178,15 @@ def test_series_from_env():
 
 def test_defaults_are_demo():
     assert KalshiFeed().url == "wss://demo-api.kalshi.co/trade-api/ws/v2"
+
+
+def test_a_kalshi_game_with_a_tie_market_is_never_used():
+    from kalshi_feed import parse_kalshi_markets
+    base = dict(event_ticker="KXNFLGAME-26OCT04KCBUF", title="Buffalo at Kansas City", status="open")
+    two = [dict(base, ticker="KXNFLGAME-26OCT04KCBUF-KC", yes_sub_title="Kansas City"),
+           dict(base, ticker="KXNFLGAME-26OCT04KCBUF-BUF", yes_sub_title="Buffalo")]
+    assert len(parse_kalshi_markets({"markets": two}, "NFL")) == 2
+    tie = two + [dict(base, ticker="KXNFLGAME-26OCT04KCBUF-TIE", yes_sub_title="Tie")]
+    assert parse_kalshi_markets({"markets": tie}, "NFL") == []      # team contracts pay $0 on a tie here
+    same = [two[0], dict(two[1], yes_sub_title="Kansas City")]
+    assert parse_kalshi_markets({"markets": same}, "NFL") == []     # not one market per team

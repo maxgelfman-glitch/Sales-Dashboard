@@ -137,7 +137,8 @@ from sharp_feed import (
 from alerts import AlertHandler
 from kalshi_trading import session_tag
 from novig_private import FillSlip
-from research import DEPTH_SAMPLE_SECONDS, MARKOUT_DELAYS, GapTracker, ResearchRecorder
+from research import (DEPTH_SAMPLE_SECONDS, MARKOUT_DELAYS, TIE_LEAGUES, GapTracker, ResearchRecorder,
+                      venue_tie_payout)
 from settlement import (
     ExchangePosition,
     load_ledger_holdings,
@@ -156,11 +157,9 @@ LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)-20s | %(messag
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 ARB_MIN_PROFIT_PER_CONTRACT = 0.01     # 1c per contract locked in, in the WORST scenario
-# Venues settling NFL moneyline ties at 50c per team contract:
-#   novig  — push/dead-heat rule (per the brief)
-#   kalshi — "$1 divided by the number of tied teams" (per the brief; matches public
-#            Kalshi help/market-FAQ descriptions: both team markets settle at 50c)
-DEAD_HEAT_VENUES = frozenset({"novig", "kalshi"})
+# Tie settlement per venue: research.venue_tie_payout (Kalshi 50c, confirmed by its contract terms; Novig a refund
+# of the price paid, unconfirmed; others $0). Applied to every moneyline in research.TIE_LEAGUES.
+DEAD_HEAT_VENUES = frozenset({"kalshi"})
 DEAD_HEAT_PAYOUT = 0.50
 BOOTSTRAP_REFRESH_SECONDS = 300.0
 TAKER_FILL_TIMEOUT_SECONDS = 2.0       # live: cancel any unfilled taker remainder after this
@@ -311,13 +310,17 @@ class MarketPosition(BaseModel):
 GameKey = tuple[str, str, str, str]   # (league, home, away, market_type) — venue independent
 
 
-SAME_GAME_WINDOW_SECONDS = 6 * 3600
+SAME_GAME_WINDOW_SECONDS = 2 * 3600       # two venues' start times for one game agree within this
+DOUBLEHEADER_SECONDS = 20 * 3600          # one matchup with two start times further apart but within this: refused
 DEFAULT_LEAGUE_MIN_EDGE = {"NCAAF": 0.045, "NCAAB": 0.045, "WNBA": 0.04, "TENNIS": 0.045}   # vs 2.5% elsewhere
 
 
-def same_game_time(a: Optional[float], b: Optional[float]) -> bool:
-    """Two markets of one matchup are the same game only if their start times agree (unknown = trust the key)."""
-    return a is None or b is None or abs(a - b) <= SAME_GAME_WINDOW_SECONDS
+def same_game_time(a: Optional[float], b: Optional[float], strict: bool = False) -> bool:
+    """Two markets of one matchup are the same game only if their start times agree. Unknown: trusted in paper,
+    refused when `strict` (live: a pair across two different games is not a lock, it is two bets)."""
+    if a is None or b is None:
+        return not strict
+    return abs(a - b) <= SAME_GAME_WINDOW_SECONDS
 
 
 def order_error_ambiguous(exc: BaseException) -> bool:
@@ -398,12 +401,13 @@ def arbitrage_scenarios(first: PaperOrder, hedge_venue: str, contracts: int, hed
     first_cost = first.stake_usd * contracts / held if held > contracts else first.stake_usd
     total_cost = first_cost + hedge_cost
     first_pay = win_payout(getattr(first, "venue", "novig"), getattr(first, "price", 1.0))
-    hedge_pay = win_payout(hedge_venue, hedge_price if hedge_price is not None else 1.0)
+    hp = hedge_price if hedge_price is not None else 1.0
+    hedge_pay = win_payout(hedge_venue, hp)
     out = {"first_side_wins": contracts * first_pay - total_cost,
            "other_side_wins": contracts * hedge_pay - total_cost}
-    if league == "NFL" and market_type == "moneyline":
-        tie_payout = sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0 for v in (first.venue, hedge_venue))
-        out["tie"] = contracts * tie_payout - total_cost
+    if league in TIE_LEAGUES and market_type == "moneyline":
+        out["tie"] = contracts * (venue_tie_payout(first.venue, first.price) + venue_tie_payout(hedge_venue, hp)) \
+            - total_cost
     return {k: round(v, 2) for k, v in out.items()}
 
 
@@ -573,6 +577,7 @@ class Supervisor:
         self.cutoff_overrides = dict(cutoff_overrides or {})  # league -> (taker_s, maker_s)
         self.require_start_time = live if require_start_time is None else require_start_time
         self.game_start: dict[tuple, float] = {}          # (league, home, away) -> scheduled start (epoch)
+        self.ambiguous_games: dict[tuple, tuple] = {}     # matchups with two starts hours apart: never traded
         self.cutoff_phases: dict[tuple, set[str]] = {}     # gid -> {"maker", "taker", "start"} already run
         self._cutoff_noted: set[tuple] = set()
         self.live_games: dict[tuple, str] = {}             # gid -> why we believe it is in play (never trade)
@@ -1184,7 +1189,9 @@ class Supervisor:
             canon = self._canonical(other)
             if canon is None or canon[0] != key or canon[1] == side:
                 continue
-            if not same_game_time(update.start_time, other.start_time):
+            known = self.game_start.get(key[:3])         # the game's start from any venue (doubleheaders refused)
+            if not same_game_time(update.start_time or known, other.start_time or known,
+                                  strict=self.require_start_time):
                 continue                                   # same teams, another day: two bets, not a lock
             if mtype == "spread" and (other.line is None or update.line is None
                                       or not math.isclose(other.line, -update.line)):
@@ -1216,9 +1223,9 @@ class Supervisor:
             if league in NO_CROSS_VENUE_HEDGE_LEAGUES and other.venue != update.venue:
                 continue
             worst_payout = min(win_payout(update.venue, update.price), win_payout(other.venue, other.price))
-            if league == "NFL" and mtype == "moneyline":
-                worst_payout = min(worst_payout, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
-                                                     for v in (update.venue, other.venue)))
+            if league in TIE_LEAGUES and mtype == "moneyline":
+                worst_payout = min(worst_payout, venue_tie_payout(update.venue, update.price)
+                                   + venue_tie_payout(other.venue, other.price))
             profit = worst_payout - self._unit_cost(update.venue, update.price) - self._unit_cost(other.venue,
                                                                                                  other.price)
             if profit >= ARB_MIN_PROFIT_PER_CONTRACT - 1e-9 and (best is None or profit > best[1]):
@@ -1249,9 +1256,10 @@ class Supervisor:
                  cost_a + cost_b, locked)
         self.stats["arb_pairs"] += 1
         if self.executing:
+            # PLANNED: nothing is locked until the second leg fills (PAIR_UNLOCKED says when it did not)
             self._ledger("ARB_PAIR", game=list(key), legs=[[update.venue, update.outcome_id, update.price],
                                                            [other.venue, other.outcome_id, other.price]],
-                         contracts=n, locked_profit_usd=locked)
+                         contracts=n, planned_locked_profit_usd=locked, status="first_leg_sent")
             await self._send_live_taker("DIRECTIONAL", update, key, side, n, cost_a, None, False,
                                         locked_per_contract=locked / n)
             held = self.positions.get(key)
@@ -1288,9 +1296,11 @@ class Supervisor:
             log.critical("ARB_PAIR second leg on %s failed (%s: %s): first leg is NAKED; normal hedging will keep "
                          "trying", venue, type(exc).__name__, exc)
             self._ledger("PAIR_LEG_FAILED", game=list(key), venue=venue, error=str(exc))
-        if not held.hedged and held.unhedged() > 0:
-            log.warning("ARB_PAIR %s: the second leg could not be completed at a locked price; %g contracts stay "
-                        "directional until a hedge locks", key, held.unhedged())
+        if not held.hedged and held.unhedged() > 0 and not any(l.pending for l in held.legs[1:]):
+            log.critical("ARB_PAIR %s: the second leg could not be completed at a locked price; %g contracts are "
+                         "NAKED (directional) until a hedge locks", key, held.unhedged())
+            self._ledger("PAIR_UNLOCKED", game=list(key), naked_contracts=held.unhedged(),
+                         first_leg_cost_usd=held.primary.stake_usd)
 
     # ---------------- arbitrage ----------------
     async def _try_arbitrage(self, update: MarketUpdate, key: GameKey, side: str, held: MarketPosition) -> None:
@@ -1344,7 +1354,8 @@ class Supervisor:
         first = held.primary
         league, _, _, mtype = key
         fail = lambda why: (False, why, 0, 0.0, 0.0, {}, 0.0, 0.0)  # noqa: E731
-        if not same_game_time(first.start_time, update.start_time):
+        known = self.game_start.get(key[:3])
+        if not same_game_time(first.start_time or known, update.start_time or known, strict=self.require_start_time):
             return fail("a different game of the same matchup (start times differ)")
         if mtype == "spread":
             if first.line is None or update.line is None or not math.isclose(update.line, -first.line):
@@ -1357,11 +1368,18 @@ class Supervisor:
         remaining = int(held.unhedged())
         if remaining <= 0 or first.contracts <= 0:
             return fail("nothing left to hedge")
-        c1 = first.stake_usd / first.contracts
+        # Every leg on the held side is what the hedge locks (a maker fill or a restored holding adds legs): its
+        # cost is their AVERAGE, and its payout the WORST of theirs. Never the first leg alone.
+        same = [l for l in held.legs if l.side == first.side and l.contracts > 0]
+        if len({l.venue for l in same}) > 1 and league in TIE_LEAGUES and mtype == "moneyline":
+            return fail("held side spans venues with different tie rules")
+        n_held = sum(l.contracts for l in same)
+        c1 = sum(l.stake_usd for l in same) / n_held
+        first = first.model_copy(update=dict(contracts=n_held, stake_usd=round(sum(l.stake_usd for l in same), 2),
+                                             price=min(l.price for l in same),
+                                             venue=min(same, key=lambda l: win_payout(l.venue, l.price)).venue))
+        tie = league in TIE_LEAGUES and mtype == "moneyline"
         worst_payout = 1.0
-        if league == "NFL" and mtype == "moneyline":
-            worst_payout = min(1.0, sum(DEAD_HEAT_PAYOUT if v in DEAD_HEAT_VENUES else 0.0
-                                        for v in (first.venue, update.venue)))
         used: list[tuple[float, int]] = []
         spent = 0.0
         for i, (price, size) in enumerate(self._ask_levels(update)):
@@ -1369,6 +1387,9 @@ class Supervisor:
                 break
             unit = price + (kalshi_fee_per_contract(price * 100) if update.venue == "kalshi" else 0.0)
             level_worst = min(worst_payout, win_payout(first.venue, first.price), win_payout(update.venue, price))
+            if tie:
+                level_worst = min(level_worst, venue_tie_payout(first.venue, first.price)
+                                  + venue_tie_payout(update.venue, price))
             if level_worst - c1 - unit < ARB_MIN_PROFIT_PER_CONTRACT - 1e-9:
                 break
             n = min(int(size), remaining - sum(k for _, k in used),
@@ -2116,6 +2137,14 @@ class Supervisor:
     # ---------------- pregame cutoff ----------------
     def _note_start(self, gid: tuple, start: float) -> None:
         prev = self.game_start.get(gid)
+        if prev is not None and SAME_GAME_WINDOW_SECONDS < abs(prev - start) <= DOUBLEHEADER_SECONDS \
+                and gid not in self.ambiguous_games:
+            # one matchup, two start times hours apart: a doubleheader (or venues disagree). Positions are keyed by
+            # matchup, so the two games cannot be kept apart: never trade either (a "pair" could span both).
+            self.ambiguous_games[gid] = (min(prev, start), max(prev, start))
+            log.warning("DOUBLEHEADER %s: start times %.1fh apart -> no orders, quotes or parlay legs",
+                        gid, abs(prev - start) / 3600)
+            self._ledger("DOUBLEHEADER", game=list(gid), starts=[prev, start])
         self.game_start[gid] = start if prev is None else min(prev, start)
 
     def _register_dynamic_games(self) -> None:
@@ -2152,6 +2181,8 @@ class Supervisor:
         """
         if gid in self.live_games:
             return f"game is live ({self.live_games[gid]})"
+        if gid in self.ambiguous_games:
+            return "two games of this matchup close together (doubleheader?)"
         start = self.game_start.get(gid)
         if start is None:
             return "no scheduled start time (required in live mode)" if self.require_start_time else None
@@ -2278,7 +2309,7 @@ class Supervisor:
             yield from self.prophetx.latest.values()
 
     def _research_gap(self, update: MarketUpdate, key: tuple, side: str) -> None:
-        tie = DEAD_HEAT_PAYOUT if key[0] == "NFL" and key[3] == "moneyline" else None
+        tie = DEAD_HEAT_PAYOUT if key[0] in TIE_LEAGUES and key[3] == "moneyline" else None   # "a tie can happen"
         self.gaps.update(key, update.venue, side, update.price, update.available_volume, update.line, tie,
                          self._sides(key), self.minutes_to_start(key[:3]))
 
@@ -2424,7 +2455,7 @@ class Supervisor:
             n += 1
         if self.gaps is not None:
             for mk in list(self.gaps.books):
-                tie = DEAD_HEAT_PAYOUT if mk[0] == "NFL" and mk[3] == "moneyline" else None
+                tie = DEAD_HEAT_PAYOUT if mk[0] in TIE_LEAGUES and mk[3] == "moneyline" else None
                 best = self.gaps.best_combo(mk, tie, self._sides(mk))
                 if best is not None:
                     self.research.write("BEST_COMBO", game=list(mk), minutes_to_start=self.minutes_to_start(mk[:3]),
