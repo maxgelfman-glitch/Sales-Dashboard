@@ -105,7 +105,15 @@ python main_supervisor.py
 * `DEVIG_METHOD` = multiplicative (default) | power | shin. Power/Shin take more margin off longshots.
   Every DECISION research row records all three so the report can show which one holds up at the close.
 * `SHARP_BOOK_WEIGHTS=pinnacle:2,circa sports:1`: fresh books quoting the same number are blended into one
-  consensus fair value; unlisted books are ignored (`*:1` includes them).
+  consensus fair value; unlisted books are ignored (`*:1` includes them). A book whose own market is broken
+  (overround outside 0.98-1.15, e.g. teams swapped) is left out, and books more than 3 points of probability
+  apart give **no** price (a blended line always looks clean and would hide the bad book).
+* **Never priced:** whole-number spreads and totals (-3, 8: a push makes the de-vigged price overstate the edge,
+  and the venues' push rules are unconfirmed); a matchup with two start times 2-20 hours apart (an MLB
+  doubleheader: game 2's line must never price game 1, and positions could not be kept apart); a sharp line
+  outside 1-99%; Kalshi games that list a Tie/Draw market (its team contracts then pay $0 on a tie).
+* TheRundown: when the main line moves, the old number's price is dropped (it is the pre-move price), and a
+  price that changed on one side only waits up to 2 seconds for the other side before it is used.
 * A sharp move re-checks every venue price of that market immediately: the stale-price edge no longer waits
   for the venue's next tick.
 * Optional taker filters, off by default: `TAKER_REQUIRE_SHARP_MOVED_LAST=1` and
@@ -114,12 +122,21 @@ python main_supervisor.py
 
 ## Locked pairs (the core arbitrage, no fair value needed)
 When the two sides of a market, on any venues, cost less than the payout after fees in every outcome
-(NFL ties included, whole-number lines excluded), the engine buys **both** at once (`ARB_PAIRS_ENABLED=1`,
+(whole-number lines excluded), the engine buys **both** at once (`ARB_PAIRS_ENABLED=1`,
 default). This needs no sharp line, so it also runs in measurement mode. Neither side has to beat the
 sharp line on its own. Size = the thinner side's best level, capped at $1,000 per leg, the live canary
 stake, and a per-game cap applied to the worst case (one leg fills, the other doesn't). In live mode both
 venues must be live-enabled. If one leg misses, the other stays as a normal position and the regular hedge
-path keeps trying to complete it.
+path keeps trying to complete it (logged CRITICAL as `PAIR_UNLOCKED`: until then it is a bet, not a lock).
+* **Ties (NFL, MLB, NHL moneylines):** each venue's own rule. Kalshi pays 50c per team (its contract terms).
+  Novig is treated as refunding the price paid (its rule is unconfirmed; its exchange's filing says "void at fair
+  value"), every other venue as paying $0. So a pair must still profit when the game ties under those rules.
+  Ask Novig for its written tie and postponement rules: if it pays 50c, cross-venue NFL pairs widen.
+* **Postponed or cancelled games** are not priced: Kalshi settles them at its own "last fair price", other venues
+  may refund. A cross-venue pair can lose here (bounded by the per-game cap); confirm the venues' rules.
+* **Doubleheaders** are never traded (see above). Live pairs and hedges need both games' start times to agree.
+* **Several legs on the held side** (a maker fill plus a taker, a restored holding): a hedge is priced against
+  their average cost and worst payout, never the first leg alone.
 
 ## Risk controls
 * `GAME_EXPOSURE_LIMIT_USD` (default $1,000): unhedged money per game across its moneyline, spread and total
@@ -184,14 +201,16 @@ quote them. Kalshi prices combos by **Request For Quote**: a user builds a combo
 * **What it quotes:** every league we have sharp prices for (NFL, NBA, MLB, NHL, WNBA, college, tennis). Shadow
   prices parlays of up to 6 legs, same-game ones included; real quotes default to parlays of up to 4 legs on
   **different games** (`COMBO_LIVE_KINDS=xgame`, `COMBO_LIVE_MAX_LEGS=4`, optional `COMBO_LIVE_LEAGUES=NFL,NBA`).
-  Same-game legs (same event, or the game code inside Kalshi tickers) move together, so they stay shadow-only
-  until their own numbers hold up (`COMBO_LIVE_KINDS=xgame,sgp`). Every leg needs a fresh fair value: the sharp
+  Same-game legs (same event, or the league + game code inside Kalshi tickers) are **never priced**: they move
+  together and some are nested (moneyline + covering spread) or the same outcome twice, so multiplying their
+  fairs underprices them by up to 40%. That needs a joint-probability model this engine does not have, so
+  `COMBO_LIVE_KINDS` accepts only `xgame`. Every leg needs a fresh fair value: the sharp
   line, or Kalshi's own book when its bid/ask spread is ≤3¢ (with an extra margin).
 * **Pricing: the less sure, the wider and the smaller.** Fair = product of the legs' probabilities. Margin =
   4% + 2% per leg + an uncertainty margin per leg: league (NFL 0, NBA/MLB/NHL +0.5%, WNBA/college/tennis +1%,
   other +2%), line age (up to +1%), sharp books disagreeing (spread ÷ probability; over 3¢ apart = no quote),
   one book only (+0.5%, no second opinion: add a second sharp book to `THERUNDOWN_AFFILIATE_IDS` and weight
-  Pinnacle higher in `SHARP_BOOK_WEIGHTS`), Kalshi-book pricing (+1%), same-game (+8% per extra leg) and a
+  Pinnacle higher in `SHARP_BOOK_WEIGHTS`), Kalshi-book pricing (+1%) and a
   requester with a winning record (+4%; declined above +15% ROI over 15+ parlays: we cannot limit winners the
   way sportsbooks do). Size shrinks with the same uncertainty, down to 25% of the per-combo cap.
 * **Fee:** since 2026-08-20 Kalshi charges combo makers half the taker fee, 0.035·P·(1−P), except parlays of
@@ -217,10 +236,15 @@ quote them. Kalshi prices combos by **Request For Quote**: a user builds a combo
   * `demo`: real quotes on Kalshi's demo exchange (`KALSHI_ENV=demo`).
   * `live`: needs `TRADING_MODE=live`. Default caps are $25 per combo, $150 per leg and $1,000 total.
 * **Gates before real money:** (0) confirm with Kalshi that a regular account can quote combos in production;
-  (1) shadow, per slice, the report's verdict must read PASS: win rate ≥5% at 95% confidence (Wilson interval),
-  median margin ≥8%, 100+ settled with positive P&L (≥1 standard error above zero), and under 20% of wins from
-  quotes 10%+ under the market. WAIT = fewer than 200 traded RFQs; FAIL = confidently under 5%, P&L ≥2 standard
-  errors below zero, or winning mainly by underpricing; WATCH = enough data, not conclusive; (2) leg fair values track closing prices; (3) tiny live
+  (1) shadow, per slice, the report's verdict must read PASS. The auction win rate (≥5% at 95% confidence) is
+  only a capacity check: a model that is too cheap wins more. Edge needs OUR median margin ≥8%, a number of
+  settled parlays fixed by statistical power (the report prints it; typically thousands, never under 300), a
+  calibration test showing parlays did not hit more often than we priced, a 95% lower bound (bootstrap) on return
+  on collateral above 0, and under 20% of wins from quotes 10%+ under the market. WAIT = not enough data;
+  FAIL = confidently under 5% wins, parlays hitting more than priced (z ≥ 2), a negative return bound, or winning
+  mainly by underpricing; WATCH = enough data, not conclusive. The report's "expected profit" of won quotes is
+  the model's and is biased high (we win when our fair is too low): judge on settled results;
+  (2) leg fair values track closing prices; (3) tiny live
   results within ~30% of shadow expectations; (4) scale up step by step, **after a CPA opinion** (if treated as
   gambling, only 90% of losses are deductible from 2026, which hits high-turnover short-combo books hard).
 * **Unknown requesters (optional):** `COMBO_UNKNOWN_REQUESTER_MARGIN` (default 0, max 0.2) adds margin until a
@@ -237,8 +261,9 @@ market type. No installs needed (standard library).
 
 **Quoting:** `novig_rfq.py` answers Novig's parlay auctions as a registered pricer (liquidity provider), over
 Novig's RFQ websocket. The auction lasts 3 seconds, the lowest price wins, and the winner has 1 second to confirm.
-Quoters pay no fee. Pricing is the Kalshi quoter's (same per-leg uncertainty margins, same-game parlays
-shadow-only, size shrinking with doubt) with its own risk book.
+Quoters pay no fee. Pricing is the Kalshi quoter's (same per-leg uncertainty margins, same-game parlays never
+priced, size shrinking with doubt) with its own risk book. Kalshi quotes are rounded up to whole cents (its price
+grid), Novig's to 0.001.
 * **Access:** email developers@novig.com to become an LP (W-9; QA test access within ~2 business days;
   production generally needs a $30,000 deposit). Novig then gives you API credentials: put
   `NOVIG_RFQ_ACCESS_TOKEN` (or `NOVIG_RFQ_CLIENT_ID`, `NOVIG_RFQ_CLIENT_SECRET`, `NOVIG_RFQ_TOKEN_URL`) in
@@ -288,7 +313,9 @@ python research_report.py --since 2026-10-01 # real runs: ./research
 The report answers: did our entries beat the closing line (CLV), how that CLV changes with time to start
 (including trades the cutoff blocked), are maker fills picked off (markouts, also by time to start),
 how much size sits at the best price by time to start, and how often, how long and how deep cross-venue
-locked-profit gaps are (Novig free, Kalshi taker fee, ProphetX 2% of winnings, NFL ties at 50c).
+locked-profit gaps are (Novig free, Kalshi taker fee, ProphetX 2% of winnings, ties by each venue's rule).
+CLV is net of fees and each bet is scored against its own game's close (a matchup that repeats in a series is
+never scored against another game's close).
 Two to four weeks of paper data are enough to decide whether the strategy is worth scaling.
 
 ## Dashboard (read-only cockpit)
@@ -327,6 +354,17 @@ SETTLED positions, releases their exposure and writes one `SETTLE` row each (ide
 restarts). The same sweep resolves `UNCONFIRMED` orders against the exchange and restores untracked
 positions (e.g. manual trades). Novig v3: open positions from `GET /v3/account/positions`; a settled one
 is read from its market's grade (WIN / LOSS / PUSH, or a fair-value price that pays that fraction).
+Accounting rules that keep exposure and P&L exact at every edge:
+* Cost and payout always come from ONE view: the exchange's (count and cost) when ours differs or an order's
+  outcome was unknown; contracts we never saw fill are charged at the order's limit price (never understated).
+* A tranche whose outcome is unknown (timeout) keeps its reservation until the exchange's records resolve it.
+* A fill or finish arriving after its position settled releases the reservation instead of re-reserving it, and
+  is logged (`LATE_FILL_AFTER_SETTLE`, `FINALIZED_AFTER_SETTLE`) for reconciliation.
+* Every contract held is written as a `HOLD` row (late fills and resolved orders too), so a position that settles
+  while the engine is down is booked at full size after a restart; parlays are written as `PARLAY_OPEN` and
+  booked exactly once after a restart even if they settled meanwhile.
+* P&L counts toward the daily loss stop on the trading day it settled; a settlement with unknown P&L counts as
+  losing the whole released stake until it is corrected.
 
 **Tax records:** `python tax_export.py --ledger logs/live_ledger.jsonl --year 2026` writes one row per settled
 wager (date in New York time, venue, stake, payout, net, WIN/LOSS) and prints gross wins and gross losses
