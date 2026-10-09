@@ -141,6 +141,7 @@ class MarketInfo(BaseModel):
     outcome: str                              # team name, or "over"/"under"
     line: Optional[float] = None              # this outcome's spread, or the total
     start_time: Optional[float] = None        # scheduled game start (epoch seconds, UTC); drives the pregame cutoff
+    start_estimate: bool = False              # start_time is only a venue's rough hint (Kalshi), not the real start
 
     @field_validator("outcome_id", "market_id", "event_id", mode="before")
     @classmethod
@@ -183,6 +184,7 @@ class MarketUpdate(BaseModel):
     # through several prices while each one still has edge. Empty = only the best ask is known.
     ask_levels: list[tuple[float, float]] = Field(default_factory=list)
     start_time: Optional[float] = None                        # scheduled game start (epoch seconds, UTC)
+    start_estimate: bool = False                              # start_time is only a rough venue hint (Kalshi)
     received_at: float = Field(default_factory=time.time)
 
     @field_validator("league")

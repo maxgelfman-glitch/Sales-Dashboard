@@ -955,6 +955,8 @@ class Supervisor:
             return
         key, side = canon
         gid = key[:3]
+        if update.start_estimate:          # an unresolved venue hint is not a start time (Kalshi): treat as unknown
+            update = update.model_copy(update=dict(start_time=None, start_estimate=False))
         if update.start_time:
             self._note_start(gid, update.start_time, (update.venue, update.event_id))
         if previous is None or previous.price != update.price:
@@ -2279,14 +2281,25 @@ class Supervisor:
                         self.stats["dynamic_game_unmatched"] += 1
 
     def _index_start_times(self) -> None:
-        """Learn scheduled start times from every registry (any venue) for every canonical game."""
+        """Learn scheduled start times from every registry for every canonical game. A venue's start HINT (Kalshi
+        publishes no real start) never sets a game's start: its market takes the real start of the same game from
+        another venue (within 6h of the hint), or gets none (and is then not traded live)."""
         self._register_dynamic_games()
         for reg in (self.registry, self.kalshi_registry):
             for info in reg.all():
-                if info.start_time:
+                if info.start_time and not info.start_estimate:
                     canon = self._canonical(MarketUpdate.from_info(info))
                     if canon is not None:
                         self._note_start(canon[0][:3], info.start_time, (info.venue, info.event_id))
+        for reg in (self.registry, self.kalshi_registry):
+            for info in list(reg.all()):
+                if not info.start_estimate:
+                    continue
+                canon = self._canonical(MarketUpdate.from_info(info))
+                known = self.game_start.get(canon[0][:3]) if canon else None
+                real = known if known is not None and info.start_time is not None \
+                    and abs(known - info.start_time) <= 6 * 3600 else None
+                reg.register(info.model_copy(update=dict(start_time=real, start_estimate=False)))
 
     def minutes_to_start(self, gid: tuple) -> Optional[float]:
         start = self.game_start.get(gid)

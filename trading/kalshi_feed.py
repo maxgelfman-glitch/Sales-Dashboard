@@ -47,6 +47,8 @@ import aiohttp
 from execution import cents_to_american, cents_to_probability
 from novig_feed import MAX_BOOK_LEVELS, MarketInfo, MarketRegistry, MarketUpdate, UpdateCallback
 from novig_rest import parse_start_time
+
+KALSHI_START_OFFSET_S = 3 * 3600      # Kalshi's time fields = originally scheduled start + 3h
 from team_normalizer import DYNAMIC_LEAGUES, canonical_league, names_match, normalize_team_name
 from ws_base import (
     OPEN_TIMEOUT_SECONDS,
@@ -378,13 +380,17 @@ def parse_kalshi_markets(payload: Any, league: str) -> list[MarketInfo]:
             if team not in {home, away}:
                 continue
             sibling = next((t for t in tickers if t != m["ticker"]), None) if len(tickers) == 2 else None
-            # ASSUMED field: Kalshi's scheduled occurrence time. Novig's start time for the same game is used when
-            # this is missing (the supervisor keys the cutoff on the canonical game, across venues).
-            start = parse_start_time(m.get("occurrence_datetime") or m.get("expected_start_time"))
+            # Kalshi publishes NO real start time: occurrence_datetime / expected_expiration_time are the ORIGINALLY
+            # scheduled start + 3h, never updated when a game moves (observed on ~2,150 of 2,154 2026 events). So it
+            # is only a hint (start - 3h): the supervisor takes the real start from Novig for the same game, or
+            # does not trade the market live at all.
+            hint = parse_start_time(m.get("occurrence_datetime") or m.get("expected_expiration_time")
+                                    or m.get("expected_start_time"))
+            start = None if hint is None else hint - KALSHI_START_OFFSET_S
             event_rows.append(MarketInfo(venue="kalshi", outcome_id=m["ticker"], market_id=event_ticker,
                                          sibling_outcome_id=sibling, league=league, market_type="moneyline",
                                          event_id=event_ticker, home_team=home, away_team=away, outcome=team,
-                                         start_time=start))
+                                         start_time=start, start_estimate=True))
         if len(event_rows) == 2 and {r.outcome for r in event_rows} == {home, away}:
             rows.extend(event_rows)                   # one market per team, both mapped: nothing else is safe
         else:

@@ -102,3 +102,22 @@ async def test_a_24_7_session_trades_game_two_of_a_series():
     assert sup._trade_blocked(gid)
     sup._note_start(gid, _t.time() + 20 * 3600, ("novig", "G2"))                             # game 2 listed
     assert sup._trade_blocked(gid) is None and gid not in sup.live_games
+
+
+def test_kalshis_start_hint_is_replaced_by_the_real_start():
+    """Kalshi publishes no real start: its time fields are the originally scheduled start + 3h."""
+    from kalshi_feed import parse_kalshi_markets
+    from datetime import datetime, timezone
+    h, a = "Kansas City Chiefs", "Buffalo Bills"
+    hint = datetime.fromtimestamp(START + 3 * 3600, timezone.utc).isoformat()
+    base = dict(event_ticker="KXNFLGAME-X", title="Buffalo at Kansas City", status="open", occurrence_datetime=hint)
+    kal = parse_kalshi_markets({"markets": [dict(base, ticker="KXNFLGAME-X-KC", yes_sub_title="Kansas City"),
+                                            dict(base, ticker="KXNFLGAME-X-BUF", yes_sub_title="Buffalo")]}, "NFL")
+    assert all(k.start_estimate and abs(k.start_time - START) < 1 for k in kal)
+    sup = make_sup(novig=ml_market("novig", "G", "NFL", h, a, start=START + 600),       # Novig: the real start
+                   kalshi=[k.model_dump() for k in kal])
+    for k in sup.kalshi_registry.all():
+        assert k.start_time == START + 600 and not k.start_estimate                     # taken from Novig
+    assert ("NFL", h, a) not in sup.ambiguous_games
+    alone = make_sup(kalshi=[k.model_dump() for k in kal])                              # Kalshi only: no start
+    assert all(k.start_time is None for k in alone.kalshi_registry.all())
